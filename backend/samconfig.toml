@@ -1,0 +1,13 @@
+version = 0.1
+
+[default.deploy.parameters]
+stack_name = "my-agent1-backend"
+resolve_s3 = true
+s3_prefix = "my-agent1-backend"
+confirm_changeset = true
+capabilities = "CAPABILITY_IAM"
+parameter_overrides = "AgentRuntimeUrl=\"https://bedrock-agentcore.us-east-1.amazonaws.com/runtimes/arn%3Aaws%3Abedrock-agentcore%3Aus-east-1%3A636052469006%3Aruntime%2Fmy_agent1-EuvQcG3t0u/invocations?qualifier=DEFAULT\""
+image_repositories = []
+
+[default.global.parameters]
+region = "us-east-1"

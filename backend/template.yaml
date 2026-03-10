@@ -1,0 +1,65 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: API backend for my_agent1 runtime
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 30
+    MemorySize: 256
+
+Parameters:
+  AgentRuntimeUrl:
+    Type: String
+    Description: HTTPS invoke URL for AgentCore runtime endpoint
+
+Resources:
+  ChatApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      CorsConfiguration:
+        AllowMethods:
+          - POST
+          - OPTIONS
+        AllowHeaders:
+          - Content-Type
+          - Authorization
+        AllowOrigins:
+          - '*'
+      Auth:
+        DefaultAuthorizer: CognitoJwtAuthorizer
+        Authorizers:
+          CognitoJwtAuthorizer:
+            JwtConfiguration:
+              issuer: https://cognito-idp.us-east-1.amazonaws.com/us-east-1_l6dPnsMxY
+              audience:
+                - 4hb4q7nat1kqbm6ehsgtq3e2op
+            IdentitySource: "$request.header.Authorization"
+
+  ChatFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: chat_handler.handler
+      CodeUri: lambda/
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - bedrock-agentcore:Invoke*
+                - bedrock-agentcore-runtime:Invoke*
+              Resource: '*'
+      Environment:
+        Variables:
+          AGENTCORE_RUNTIME_URL: !Ref AgentRuntimeUrl
+      Events:
+        ChatPost:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref ChatApi
+            Path: /chat
+            Method: POST
+
+Outputs:
+  ApiUrl:
+    Description: HTTP API base URL
+    Value: !Sub "https://${ChatApi}.execute-api.${AWS::Region}.amazonaws.com"

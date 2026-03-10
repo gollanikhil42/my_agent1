@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.venv/
+venv/
+
+# Node / frontend
+node_modules/
+dist/
+
+# Environment files
+.env
+*.env.local
+
+# SAM / AWS build artifacts
+.aws-sam/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
