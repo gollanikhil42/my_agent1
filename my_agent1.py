@@ -93,6 +93,23 @@ def decode_jwt_user(token: str) -> dict:
             "auth_type":  "unknown",
         }
 
+# ── Helper: Get system prompt from DynamoDB ─────────────────
+def get_system_prompt() -> str:
+    """
+    Read the current system prompt from AgentConfig table.
+    Falls back to default if DynamoDB is unreachable.
+    This enables dynamic prompt evolution without redeploying.
+    """
+    try:
+        config_table = dynamodb.Table("AgentConfig")
+        result = config_table.get_item(Key={"config_key": "system_prompt"})
+        if "Item" in result:
+            return result["Item"]["prompt_text"]
+    except Exception as e:
+        print(f"WARNING: Could not read system prompt from AgentConfig: {e}", flush=True)
+    # Fallback if DynamoDB is unreachable
+    return "Helpful general chatbot. Keep responses concise and clear."
+
 # ── Helper: write log to DynamoDB ───────────────────────────
 def write_log(data: dict):
     try:
@@ -180,9 +197,7 @@ def handler(payload, context):
 
         agent = Agent(
             model=model,
-            system_prompt=(
-                "Helpful general chatbot. Keep responses concise and clear."
-            ),
+            system_prompt=get_system_prompt(),
         )
 
         result = agent(prompt)
