@@ -1,5 +1,6 @@
 import json
 import os
+import base64
 from typing import Any, Dict
 
 import urllib3
@@ -34,6 +35,37 @@ def _build_user_claims(event: Dict[str, Any]) -> Dict[str, str]:
         "user_role": claims.get("custom:role", "unknown"),
         "auth_type": "Cognito-JWT",
     }
+
+
+def _extract_bearer_token(event: Dict[str, Any]) -> str:
+    headers = event.get("headers") or {}
+    auth_header = headers.get("authorization") or headers.get("Authorization") or ""
+    if not auth_header.lower().startswith("bearer "):
+        return ""
+    return auth_header.split(" ", 1)[1].strip()
+
+
+def _decode_jwt_claims(token: str) -> Dict[str, str]:
+    if not token:
+        return {}
+    try:
+        parts = token.split(".")
+        if len(parts) < 2:
+            return {}
+        payload_b64 = parts[1]
+        payload_b64 += "=" * ((4 - len(payload_b64) % 4) % 4)
+        payload = json.loads(base64.b64decode(payload_b64).decode("utf-8"))
+        return {
+            "user_id": payload.get("sub", "unknown"),
+            "user_name": payload.get("cognito:username", "unknown"),
+            "user_email": payload.get("email", "unknown"),
+            "name": payload.get("name", "unknown"),
+            "department": payload.get("custom:department", "unknown"),
+            "user_role": payload.get("custom:role", "unknown"),
+            "auth_type": "Cognito-JWT",
+        }
+    except Exception:
+        return {}
 
 
 def _signed_post(url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -94,10 +126,18 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             "body": json.dumps({"error": "prompt is required"}),
         }
 
+    bearer_token = _extract_bearer_token(event)
+    claims_from_authorizer = _build_user_claims(event)
+    user_context = claims_from_authorizer
+    if user_context.get("user_id") in ("", "unknown"):
+        decoded_claims = _decode_jwt_claims(bearer_token)
+        if decoded_claims:
+            user_context = decoded_claims
+
     payload = {
         "prompt": prompt,
-        "jwt_token": "",  # Keep empty; user identity is forwarded via explicit fields below.
-        "user_context": _build_user_claims(event),
+        "jwt_token": bearer_token,
+        "user_context": user_context,
     }
 
     for key in ("max_tokens", "temperature", "top_p", "top_k"):
