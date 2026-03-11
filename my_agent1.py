@@ -20,26 +20,9 @@ logging.getLogger("strands").setLevel(logging.ERROR)
 logging.getLogger("botocore").setLevel(logging.ERROR)
 logging.getLogger("boto3").setLevel(logging.ERROR)
 logging.getLogger("opentelemetry").setLevel(logging.ERROR)
+logging.getLogger("bedrock_agentcore").setLevel(logging.ERROR)
+logging.getLogger("bedrock_agentcore.app").setLevel(logging.ERROR)
 logging.basicConfig(level=logging.ERROR)
-
-
-class SuppressHealthCheckNoise(logging.Filter):
-    def filter(self, record):
-        msg = record.getMessage().lower()
-        if "health check uri" in msg and "connection failed" in msg:
-            return False
-        return True
-
-
-class OnlyAgentTraceEvents(logging.Filter):
-    def filter(self, record):
-        msg = record.getMessage()
-        return "agent_request_trace" in msg
-
-
-runtime_logger = logging.getLogger("bedrock_agentcore.app")
-runtime_logger.addFilter(SuppressHealthCheckNoise())
-runtime_logger.addFilter(OnlyAgentTraceEvents())
 
 # ── AWS Clients ──────────────────────────────────────────────
 dynamodb   = boto3.resource("dynamodb", region_name="us-east-1")
@@ -325,7 +308,9 @@ def handler(payload, context):
             "dynamodb_log_error": ddb_error,
         }
         cloudwatch_trace.update(runtime_log)
-        runtime_logger.info(json.dumps(cloudwatch_trace, ensure_ascii=True))
+
+        # Emit one deterministic stdout log event to avoid multi-handler duplicates.
+        print(f"INFO:my_agent1:{json.dumps(cloudwatch_trace, ensure_ascii=True)}", flush=True)
 
     return {"answer": answer}
 
