@@ -1,0 +1,7 @@
+{
+    "config_key": {"S": "system_prompt"},
+    "prompt_text": {"S": "Helpful general chatbot. Keep responses concise and clear."},
+    "version": {"N": "1"},
+    "updated_at": {"S": "2026-03-11"},
+    "updated_by": {"S": "manual"}
+}

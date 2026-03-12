@@ -5,13 +5,17 @@ Description: API backend for my_agent1 runtime
 Globals:
   Function:
     Runtime: python3.12
-    Timeout: 30
+    Timeout: 120
     MemorySize: 256
 
 Parameters:
   AgentRuntimeUrl:
     Type: String
     Description: HTTPS invoke URL for AgentCore runtime endpoint
+  EvaluatorRuntimeUrl:
+    Type: String
+    Default: ""
+    Description: Optional HTTPS invoke URL for evaluator AgentCore runtime endpoint
 
 Resources:
   ChatApi:
@@ -51,6 +55,7 @@ Resources:
       Environment:
         Variables:
           AGENTCORE_RUNTIME_URL: !Ref AgentRuntimeUrl
+          EVALUATOR_RUNTIME_URL: !Ref EvaluatorRuntimeUrl
       Events:
         ChatPost:
           Type: HttpApi

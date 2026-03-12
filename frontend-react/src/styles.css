@@ -1,10 +1,17 @@
+@import url("https://fonts.googleapis.com/css2?family=Sora:wght@400;600;700;800&family=IBM+Plex+Mono:wght@400;500&display=swap");
+
 :root {
-  --bg: #f2efe8;
-  --surface: #ffffffdd;
-  --ink: #1f2a36;
-  --muted: #58667a;
-  --accent: #14746f;
-  --border: #d3dae3;
+  --bg-a: #fcf7ef;
+  --bg-b: #e6f4f1;
+  --bg-c: #dfe9ff;
+  --surface: #ffffffd6;
+  --ink: #162336;
+  --muted: #4f647a;
+  --accent: #0f766e;
+  --accent-strong: #115e59;
+  --danger: #c2410c;
+  --border: #c8d4e4;
+  --shadow: 0 18px 55px rgba(22, 35, 54, 0.13);
 }
 
 * {
@@ -13,51 +20,89 @@
 
 body {
   margin: 0;
-  font-family: "Segoe UI", sans-serif;
+  font-family: "Sora", sans-serif;
   color: var(--ink);
-  background: linear-gradient(145deg, #f7f3ea, #e8eef3);
+  background:
+    radial-gradient(900px 500px at 10% 0%, var(--bg-c), transparent 60%),
+    radial-gradient(1000px 540px at 95% 15%, var(--bg-b), transparent 62%),
+    linear-gradient(130deg, var(--bg-a), #f6fbff 55%, #f3fff8);
+  min-height: 100vh;
 }
 
 .shell {
-  width: min(980px, 92vw);
-  margin: 28px auto;
+  width: min(1120px, 94vw);
+  margin: 30px auto;
   display: grid;
-  gap: 16px;
+  gap: 18px;
+  animation: rise 0.45s ease-out both;
 }
 
 .badge {
   display: inline-block;
   margin: 0;
-  padding: 6px 10px;
+  padding: 8px 12px;
   border-radius: 999px;
-  background: #14746f22;
+  background: #0f766e1f;
   color: var(--accent);
-  font-size: 12px;
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  font-weight: 700;
   text-transform: uppercase;
 }
 
 h1 {
-  margin: 10px 0;
+  margin: 8px 0 4px;
+  font-size: clamp(1.5rem, 2.4vw, 2.2rem);
+  line-height: 1.15;
+}
+
+.subtitle {
+  margin: 0;
+  color: var(--muted);
+  max-width: 70ch;
+  font-size: 0.95rem;
+}
+
+.hero {
+  border: 1px solid var(--border);
+  background: linear-gradient(140deg, #ffffffdb, #f8fdffb8);
+  backdrop-filter: blur(6px);
+  border-radius: 24px;
+  padding: 18px;
+  box-shadow: var(--shadow);
+}
+
+.hero-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.hero-grid {
+  margin-top: 14px;
+  display: grid;
+  grid-template-columns: minmax(220px, 1.4fr) repeat(3, minmax(130px, 1fr));
+  gap: 10px;
 }
 
 .profile {
   border: 1px solid var(--border);
-  border-radius: 12px;
-  padding: 10px;
+  border-radius: 14px;
+  padding: 10px 12px;
   display: flex;
   align-items: center;
   gap: 10px;
-  background: #fff;
+  background: #ffffffbf;
 }
 
 .avatar {
-  width: 36px;
-  height: 36px;
+  width: 40px;
+  height: 40px;
   border-radius: 50%;
   display: grid;
   place-items: center;
   color: #fff;
-  background: var(--accent);
+  background: linear-gradient(145deg, var(--accent), #0a5c57);
   font-weight: 700;
 }
 
@@ -67,39 +112,72 @@ h1 {
 }
 
 .profile-meta {
-  margin: 0;
+  margin: 2px 0 0;
   color: var(--muted);
   font-size: 13px;
 }
 
+.mini-stat {
+  border: 1px solid var(--border);
+  background: #ffffffa8;
+  border-radius: 14px;
+  padding: 10px;
+  display: grid;
+  gap: 5px;
+  align-content: center;
+}
+
+.mini-label {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.mini-value {
+  margin: 0;
+  font-size: 1.1rem;
+  font-weight: 700;
+}
+
 .signout {
-  margin-left: auto;
+  margin-left: 10px;
   border: 0;
-  border-radius: 8px;
-  padding: 8px 12px;
-  background: #d4572f;
+  border-radius: 10px;
+  padding: 9px 14px;
+  background: var(--danger);
   color: #fff;
   cursor: pointer;
+  transition: transform 0.18s ease, filter 0.18s ease;
+}
+
+.signout:hover {
+  transform: translateY(-1px);
+  filter: saturate(1.12);
 }
 
 .chat-card {
   border: 1px solid var(--border);
-  border-radius: 18px;
+  border-radius: 24px;
   overflow: hidden;
   background: var(--surface);
+  backdrop-filter: blur(8px);
+  box-shadow: var(--shadow);
 }
 
 .messages {
-  min-height: 52vh;
-  max-height: 62vh;
+  min-height: 50vh;
+  max-height: 60vh;
   overflow-y: auto;
-  padding: 14px;
+  padding: 16px;
   display: grid;
-  gap: 10px;
+  gap: 12px;
 }
 
 .message {
   display: flex;
+  animation: fadeSlide 0.24s ease both;
 }
 
 .message.user {
@@ -113,54 +191,118 @@ h1 {
 
 .bubble {
   max-width: min(80ch, 100%);
-  border-radius: 12px;
-  padding: 10px 12px;
+  border-radius: 14px;
+  padding: 11px 13px;
   white-space: pre-wrap;
+  line-height: 1.45;
 }
 
 .message.user .bubble {
-  background: #d4572f;
+  background: linear-gradient(145deg, #c2410c, #ea580c);
   color: #fff;
+  box-shadow: 0 10px 25px rgba(194, 65, 12, 0.22);
 }
 
 .message.bot .bubble {
-  background: #fff;
+  background: #ffffff;
   border: 1px solid var(--border);
 }
 
+.message.bot-updated .bubble {
+  border-left: 4px solid var(--accent);
+  background: #f4fffc;
+}
+
 .message.system .bubble {
-  background: #e8eef3;
+  background: #eaf4ff;
   color: #44566a;
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 0.88rem;
+}
+
+.message.metric .bubble {
+  border: 1px dashed #b8cde4;
+  background: #edf7ff;
 }
 
 .composer {
   border-top: 1px solid var(--border);
   padding: 12px;
   display: grid;
-  gap: 8px;
+  gap: 10px;
+  background: #ffffff9f;
 }
 
 textarea {
   width: 100%;
-  border-radius: 10px;
-  border: 1px solid var(--border);
-  padding: 10px;
+  border-radius: 12px;
+  border: 1px solid #bfd0e2;
+  padding: 12px;
   resize: vertical;
   font: inherit;
+  min-height: 68px;
+}
+
+textarea:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px #0f766e22;
 }
 
 .send {
   justify-self: end;
   border: 0;
-  border-radius: 8px;
-  padding: 9px 14px;
-  background: #14746f;
+  border-radius: 10px;
+  padding: 10px 16px;
+  background: linear-gradient(145deg, var(--accent), var(--accent-strong));
   color: #fff;
   cursor: pointer;
+  font-weight: 700;
+  transition: transform 0.18s ease, box-shadow 0.18s ease;
+}
+
+.send:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 10px 22px rgba(17, 94, 89, 0.28);
+}
+
+.send:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes fadeSlide {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
 }
 
 @media (max-width: 720px) {
   .shell {
     width: 95vw;
+  }
+
+  .hero-grid {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .profile {
+    grid-column: 1 / -1;
   }
 }

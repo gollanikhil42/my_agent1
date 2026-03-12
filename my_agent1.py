@@ -135,7 +135,7 @@ def handler(payload, context):
 
     # ── Extract input params ─────────────────────────────────
     prompt      = payload.get("prompt", "")
-    max_tokens  = max(payload.get("max_tokens", 220), 120)
+    max_tokens  = max(payload.get("max_tokens", 1024), 256)
     temperature = payload.get("temperature", None)
     top_p       = payload.get("top_p", None)
     top_k       = payload.get("top_k", None)
