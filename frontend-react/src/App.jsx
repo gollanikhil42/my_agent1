@@ -63,7 +63,9 @@ function App({ signOut, user }) {
       });
 
       const data = await response.json().catch(() => ({}));
-      const answer = response.ok ? data.answer || "No answer returned." : data.error || "Unable to fetch response.";
+      const answer = response.ok
+        ? data.answer || "No answer returned."
+        : data.error || data.message || `Request failed (${response.status})`;
       const improvedAnswer = response.ok ? data.answer_after_prompt_update : null;
       const evaluator = response.ok ? data?.evaluator?.result : null;
       const postEval = response.ok ? data?.post_update_evaluator?.result : null;
@@ -98,12 +100,12 @@ function App({ signOut, user }) {
 
         return next;
       });
-    } catch {
+    } catch (error) {
       setMessages((prev) => {
         const withoutThinking = prev.filter(
           (msg, idx) => !(msg.role === "system" && msg.variant === "status" && idx === prev.length - 1),
         );
-        return [...withoutThinking, { role: "bot", text: "Unable to fetch response." }];
+        return [...withoutThinking, { role: "bot", text: `Unable to fetch response. ${error?.message || ""}`.trim() }];
       });
     } finally {
       setBusy(false);
