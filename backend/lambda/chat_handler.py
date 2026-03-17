@@ -12,6 +12,8 @@ HTTP = urllib3.PoolManager()
 REGION = os.environ.get("AWS_REGION", "us-east-1")
 RUNTIME_URL = os.environ.get("AGENTCORE_RUNTIME_URL", "")
 EVALUATOR_RUNTIME_URL = os.environ.get("EVALUATOR_RUNTIME_URL", "")
+# Temporary kill-switch: set to True to stop all evaluator traffic while investigating cost spikes.
+TEMP_DISABLE_EVALUATOR = True
 CORS_HEADERS = {
     "Content-Type": "application/json",
     "Access-Control-Allow-Origin": "*",
@@ -159,7 +161,11 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         post_update_evaluation_result = None
         post_update_evaluator_error = None
         # Default to running evaluator so one user prompt triggers the full feedback loop.
-        run_evaluator = bool(body.get("run_evaluator", True)) and bool(EVALUATOR_RUNTIME_URL)
+        run_evaluator = (
+            (not TEMP_DISABLE_EVALUATOR)
+            and bool(body.get("run_evaluator", True))
+            and bool(EVALUATOR_RUNTIME_URL)
+        )
         if run_evaluator:
             eval_payload = {
                 "user_prompt": prompt,

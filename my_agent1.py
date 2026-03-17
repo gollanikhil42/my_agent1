@@ -12,9 +12,9 @@ from opentelemetry import trace as otel_trace
 import os
 
 # Keep runtime logs clean and deterministic for downstream parsing.
-os.environ["AGENT_OBSERVABILITY_ENABLED"] = "false"
+#os.environ["AGENT_OBSERVABILITY_ENABLED"] = "false"
 os.environ["OTEL_RESOURCE_ATTRIBUTES"] = "service.name=my_agent1"
-os.environ["OTEL_SDK_DISABLED"] = "true"
+#os.environ["OTEL_SDK_DISABLED"] = "true"
 
 logging.getLogger("strands").setLevel(logging.ERROR)
 logging.getLogger("botocore").setLevel(logging.ERROR)
@@ -27,6 +27,7 @@ logging.basicConfig(level=logging.ERROR)
 # ── AWS Clients ──────────────────────────────────────────────
 dynamodb   = boto3.resource("dynamodb", region_name="us-east-1")
 logs_table = dynamodb.Table("AgentLogs")
+s3_client  = boto3.client("s3", region_name="us-east-1")
 
 # ── Constants ────────────────────────────────────────────────
 AGENT_NAME    = "my_agent1"
@@ -37,6 +38,8 @@ MODEL_ID      = "arn:aws:bedrock:us-east-1:636052469006:inference-profile/global
 AGENT_ARN     = f"arn:aws:bedrock-agentcore:{REGION}:{ACCOUNT_ID}:runtime/{RUNTIME_ID}"
 LOG_GROUP     = f"/aws/bedrock-agentcore/runtimes/{RUNTIME_ID}-DEFAULT"
 LOG_GROUP_ENC = LOG_GROUP.replace("/", "%2F")
+PRICE_BUCKET  = os.environ.get("PRICE_BUCKET", f"my-agent1-price-catalog-{ACCOUNT_ID}-{REGION}")
+PRICE_KEY     = os.environ.get("PRICE_KEY", "pricing/catalog.json")
 
 LINKS = {
     "genai_dashboard": (
@@ -109,6 +112,37 @@ def get_system_prompt() -> str:
         print(f"WARNING: Could not read system prompt from AgentConfig: {e}", flush=True)
     # Fallback if DynamoDB is unreachable
     return "Helpful general chatbot. Keep responses concise and clear."
+
+
+def get_price_catalog() -> dict:
+    """
+    Read pricing data from S3 so the runtime can follow the latest catalog
+    without code changes or redeploys.
+    """
+    try:
+        result = s3_client.get_object(Bucket=PRICE_BUCKET, Key=PRICE_KEY)
+        raw = result["Body"].read().decode("utf-8")
+        catalog = json.loads(raw)
+        if isinstance(catalog, dict):
+            return catalog
+    except Exception as e:
+        print(f"WARNING: Could not read pricing catalog from S3: {e}", flush=True)
+    return {}
+
+
+def build_runtime_system_prompt() -> str:
+    base_prompt = get_system_prompt()
+    catalog = get_price_catalog()
+    if not catalog:
+        return base_prompt
+
+    catalog_lines = [f"- {machine}: {price}" for machine, price in sorted(catalog.items())]
+    catalog_block = "\n".join(catalog_lines)
+    return (
+        f"{base_prompt}\n\n"
+        f"Price data source: S3 bucket '{PRICE_BUCKET}', key '{PRICE_KEY}'.\n"
+        f"Use the following latest machine price list exactly as provided:\n{catalog_block}"
+    )
 
 # ── Helper: write log to DynamoDB ───────────────────────────
 def write_log(data: dict):
@@ -197,7 +231,7 @@ def handler(payload, context):
 
         agent = Agent(
             model=model,
-            system_prompt=get_system_prompt(),
+            system_prompt=build_runtime_system_prompt(),
         )
 
         result = agent(prompt)
