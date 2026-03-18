@@ -4,6 +4,7 @@ import boto3
 import time
 import uuid
 import base64
+import re
 from datetime import datetime, timezone
 from bedrock_agentcore import BedrockAgentCoreApp
 from strands import Agent
@@ -28,6 +29,7 @@ logging.basicConfig(level=logging.ERROR)
 dynamodb   = boto3.resource("dynamodb", region_name="us-east-1")
 logs_table = dynamodb.Table("AgentLogs")
 s3_client  = boto3.client("s3", region_name="us-east-1")
+logs_client = boto3.client("logs", region_name="us-east-1")
 
 # ── Constants ────────────────────────────────────────────────
 AGENT_NAME    = "my_agent1"
@@ -37,6 +39,9 @@ ACCOUNT_ID    = "636052469006"
 MODEL_ID      = "arn:aws:bedrock:us-east-1:636052469006:inference-profile/global.anthropic.claude-sonnet-4-6"
 AGENT_ARN     = f"arn:aws:bedrock-agentcore:{REGION}:{ACCOUNT_ID}:runtime/{RUNTIME_ID}"
 LOG_GROUP     = f"/aws/bedrock-agentcore/runtimes/{RUNTIME_ID}-DEFAULT"
+# Fixed stream – all agent_request_trace events land here so the backend
+# can read them reliably via get_log_events without per-invocation stream discovery.
+LOG_STREAM    = "agent-traces"
 LOG_GROUP_ENC = LOG_GROUP.replace("/", "%2F")
 PRICE_BUCKET  = os.environ.get("PRICE_BUCKET", f"my-agent1-price-catalog-{ACCOUNT_ID}-{REGION}")
 PRICE_KEY     = os.environ.get("PRICE_KEY", "pricing/catalog.json")
@@ -64,6 +69,32 @@ LINKS = {
         f"#/agentcore/runtimes/{RUNTIME_ID}"
     ),
 }
+
+# ── Helper: write structured trace to a fixed CloudWatch log stream ──
+_log_stream_ready = False
+
+def _put_trace_to_fixed_stream(record: dict) -> None:
+    global _log_stream_ready
+    if not _log_stream_ready:
+        try:
+            logs_client.create_log_stream(logGroupName=LOG_GROUP, logStreamName=LOG_STREAM)
+        except logs_client.exceptions.ResourceAlreadyExistsException:
+            pass
+        except Exception:
+            pass
+        _log_stream_ready = True
+    try:
+        logs_client.put_log_events(
+            logGroupName=LOG_GROUP,
+            logStreamName=LOG_STREAM,
+            logEvents=[{
+                "timestamp": int(time.time() * 1000),
+                "message": json.dumps(record, ensure_ascii=True),
+            }],
+        )
+    except Exception as exc:
+        print(f"WARNING: could not write to fixed log stream: {exc}", flush=True)
+
 
 # ── Helper: Decode Cognito JWT ───────────────────────────────
 def decode_jwt_user(token: str) -> dict:
@@ -144,6 +175,56 @@ def build_runtime_system_prompt() -> str:
         f"Use the following latest machine price list exactly as provided:\n{catalog_block}"
     )
 
+
+def _extract_price_items(prompt: str, catalog: dict) -> list:
+    if not prompt or not isinstance(catalog, dict):
+        return []
+
+    text = str(prompt).upper()
+    keys = {str(k).upper(): int(v) for k, v in catalog.items() if isinstance(v, (int, float, str))}
+    items = []
+
+    # Matches "21MRI", "21 MRI", "21 MRI MACHINES" etc.
+    for qty_text, machine_text in re.findall(r"(\d+)\s*([A-Z]+)", text):
+        machine = machine_text.strip().upper()
+        if machine not in keys:
+            continue
+        qty = int(qty_text)
+        if qty <= 0:
+            continue
+        items.append((machine, qty, int(keys[machine])))
+
+    return items
+
+
+def _build_deterministic_price_answer(prompt: str, catalog: dict) -> str:
+    text = str(prompt or "")
+    lower = text.lower()
+    if not any(word in lower for word in ["cost", "price", "total"]):
+        return ""
+
+    items = _extract_price_items(text, catalog)
+    if not items:
+        return ""
+
+    line_totals = []
+    total = 0
+    for machine, qty, unit_price in items:
+        line_total = qty * unit_price
+        total += line_total
+        line_totals.append((machine, qty, unit_price, line_total))
+
+    lines = [
+        f"The total price is ${total:,.0f}.",
+    ]
+    for machine, qty, unit_price, line_total in line_totals:
+        lines.append(f"{machine}: {qty} x ${unit_price:,.0f} = ${line_total:,.0f}")
+    lines.append(
+        "Combined Total: " + " + ".join(f"${lt:,.0f}" for _, _, _, lt in line_totals) + f" = ${total:,.0f}"
+    )
+
+    return json.dumps({"explanation": "\n".join(lines)})
+
 # ── Helper: write log to DynamoDB ───────────────────────────
 def write_log(data: dict):
     try:
@@ -159,7 +240,9 @@ app = BedrockAgentCoreApp()
 def handler(payload, context):
     start_time    = time.time()
     request_id    = str(uuid.uuid4())
-    session_id    = getattr(context, "session_id", "unknown")
+    client_request_id = str(payload.get("client_request_id", "")).strip()
+    context_session_id = getattr(context, "session_id", None)
+    session_id    = context_session_id or str(payload.get("session_id", "")).strip() or None
     tools_used    = []
     error_msg     = ""
     answer        = ""
@@ -266,6 +349,7 @@ def handler(payload, context):
                 f"https://console.aws.amazon.com/cloudwatch/home?region={REGION}"
                 f"#xray:traces/{xray_trace_id}"
             )
+            print(xray_trace_id)
         except Exception:
             xray_trace_id = "unavailable"
             xray_link     = LINKS["xray_all_traces"]
@@ -279,6 +363,7 @@ def handler(payload, context):
         runtime_log = {
             # ── Agent identity ────────────────────────────────
             "request_id":    request_id,
+            "client_request_id": client_request_id,
             "session_id":    session_id,
             "agent_name":    AGENT_NAME,
             "agent_arn":     AGENT_ARN,
@@ -360,8 +445,23 @@ def handler(payload, context):
 
         # Emit one deterministic stdout log event to avoid multi-handler duplicates.
         print(f"INFO:my_agent1:{json.dumps(cloudwatch_trace, ensure_ascii=True)}", flush=True)
+        # Also write to a fixed log stream so chat_handler can find it reliably
+        # without per-invocation stream discovery.
+        _put_trace_to_fixed_stream(cloudwatch_trace)
 
-    return {"answer": answer}
+    return {
+        "answer": answer,
+        "request_id": request_id,
+        "client_request_id": client_request_id,
+        "session_id": session_id,
+        "xray_trace_id": xray_trace_id,
+        "latency_ms": latency_ms,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": input_tokens + output_tokens,
+        "status": status,
+        "error": error_msg,
+    }
 
 if __name__ == "__main__":
     app.run()

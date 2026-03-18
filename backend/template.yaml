@@ -52,16 +52,43 @@ Resources:
                 - bedrock-agentcore:Invoke*
                 - bedrock-agentcore-runtime:Invoke*
               Resource: '*'
+            - Effect: Allow
+              Action:
+                - logs:FilterLogEvents
+                - logs:GetLogEvents
+                - logs:DescribeLogGroups
+                - logs:DescribeLogStreams
+              Resource: '*'
+            - Effect: Allow
+              Action:
+                - xray:BatchGetTraces
+                - xray:GetTraceSummaries
+              Resource: '*'
+            - Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+                - bedrock:InvokeModelWithResponseStream
+              Resource: '*'
       Environment:
         Variables:
           AGENTCORE_RUNTIME_URL: !Ref AgentRuntimeUrl
           EVALUATOR_RUNTIME_URL: !Ref EvaluatorRuntimeUrl
+          AGENTCORE_RUNTIME_ID: my_agent1-EuvQcG3t0u
+          EVALUATOR_RUNTIME_ID: hyperGray_Agent-bNWvhnEOaB
+          EVALUATOR_LOG_GROUP: /aws/bedrock-agentcore/evaluations/results/evaluation_quick_start_1773400924069-RMD3JBHdQM
+          DIAGNOSIS_MODEL_ID: arn:aws:bedrock:us-east-1:636052469006:inference-profile/global.anthropic.claude-sonnet-4-6
       Events:
         ChatPost:
           Type: HttpApi
           Properties:
             ApiId: !Ref ChatApi
             Path: /chat
+            Method: POST
+        SessionInsightsPost:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref ChatApi
+            Path: /session-insights
             Method: POST
 
 Outputs:
