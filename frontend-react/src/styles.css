@@ -206,6 +206,10 @@ h1 {
   background: rgba(9, 19, 43, 0.65);
 }
 
+.anchor-grid--single {
+  grid-template-columns: 1fr;
+}
+
 .anchor-grid label {
   display: grid;
   gap: 6px;

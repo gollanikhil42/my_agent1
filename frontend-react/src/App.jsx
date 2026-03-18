@@ -252,10 +252,10 @@ function App({ signOut, user }) {
       return;
     }
 
-    if (!Object.values(effectiveAnchors).some(Boolean)) {
+    if (!effectiveAnchors.xray_trace_id) {
       setLogMessages((prev) => [
         ...prev,
-        makeMessage("system", "No anchors available yet. Send one assistant prompt first to capture trace IDs.", "metric"),
+        makeMessage("system", "No trace ID available yet. Send one assistant prompt first to capture a trace ID.", "metric"),
       ]);
       return;
     }
@@ -445,41 +445,33 @@ function App({ signOut, user }) {
         <section className="chat-card glass">
           <div className="anchors-head">
             <h2>Session Anchors</h2>
-            <p>Current session IDs are prefilled as placeholders. You can edit to query older sessions.</p>
+            <p>Trace ID is auto-captured from your last chat message. You can paste an older trace ID to query historical sessions.</p>
           </div>
 
-          <div className="anchor-grid">
-            {[
-              { key: "request_id", label: "Request ID" },
-              { key: "client_request_id", label: "Client Request ID" },
-              { key: "session_id", label: "Session ID" },
-              { key: "evaluator_session_id", label: "Evaluator Session ID" },
-              { key: "xray_trace_id", label: "X-Ray Trace ID" },
-            ].map(({ key, label }) => (
-              <label key={label}>
-                <span>{label}</span>
-                <div className="anchor-input-wrap">
-                  <input
-                    value={analystAnchors[key] || ""}
-                    onChange={(e) =>
-                      setAnalystAnchors((prev) => ({
-                        ...prev,
-                        [key]: e.target.value.trim(),
-                      }))
-                    }
-                    placeholder={autoAnchors[key] || "not available yet"}
-                  />
-                  <button
-                    type="button"
-                    className="copy-icon"
-                    onClick={() => copyToClipboard(effectiveAnchors[key], `anchor-${label}`)}
-                    title={`Copy ${label}`}
-                  >
-                    {copiedId === `anchor-${label}` ? "Copied" : "Copy"}
-                  </button>
-                </div>
-              </label>
-            ))}
+          <div className="anchor-grid anchor-grid--single">
+            <label>
+              <span>X-Ray Trace ID</span>
+              <div className="anchor-input-wrap">
+                <input
+                  value={analystAnchors.xray_trace_id || ""}
+                  onChange={(e) =>
+                    setAnalystAnchors((prev) => ({
+                      ...prev,
+                      xray_trace_id: e.target.value.trim(),
+                    }))
+                  }
+                  placeholder={autoAnchors.xray_trace_id || "send a chat message to capture trace ID"}
+                />
+                <button
+                  type="button"
+                  className="copy-icon"
+                  onClick={() => copyToClipboard(effectiveAnchors.xray_trace_id, "anchor-xray")}
+                  title="Copy X-Ray Trace ID"
+                >
+                  {copiedId === "anchor-xray" ? "Copied" : "Copy"}
+                </button>
+              </div>
+            </label>
           </div>
 
           {latestMerged && (

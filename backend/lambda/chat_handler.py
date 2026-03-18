@@ -140,7 +140,7 @@ def _signed_post(url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         return {"answer": text}
 
 
-def _json_from_log_message(how message: str) -> Dict[str, Any]:
+def _json_from_log_message(message: str) -> Dict[str, Any]:
     if not message:
         return {}
     first = message.find("{")
@@ -890,13 +890,17 @@ def _handle_session_insights(event: Dict[str, Any]) -> Dict[str, Any]:
             "body": json.dumps({"error": "Provide at least one of request_id, session_id, evaluator_session_id, xray_trace_id, client_request_id"}),
         }
 
-    runtime_terms = {
-        "request_id": request_id,
-        "client_request_id": client_request_id,
-        "xray_trace_id": xray_trace_id,
-    }
-    if not any(runtime_terms.values()):
-        runtime_terms["session_id"] = session_id
+    # Trace-first correlation: use xray_trace_id as the primary key whenever available.
+    runtime_terms: Dict[str, str] = {}
+    if xray_trace_id:
+        runtime_terms["xray_trace_id"] = xray_trace_id
+    else:
+        runtime_terms = {
+            "request_id": request_id,
+            "client_request_id": client_request_id,
+        }
+        if not any(runtime_terms.values()):
+            runtime_terms["session_id"] = session_id
 
     runtime_records = []
     _rt_start_ms = int((time.time() - lookback_hours * 3600) * 1000)
@@ -966,10 +970,11 @@ def _handle_session_insights(event: Dict[str, Any]) -> Dict[str, Any]:
     evaluator_events = []
     evaluator_groups_used = []
     # Evaluator result logs usually anchor on session and trace, not request/client IDs.
-    evaluator_terms = {
-        "session_id": evaluator_session_id or session_id,
-        "xray_trace_id": xray_trace_id,
-    }
+    evaluator_terms: Dict[str, str] = {}
+    if xray_trace_id:
+        evaluator_terms["xray_trace_id"] = xray_trace_id
+    elif evaluator_session_id or session_id:
+        evaluator_terms["session_id"] = evaluator_session_id or session_id
     if not any(evaluator_terms.values()):
         evaluator_terms["request_id"] = request_id
         evaluator_terms["client_request_id"] = client_request_id

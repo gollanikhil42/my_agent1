@@ -161,30 +161,14 @@ def get_price_catalog() -> dict:
     return {}
 
 
-def build_runtime_system_prompt() -> str:
-    base_prompt = get_system_prompt()
-    catalog = get_price_catalog()
-    if not catalog:
-        return base_prompt
-
-    catalog_lines = [f"- {machine}: {price}" for machine, price in sorted(catalog.items())]
-    catalog_block = "\n".join(catalog_lines)
-    return (
-        f"{base_prompt}\n\n"
-        f"Price data source: S3 bucket '{PRICE_BUCKET}', key '{PRICE_KEY}'.\n"
-        f"Use the following latest machine price list exactly as provided:\n{catalog_block}"
-    )
-
-
-def _extract_price_items(prompt: str, catalog: dict) -> list:
+def _build_retrieval_evidence(prompt: str, catalog: dict) -> dict:
     if not prompt or not isinstance(catalog, dict):
-        return []
+        return {}
 
     text = str(prompt).upper()
     keys = {str(k).upper(): int(v) for k, v in catalog.items() if isinstance(v, (int, float, str))}
-    items = []
-
-    # Matches "21MRI", "21 MRI", "21 MRI MACHINES" etc.
+    matched = []
+    seen = set()
     for qty_text, machine_text in re.findall(r"(\d+)\s*([A-Z]+)", text):
         machine = machine_text.strip().upper()
         if machine not in keys:
@@ -192,38 +176,58 @@ def _extract_price_items(prompt: str, catalog: dict) -> list:
         qty = int(qty_text)
         if qty <= 0:
             continue
-        items.append((machine, qty, int(keys[machine])))
+        key = (machine, qty)
+        if key in seen:
+            continue
+        seen.add(key)
+        matched.append(
+            {
+                "machine": machine,
+                "quantity": qty,
+                "unit_price": int(keys[machine]),
+                "line_total": int(keys[machine]) * qty,
+            }
+        )
 
-    return items
+    if not matched:
+        return {}
+
+    total = sum(item["line_total"] for item in matched)
+    return {
+        "source": {"bucket": PRICE_BUCKET, "key": PRICE_KEY},
+        "retrieved_at": datetime.now(timezone.utc).isoformat(),
+        "items": matched,
+        "computed_total": total,
+    }
 
 
-def _build_deterministic_price_answer(prompt: str, catalog: dict) -> str:
-    text = str(prompt or "")
-    lower = text.lower()
-    if not any(word in lower for word in ["cost", "price", "total"]):
-        return ""
+def build_runtime_system_prompt(retrieval_evidence: dict | None = None) -> str:
+    base_prompt = get_system_prompt()
+    catalog = get_price_catalog()
+    if not catalog:
+        if retrieval_evidence:
+            return (
+                f"{base_prompt}\n\n"
+                "RETRIEVAL_EVIDENCE_JSON (fetched at runtime):\n"
+                f"{json.dumps(retrieval_evidence, ensure_ascii=True)}\n"
+                "Use this evidence as the source of truth when relevant, and cite it explicitly."
+            )
+        return base_prompt
 
-    items = _extract_price_items(text, catalog)
-    if not items:
-        return ""
-
-    line_totals = []
-    total = 0
-    for machine, qty, unit_price in items:
-        line_total = qty * unit_price
-        total += line_total
-        line_totals.append((machine, qty, unit_price, line_total))
-
-    lines = [
-        f"The total price is ${total:,.0f}.",
-    ]
-    for machine, qty, unit_price, line_total in line_totals:
-        lines.append(f"{machine}: {qty} x ${unit_price:,.0f} = ${line_total:,.0f}")
-    lines.append(
-        "Combined Total: " + " + ".join(f"${lt:,.0f}" for _, _, _, lt in line_totals) + f" = ${total:,.0f}"
+    catalog_lines = [f"- {machine}: {price}" for machine, price in sorted(catalog.items())]
+    catalog_block = "\n".join(catalog_lines)
+    prompt_text = (
+        f"{base_prompt}\n\n"
+        f"Price data source: S3 bucket '{PRICE_BUCKET}', key '{PRICE_KEY}'.\n"
+        f"Use the following latest machine price list exactly as provided:\n{catalog_block}"
     )
-
-    return json.dumps({"explanation": "\n".join(lines)})
+    if retrieval_evidence:
+        prompt_text += (
+            "\n\nRETRIEVAL_EVIDENCE_JSON (fetched at runtime):\n"
+            f"{json.dumps(retrieval_evidence, ensure_ascii=True)}\n"
+            "When answering about prices, rely on this evidence and cite the source bucket/key."
+        )
+    return prompt_text
 
 # ── Helper: write log to DynamoDB ───────────────────────────
 def write_log(data: dict):
@@ -249,6 +253,7 @@ def handler(payload, context):
     status        = "success"
     input_tokens  = 0
     output_tokens = 0
+    retrieval_evidence = {}
 
     # ── Extract input params ─────────────────────────────────
     prompt      = payload.get("prompt", "")
@@ -310,11 +315,14 @@ def handler(payload, context):
         model_kwargs["top_k"] = top_k
 
     try:
+        price_catalog = get_price_catalog()
+        retrieval_evidence = _build_retrieval_evidence(prompt, price_catalog)
+
         model = BedrockModel(**model_kwargs)
 
         agent = Agent(
             model=model,
-            system_prompt=build_runtime_system_prompt(),
+            system_prompt=build_runtime_system_prompt(retrieval_evidence=retrieval_evidence),
         )
 
         result = agent(prompt)
@@ -425,6 +433,7 @@ def handler(payload, context):
                 "top_p": top_p,
                 "top_k": top_k,
                 "jwt_present": bool(jwt_token),
+                "retrieval_evidence": retrieval_evidence,
             },
             "response_payload": {
                 "answer": answer,
@@ -459,6 +468,7 @@ def handler(payload, context):
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "total_tokens": input_tokens + output_tokens,
+        "retrieval_evidence": retrieval_evidence,
         "status": status,
         "error": error_msg,
     }
