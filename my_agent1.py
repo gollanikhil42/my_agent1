@@ -210,7 +210,7 @@ def build_runtime_system_prompt(retrieval_evidence: dict | None = None) -> str:
                 f"{base_prompt}\n\n"
                 "RETRIEVAL_EVIDENCE_JSON (fetched at runtime):\n"
                 f"{json.dumps(retrieval_evidence, ensure_ascii=True)}\n"
-                "Use this evidence as the source of truth when relevant, and cite it explicitly."
+                "Use this evidence as the source of truth when relevant."
             )
         return base_prompt
 
@@ -218,16 +218,23 @@ def build_runtime_system_prompt(retrieval_evidence: dict | None = None) -> str:
     catalog_block = "\n".join(catalog_lines)
     prompt_text = (
         f"{base_prompt}\n\n"
-        f"Price data source: S3 bucket '{PRICE_BUCKET}', key '{PRICE_KEY}'.\n"
         f"Use the following latest machine price list exactly as provided:\n{catalog_block}"
     )
     if retrieval_evidence:
         prompt_text += (
             "\n\nRETRIEVAL_EVIDENCE_JSON (fetched at runtime):\n"
             f"{json.dumps(retrieval_evidence, ensure_ascii=True)}\n"
-            "When answering about prices, rely on this evidence and cite the source bucket/key."
+            "When answering about prices, rely on this evidence."
         )
     return prompt_text
+
+
+def _sanitize_answer_text(answer: str) -> str:
+    text = str(answer or "")
+    # Remove source disclosure suffixes from user-facing text.
+    text = re.sub(r"\s*\(\s*source\s*:[^)]+\)", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s*source\s*:\s*my-agent1-price-catalog[^\n\r]*", "", text, flags=re.IGNORECASE)
+    return text.strip()
 
 # ── Helper: write log to DynamoDB ───────────────────────────
 def write_log(data: dict):
@@ -326,7 +333,7 @@ def handler(payload, context):
         )
 
         result = agent(prompt)
-        answer = str(result)
+        answer = _sanitize_answer_text(str(result))
 
         try:
             tools_used = list(result.metrics.tool_metrics.keys())
@@ -458,6 +465,11 @@ def handler(payload, context):
         # without per-invocation stream discovery.
         _put_trace_to_fixed_stream(cloudwatch_trace)
 
+    # Clean up retrieval_evidence: remove source metadata (bucket/key) to reduce noise
+    clean_evidence = {}
+    if retrieval_evidence:
+        clean_evidence = {k: v for k, v in retrieval_evidence.items() if k != "source"}
+    
     return {
         "answer": answer,
         "request_id": request_id,
@@ -468,7 +480,7 @@ def handler(payload, context):
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "total_tokens": input_tokens + output_tokens,
-        "retrieval_evidence": retrieval_evidence,
+        "retrieval_evidence": clean_evidence,
         "status": status,
         "error": error_msg,
     }

@@ -76,7 +76,7 @@ function App({ signOut, user }) {
     {
       id: crypto.randomUUID(),
       role: "system",
-      text: "Session Log Analyst ready. Provide request/session/trace anchor and ask a question.",
+      text: "Analyser logs ready. Provide request/session/trace anchor and ask a question.",
       variant: "status",
       timestamp: stamp(),
     },
@@ -99,7 +99,8 @@ function App({ signOut, user }) {
   const [latestMerged, setLatestMerged] = useState(null);
   const [busyChat, setBusyChat] = useState(false);
   const [busyLog, setBusyLog] = useState(false);
-  const [analystMode, setAnalystMode] = useState("fleet_1h");
+  const [analystMode, setAnalystMode] = useState("fleet_window");
+  const [logLookbackHours, setLogLookbackHours] = useState(5);
   const [copiedId, setCopiedId] = useState("");
   const [profile, setProfile] = useState({ name: user?.username || "User", department: "", role: "" });
 
@@ -192,16 +193,7 @@ function App({ signOut, user }) {
       setMessages((prev) => {
         const next = [...prev, makeMessage("assistant", answer)];
 
-        if (trace?.request_id || trace?.session_id || trace?.xray_trace_id) {
-          next.push({
-            ...makeMessage(
-              "system",
-              `Trace: request_id=${trace.request_id || "n/a"} | session_id=${trace.session_id || "n/a"} | evaluator_session_id=${trace.evaluator_session_id || "n/a"}${trace.runtime_session_id ? ` | runtime_session_id=${trace.runtime_session_id}` : ""} | xray_trace_id=${trace.xray_trace_id || "n/a"}`,
-              "metric",
-            ),
-            variant: "metric",
-          });
-        }
+        // Trace metadata is captured but not displayed in chat to keep UI clean
 
         if (evaluator?.evaluation?.scores) {
           const s = evaluator.evaluation.scores;
@@ -285,7 +277,7 @@ function App({ signOut, user }) {
           session_id: analystMode === "single_trace" ? effectiveAnchors.session_id : "",
           evaluator_session_id: analystMode === "single_trace" ? effectiveAnchors.evaluator_session_id : "",
           xray_trace_id: analystMode === "single_trace" ? effectiveAnchors.xray_trace_id : "",
-          lookback_hours: analystMode === "fleet_1h" ? 1 : 48,
+          lookback_hours: analystMode === "single_trace" ? 48 : logLookbackHours,
         }),
       });
 
@@ -295,49 +287,7 @@ function App({ signOut, user }) {
         : data.error || data.message || `Request failed (${response.status})`;
 
       setLogMessages((prev) => {
-        const next = [...prev, makeMessage("assistant", answer)];
-
-        if (response.ok && data?.anchors && analystMode === "single_trace") {
-          next.push({
-            ...makeMessage(
-              "system",
-              `Anchors used: request_id=${data.anchors.request_id || "n/a"} | session_id=${data.anchors.session_id || "n/a"} | evaluator_session_id=${data.anchors.evaluator_session_id || "n/a"} | xray_trace_id=${data.anchors.xray_trace_id || "n/a"}`,
-              "metric",
-            ),
-            variant: "metric",
-          });
-        }
-
-        if (response.ok && data?.merged) {
-          const merged = data.merged;
-          if (merged?.analysis_mode === "fleet_1h") {
-            const tracesTotal = merged?.fleet_metrics?.traces_total ?? 0;
-            const e2eP95 = merged?.fleet_metrics?.e2e_ms?.p95 ?? 0;
-            const top = merged?.bottleneck_ranking?.[0];
-            next.push({
-              ...makeMessage(
-                "system",
-                `1h Fleet: traces=${tracesTotal} | e2e p95=${e2eP95} ms${top ? ` | top bottleneck=${top.component}` : ""}`,
-                "metric",
-              ),
-              variant: "metric",
-            });
-          } else {
-            const slow = merged?.xray?.slowest_step;
-            const runtimeCount = merged?.runtime_records_found ?? 0;
-            const evaluatorCount = merged?.evaluator_records_found ?? 0;
-            next.push({
-              ...makeMessage(
-                "system",
-                `Records: runtime=${runtimeCount}, evaluator=${evaluatorCount}${slow ? ` | slowest=${slow.name} (${slow.duration_ms} ms)` : ""}`,
-                "metric",
-              ),
-              variant: "metric",
-            });
-          }
-        }
-
-        return next;
+        return [...prev, makeMessage("assistant", answer)];
       });
 
       if (response.ok && data?.anchors && analystMode === "single_trace") {
@@ -403,7 +353,7 @@ function App({ signOut, user }) {
       <header className="topbar glass">
         <div>
           <h1>
-            <span className="title-gradient">my_agent1</span> Intelligence Dashboard
+            <span className="title-gradient">Observability & Evaluations</span> Dashboard
           </h1>
           <p className="subtitle">AI operations cockpit for live chat intelligence and session diagnostics.</p>
         </div>
@@ -421,7 +371,7 @@ function App({ signOut, user }) {
             onClick={() => setMode("session")}
             type="button"
           >
-            Session Log Analyst
+            Analyser logs
           </button>
 
           <div className="identity-pill">
@@ -461,7 +411,7 @@ function App({ signOut, user }) {
         <section className="chat-card glass">
           <div className="anchors-head">
             <h2>Session Anchors</h2>
-            <p>{analystMode === "fleet_1h" ? "Fleet mode analyzes all traces in the last hour across X-Ray, runtime, and evaluator logs." : "Trace ID is auto-captured from your last chat message. You can paste an older trace ID to query historical sessions."}</p>
+            <p>{analystMode !== "single_trace" ? `Fleet mode analyzes all traces in the last ${logLookbackHours} hours across X-Ray, runtime, and evaluator logs.` : "Trace ID is auto-captured from your last chat message. You can paste an older trace ID to query historical sessions."}</p>
           </div>
 
           <div className="anchor-grid">
@@ -471,8 +421,22 @@ function App({ signOut, user }) {
                 value={analystMode}
                 onChange={(e) => setAnalystMode(e.target.value)}
               >
-                <option value="fleet_1h">All traces (last 1 hour)</option>
+                <option value="fleet_window">All traces (fleet window)</option>
                 <option value="single_trace">Single trace deep-dive</option>
+              </select>
+            </label>
+            <label>
+              <span>Timeframe (hours)</span>
+              <select
+                value={logLookbackHours}
+                onChange={(e) => setLogLookbackHours(Number(e.target.value) || 5)}
+                disabled={analystMode === "single_trace"}
+              >
+                <option value={1}>1 hour</option>
+                <option value={3}>3 hours</option>
+                <option value={5}>5 hours</option>
+                <option value={12}>12 hours</option>
+                <option value={24}>24 hours</option>
               </select>
             </label>
           </div>
@@ -507,7 +471,7 @@ function App({ signOut, user }) {
 
           {latestMerged && (
             <div className="insight-strip">
-              {latestMerged?.analysis_mode === "fleet_1h" ? (
+              {latestMerged?.analysis_mode === "fleet_window" || analystMode !== "single_trace" ? (
                 <>
                   <p>
                     Traces: <strong>{latestMerged?.fleet_metrics?.traces_total || 0}</strong>

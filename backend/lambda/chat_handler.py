@@ -61,6 +61,7 @@ FLEET_RUNTIME_LIMIT = int(os.environ.get("FLEET_RUNTIME_LIMIT", "1800"))
 FLEET_EVALUATOR_MAX_GROUPS = int(os.environ.get("FLEET_EVALUATOR_MAX_GROUPS", "10"))
 FLEET_EVALUATOR_PER_GROUP_LIMIT = int(os.environ.get("FLEET_EVALUATOR_PER_GROUP_LIMIT", "300"))
 FLEET_XRAY_MAX_TRACES = int(os.environ.get("FLEET_XRAY_MAX_TRACES", "600"))
+DELAY_THRESHOLD_MS = float(os.environ.get("DELAY_THRESHOLD_MS", "6000"))
 
 def _build_user_claims(event: Dict[str, Any]) -> Dict[str, str]:
     claims = (
@@ -156,6 +157,39 @@ def _json_from_log_message(message: str) -> Dict[str, Any]:
         return parsed if isinstance(parsed, dict) else {}
     except Exception:
         return {}
+
+
+def _sanitize_user_answer(text: str) -> str:
+    value = str(text or "")
+    value = re.sub(r"\s*\(\s*source\s*:[^)]+\)", "", value, flags=re.IGNORECASE)
+    value = re.sub(r"\s*source\s*:\s*my-agent1-price-catalog[^\n\r]*", "", value, flags=re.IGNORECASE)
+    return value.strip()
+
+
+def _sanitize_analysis_answer(text: str, traces_total: int = 0) -> str:
+    """Remove internal/debug lines from analyzer output and suppress noisy low-value text."""
+    value = str(text or "")
+    cleaned_lines: List[str] = []
+    for raw_line in value.splitlines():
+        line = raw_line.strip()
+        if not line:
+            cleaned_lines.append("")
+            continue
+        if re.match(r"^anchors\s+used\s*:", line, flags=re.IGNORECASE):
+            continue
+        if re.match(r"^tool\s+calls\s*:\s*none\s*\(0\s*tools\s*used\)", line, flags=re.IGNORECASE):
+            continue
+        if re.search(r"request_id=.*session_id=.*xray_trace_id=", line, flags=re.IGNORECASE):
+            continue
+        if traces_total >= 10 and re.match(r"^small sample size\s*\(", line, flags=re.IGNORECASE):
+            continue
+        if traces_total >= 10 and re.search(r"with only\s+\d+\s+traces.*reliable", line, flags=re.IGNORECASE):
+            continue
+        cleaned_lines.append(raw_line)
+
+    cleaned = "\n".join(cleaned_lines)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
 
 
 def _normalize_trace_id(value: str) -> str:
@@ -817,11 +851,14 @@ def _build_diagnosis(question: str, merged: Dict[str, Any]) -> str:
     system_prompt = (
         "You are a session log analyst for an AWS Bedrock AgentCore application. "
         "You have access to structured diagnostics data for a single agent session, "
-        "including runtime metadata (request IDs, latency, token counts), "
-        "X-Ray trace step timings, and evaluator quality metric scores. "
+        "including runtime metadata (latency, token counts), X-Ray trace step timings, "
+        "and evaluator quality metric scores. "
         "Answer the user's question concisely and accurately using only the data provided. "
-        "If specific data is missing or not available, say so explicitly. "
-        "Format numbers readably (e.g. '8,138 ms' or '8.1 s'). "
+        "FORMATTING RULES: Plain text only. No emojis, no markdown, no tables, no bullet points. "
+        "Short paragraphs and professional tone. "
+        "Format numbers readably (e.g. '8.1 seconds' or '3.4 seconds'). "
+        "Do not mention request IDs, session IDs, trace IDs, or internal anchor values unless user explicitly asks. "
+        "If tools_used is empty or zero, do not report it or mention it - S3 price retrieval is pre-injected as context before the model call, not a Bedrock tool call. "
         "Do not fabricate values."
     )
 
@@ -1018,19 +1055,214 @@ def _extract_duration_ms_from_payload(payload: Dict[str, Any]) -> float:
     return 0.0
 
 
+def _truncate_text(text: Any, limit: int = 220) -> str:
+    value = str(text or "").strip()
+    if len(value) <= limit:
+        return value
+    return value[:limit].rstrip() + "..."
+
+
+def _is_deep_dive_question(question: str) -> bool:
+    q = str(question or "").strip().lower()
+    if not q:
+        return False
+    deep_markers = [
+        "deep",
+        "detail",
+        "inner",
+        "raw",
+        "json",
+        "per trace",
+        "trace by trace",
+        "breakdown",
+        "table",
+        "drill",
+    ]
+    return any(marker in q for marker in deep_markers)
+
+
+def _short_trace(trace_id: str) -> str:
+    value = str(trace_id or "").strip()
+    if not value:
+        return "n/a"
+    compact = value.replace("-", "")
+    return compact[:8] + "..." if len(compact) > 8 else compact
+
+
+def _build_fleet_digest(question: str, merged: Dict[str, Any]) -> str:
+    window = merged.get("window", {})
+    metrics = merged.get("fleet_metrics", {})
+    bottlenecks = merged.get("bottleneck_ranking", [])
+    delayed = merged.get("delayed_traces", [])
+    threshold = _to_float(merged.get("delay_threshold_ms"))
+    traces_total = int(metrics.get("traces_total", 0) or 0)
+    complete_total = int(metrics.get("traces_complete_3stage", 0) or 0)
+    e2e = metrics.get("e2e_ms", {})
+    top = bottlenecks[0] if bottlenecks else {}
+
+    component_labels = {
+        "runtime": "Runtime",
+        "model_or_handoff_gap": "Model/Handoff Gap",
+        "evaluator": "Evaluator",
+    }
+    top_component = component_labels.get(str(top.get("component", "")), str(top.get("component", "n/a") or "n/a"))
+    top_p95 = _to_float(top.get("p95_ms"))
+    delayed_count = int(merged.get("delayed_traces_count", len(delayed)) or 0)
+
+    lines = []
+    lines.append("Quick Summary")
+    lines.append(
+        f"- Window: {int(window.get('duration_minutes', 0) or 0)} minutes | Traces: {traces_total} | Complete 3-stage: {complete_total}"
+    )
+    lines.append(
+        f"- Latency: p50 {round(_to_float(e2e.get('p50')), 0):.0f} ms | p95 {round(_to_float(e2e.get('p95')), 0):.0f} ms | max {round(_to_float(e2e.get('max')), 0):.0f} ms"
+    )
+    lines.append(
+        f"- Main bottleneck: {top_component} (p95 {round(top_p95, 0):.0f} ms, impact {round(_to_float(top.get('impact_score')) * 100, 0):.0f}%)"
+    )
+    lines.append(
+        f"- Delayed traces (>{round(threshold, 0):.0f} ms): {delayed_count}"
+    )
+
+    if delayed:
+        samples = []
+        for row in delayed[:3]:
+            samples.append(f"{_short_trace(str(row.get('trace_id', '')))} ({round(_to_float(row.get('e2e_ms')), 0):.0f} ms)")
+        lines.append(f"- Delayed examples: {', '.join(samples)}")
+
+    lines.append("- What this means: System is healthy if error/timeout rates are low, but response speed is mostly limited by runtime latency.")
+    lines.append("- Next best actions: optimize runtime/model path first, then reduce handoff gap.")
+
+    # Keep the first response intentionally concise and readable.
+    return "\n".join(lines)
+
+
+def _ask_for_prompt_upgrade(question: str, merged: Dict[str, Any]) -> str:
+    """Generate an upgraded system prompt based on analysis of the current one and context."""
+    context_excerpt = json.dumps(merged.get("fleet_metrics", {}), indent=2, default=str)
+    
+    meta_prompt = (
+        "You are a prompt engineering expert. Based on the user's question about system prompt improvement, "
+        "suggest a concrete, improved version of the fleet analyzer system prompt. "
+        "The improved prompt should be: human-centric, example-driven, include signal detection logic "
+        "(ResponseRelevance thresholds, sample size warnings), and prioritize natural readability. "
+        "Return the improved prompt as a single multi-line string, ready to use. "
+        "Do not include explanation or commentary—just the prompt itself."
+    )
+    
+    meta_content = (
+        f"Current system prompt goal: Analyze AWS Bedrock AgentCore fleet diagnostics concisely.\n\n"
+        f"Fleet context (sample metrics):\n{context_excerpt}\n\n"
+        f"User request: {question}\n\n"
+        f"Provide an upgraded system prompt that is more natural, includes examples of what to avoid, "
+        f"and includes instructions for detecting low ResponseRelevance, missing data, and small sample sizes."
+    )
+    
+    try:
+        response = BEDROCK_CLIENT.converse(
+            modelId=DIAGNOSIS_MODEL_ID,
+            system=[{"text": meta_prompt}],
+            messages=[{"role": "user", "content": [{"text": meta_content}]}],
+            inferenceConfig={"maxTokens": 800, "temperature": 0.2},
+        )
+        return response["output"]["message"]["content"][0]["text"]
+    except Exception as exc:
+        return f"Could not generate upgraded prompt: {exc}"
+
+
+def _is_prompt_upgrade_request(question: str) -> bool:
+    """Detect if user is asking to improve/upgrade the system prompt."""
+    q = str(question or "").strip().lower()
+    markers = ["upgrade prompt", "improve prompt", "better prompt", "suggest prompt", "new prompt", "system prompt improvement", "refine prompt"]
+    return any(marker in q for marker in markers)
+
+
+def _build_fleet_summary_with_llm(question: str, merged: Dict[str, Any]) -> str:
+    # Handle prompt upgrade request separately
+    if _is_prompt_upgrade_request(question):
+        return _ask_for_prompt_upgrade(question, merged)
+    
+    window_minutes = int(merged.get("window", {}).get("duration_minutes", 0) or 0)
+    traces_total = int(merged.get("fleet_metrics", {}).get("traces_total", 0) or 0)
+    context_json = json.dumps(merged, indent=2, default=str)
+    user_question = question.strip() if question and question.strip() else "Give me a short summary of the fleet window."
+
+    system_prompt = (
+        "You are a session log analyst for an AWS Bedrock AgentCore system.\n\n"
+        "Answer the user's question using ONLY the provided merged diagnostics payload.\n\n"
+        "FORMATTING RULES (STRICT):\n"
+        "- NO emojis, no special symbols, no quotation marks around examples\n"
+        "- Plain text only. Use line breaks for clarity, not markdown\n"
+        "- NO tables, NO bullet points, NO excessive indentation\n"
+        "- Use simple sentences and short paragraphs\n"
+        "- Professional and minimal tone\n\n"
+        "RESPONSE STRUCTURE:\n"
+        "1. Start with a one or two sentence summary of the main finding\n"
+        f"2. If sample size is very small (< 10 traces), briefly note limited data (current: {traces_total})\n"
+        "3. Describe the main bottleneck in plain language\n"
+        "4. If user asks for delayed trace details: list each delayed trace on a new line with format 'Trace ID: [id], Latency: [time]ms, Runtime: [time]ms'\n"
+        "5. Wrap up with actionable next steps\n\n"
+        "CONTENT RULES:\n"
+        "- Avoid p50/p95/p99 distributions unless explicitly requested\n"
+        "- Round latencies to nearest 100ms (e.g., '3.4 seconds' not '3412 ms')\n"
+        "- Use 'most requests', 'a few cases', 'one clear outlier' instead of percentile language\n"
+        "- If ResponseRelevance is low (< 0.5): say 'response quality is questionable'\n"
+        "- If ResponseRelevance is moderate (0.5-0.7): say 'response may not fully match intent'\n"
+        "- If list of delayed traces is requested: provide each on separate line, no table, no markdown\n"
+        "- No colons with quoted values (write 'Runtime took 5.4 seconds' not 'Runtime: \"5.4 seconds\"')\n\n"
+        "TONE: Direct, professional, factual. No marketing language, no dramatic language."
+    )
+
+    user_content = (
+        f"Window size: {window_minutes} minutes. Total traces analyzed: {traces_total}.\n"
+        "Return a concise, natural answer that directly addresses the user's question.\n"
+        "If user asks for delayed trace details: list each trace as 'Trace [id], Latency [time]ms, Runtime [time]ms' on separate lines.\n"
+        "Keep formatting minimal and professional.\n\n"
+        f"Merged diagnostics payload:\n```json\n{context_json}\n```\n\n"
+        f"User question: {user_question}"
+    )
+
+    try:
+        response = BEDROCK_CLIENT.converse(
+            modelId=DIAGNOSIS_MODEL_ID,
+            system=[{"text": system_prompt}],
+            messages=[{"role": "user", "content": [{"text": user_content}]}],
+            inferenceConfig={"maxTokens": 520, "temperature": 0.1},
+        )
+        answer = response["output"]["message"]["content"][0]["text"]
+        return answer
+    except Exception as exc:
+        return f"Analysis unavailable: {exc}"
+
+
 def _build_fleet_diagnosis(question: str, merged: Dict[str, Any]) -> str:
+    window_minutes = int(merged.get("window", {}).get("duration_minutes", 0) or 0)
+    detail_level = "deep_dive" if _is_deep_dive_question(question) else "summary_first"
+
+    if detail_level == "summary_first":
+        try:
+            return _build_fleet_summary_with_llm(question, merged)
+        except Exception:
+            return _build_fleet_digest(question, merged)
+
     system_prompt = (
         "You are a session log analyst for an AWS Bedrock AgentCore system. "
-        "You receive 1-hour, all-traces merged diagnostics from X-Ray, runtime logs, and evaluator logs. "
+        f"You receive merged diagnostics from X-Ray, runtime logs, and evaluator logs for a {window_minutes}-minute window. "
         "Identify latency bottlenecks, delay points between stages, and likely causes based only on provided data. "
         "If a metric is inferred/approximate, state that explicitly. "
-        "Return concise, practical recommendations ranked by impact. Do not fabricate values."
+        "FORMATTING: Use plain text only, no emojis, no tables, no markdown. Keep it professional and concise. "
+        "Default behavior: provide a clean, human-readable executive summary first. "
+        "Only provide deep technical detail if the user explicitly asks for deep-dive/raw details. "
+        "Use short sections, plain language, and professional formatting. "
+        "Do not fabricate values."
     )
 
     context_json = json.dumps(merged, indent=2, default=str)
-    user_question = question.strip() if question and question.strip() else "Analyze this 1-hour fleet window and rank bottlenecks."
+    user_question = question.strip() if question and question.strip() else "Analyze this fleet window and rank bottlenecks."
     user_content = (
-        "Here is the 1-hour merged diagnostics payload:\n\n"
+        f"Requested response level: {detail_level}.\n"
+        f"Window size: {window_minutes} minutes.\n"
+        "Here is the merged diagnostics payload:\n\n"
         f"```json\n{context_json}\n```\n\n"
         f"Question: {user_question}"
     )
@@ -1047,6 +1279,24 @@ def _build_fleet_diagnosis(question: str, merged: Dict[str, Any]) -> str:
         return f"Fleet diagnosis unavailable: {exc}"
 
 
+def _compute_response_relevance(trace_diagnostics: List[Dict[str, Any]]) -> float:
+    """Compute average ResponseRelevance score from evaluator_scores across all traces."""
+    relevance_scores = []
+    for diag in trace_diagnostics:
+        eval_scores = diag.get("evaluator_scores", {})
+        if isinstance(eval_scores, dict):
+            for metric_name, metric_data in eval_scores.items():
+                if "relevance" in str(metric_name).lower():
+                    score = metric_data.get("score")
+                    if score is not None:
+                        relevance_scores.append(_to_float(score))
+    
+    if relevance_scores:
+        avg = sum(relevance_scores) / len(relevance_scores)
+        return round(min(1.0, max(0.0, avg)), 3)
+    return None
+
+
 def _handle_fleet_insights(question: str, lookback_hours: int) -> Dict[str, Any]:
     runtime_records = _fetch_runtime_records_window(lookback_hours=lookback_hours, limit=max(200, FLEET_RUNTIME_LIMIT))
     evaluator_fetch = _fetch_evaluator_records_window(
@@ -1059,6 +1309,7 @@ def _handle_fleet_insights(question: str, lookback_hours: int) -> Dict[str, Any]
     xray_summaries = _fetch_xray_trace_summaries_window(lookback_hours=lookback_hours, max_traces=max(100, FLEET_XRAY_MAX_TRACES))
 
     traces: Dict[str, Dict[str, Any]] = {}
+    runtime_details_by_trace: Dict[str, Dict[str, Any]] = {}
 
     for rec in runtime_records:
         trace_id = _normalize_trace_id(str(rec.get("xray_trace_id", "")))
@@ -1086,6 +1337,39 @@ def _handle_fleet_insights(question: str, lookback_hours: int) -> Dict[str, Any]
             item["status"] = str(rec.get("response_payload", {}).get("status"))
         if rec.get("response_payload", {}).get("error"):
             item["status"] = "error"
+
+        existing = runtime_details_by_trace.get(trace_id, {})
+        existing_ts = _to_float(existing.get("_ts"))
+        current_ts = _to_float(rec.get("_cloudwatch_timestamp"))
+        if not existing or current_ts >= existing_ts:
+            tools_used = rec.get("metrics", {}).get("tools_used", [])
+            runtime_details_by_trace[trace_id] = {
+                "_ts": current_ts,
+                "user": {
+                    "user_id": str(rec.get("user_id", "")),
+                    "user_name": str(rec.get("user_name", "")),
+                    "department": str(rec.get("department", "")),
+                    "user_role": str(rec.get("user_role", "")),
+                },
+                "token_usage": {
+                    "input": _to_float(rec.get("metrics", {}).get("input_tokens")),
+                    "output": _to_float(rec.get("metrics", {}).get("output_tokens")),
+                    "total": _to_float(rec.get("metrics", {}).get("total_tokens")),
+                },
+                "model_invocation": {
+                    "model_id": str(rec.get("model_id") or rec.get("request_payload", {}).get("model_id") or ""),
+                    "prompt_excerpt": _truncate_text(rec.get("request_payload", {}).get("prompt", ""), 240),
+                    "answer_excerpt": _truncate_text(rec.get("response_payload", {}).get("answer", ""), 240),
+                },
+                "tool_trace": {
+                    "tools_used": tools_used if isinstance(tools_used, list) else [],
+                    "tool_call_count": len(tools_used) if isinstance(tools_used, list) else 0,
+                },
+                "reasoning_steps": {
+                    "available": False,
+                    "note": "Chain-of-thought is not logged. Tool trace and latency metrics are provided instead.",
+                },
+            }
 
     for rec in evaluator_records:
         trace_id = _extract_trace_id_from_payload(rec, rec.get("_cloudwatch_message", ""))
@@ -1139,6 +1423,7 @@ def _handle_fleet_insights(question: str, lookback_hours: int) -> Dict[str, Any]
         inferred = max(0.0, base_e2e - item["runtime_latency_ms"] - item["evaluator_latency_ms"])
         item["inferred_model_or_gap_ms"] = round(inferred, 2)
         item["e2e_ms"] = round(base_e2e, 2)
+        item["is_delayed"] = bool(item["e2e_ms"] >= DELAY_THRESHOLD_MS)
 
     all_traces = list(traces.values())
     complete_3stage = [
@@ -1200,13 +1485,68 @@ def _handle_fleet_insights(question: str, lookback_hours: int) -> Dict[str, Any]
         for i, t in enumerate(anomalies)
     ]
 
+    delayed_traces = [
+        {
+            "trace_id": t.get("trace_id", ""),
+            "e2e_ms": round(_to_float(t.get("e2e_ms")), 2),
+            "runtime_latency_ms": round(_to_float(t.get("runtime_latency_ms")), 2),
+            "evaluator_latency_ms": round(_to_float(t.get("evaluator_latency_ms")), 2),
+            "inferred_model_or_gap_ms": round(_to_float(t.get("inferred_model_or_gap_ms")), 2),
+            "status": t.get("status", "success"),
+        }
+        for t in sorted(all_traces, key=lambda row: _to_float(row.get("e2e_ms")), reverse=True)
+        if bool(t.get("is_delayed"))
+    ]
+
+    trace_diagnostics = []
+    for t in sorted(all_traces, key=lambda row: _to_float(row.get("e2e_ms")), reverse=True)[:120]:
+        trace_id = str(t.get("trace_id", ""))
+        rt = runtime_details_by_trace.get(trace_id, {})
+        trace_diagnostics.append(
+            {
+                "trace_id": trace_id,
+                "status": t.get("status", "success"),
+                "is_delayed": bool(t.get("is_delayed")),
+                "stage_latency_ms": {
+                    "runtime": round(_to_float(t.get("runtime_latency_ms")), 2),
+                    "model_or_handoff_gap": round(_to_float(t.get("inferred_model_or_gap_ms")), 2),
+                    "evaluator": round(_to_float(t.get("evaluator_latency_ms")), 2),
+                    "e2e": round(_to_float(t.get("e2e_ms")), 2),
+                },
+                "user": rt.get("user", {}),
+                "token_usage": rt.get("token_usage", {}),
+                "model_invocation": rt.get("model_invocation", {}),
+                "tool_trace": rt.get("tool_trace", {}),
+                "reasoning_steps": rt.get("reasoning_steps", {}),
+                "evaluator_scores": t.get("evaluator_metrics", {}),
+            }
+        )
+
     now_ts = time.time()
+    
+    # Compute ResponseRelevance score from evaluator metrics
+    response_relevance = _compute_response_relevance(trace_diagnostics)
+    
     merged = {
-        "analysis_mode": "fleet_1h",
+        "analysis_mode": "fleet_window",
         "window": {
             "start_epoch_ms": int((now_ts - lookback_hours * 3600) * 1000),
             "end_epoch_ms": int(now_ts * 1000),
             "duration_minutes": int(lookback_hours * 60),
+        },
+        "quality_indicators": {
+            "response_relevance": response_relevance,
+            "response_relevance_status": (
+                "low (likely incorrect)" if response_relevance is not None and response_relevance < 0.5
+                else "medium (may not match intent)" if response_relevance is not None and response_relevance < 0.7
+                else "high (reliable)" if response_relevance is not None and response_relevance >= 0.7
+                else "unknown (no evaluator data)"
+            ),
+            "trace_count_status": (
+                "small (may not be reliable)" if len(all_traces) < 50
+                else "adequate" if len(all_traces) < 200
+                else "large (highly reliable)"
+            ),
         },
         "sources": {
             "runtime": {"events_scanned": len(runtime_records), "traces_found": len({r.get('xray_trace_id', '') for r in runtime_records if r.get('xray_trace_id')})},
@@ -1227,11 +1567,21 @@ def _handle_fleet_insights(question: str, lookback_hours: int) -> Dict[str, Any]
         },
         "bottleneck_ranking": bottlenecks,
         "top_anomalies": top_anomalies,
+        "delay_threshold_ms": DELAY_THRESHOLD_MS,
+        "delayed_traces_count": len(delayed_traces),
+        "delayed_traces": delayed_traces[:50],
+        "trace_diagnostics": trace_diagnostics,
         "evaluator_groups_used": evaluator_groups_used,
         "trace_samples": top_anomalies[:5],
     }
 
-    answer = _build_fleet_diagnosis(question, merged)
+    # Log merged payload for debugging (what gets sent to Bedrock)
+    print(f"FLEET_ANALYSIS_MERGED_PAYLOAD: {json.dumps(merged, indent=2, default=str)}", flush=True)
+    
+    answer = _sanitize_analysis_answer(
+        _build_fleet_diagnosis(question, merged),
+        traces_total=len(all_traces),
+    )
     return {
         "statusCode": 200,
         "headers": CORS_HEADERS,
@@ -1287,8 +1637,8 @@ def _handle_session_insights(event: Dict[str, Any]) -> Dict[str, Any]:
     lookback_hours = int(body.get("lookback_hours", 24))
     analysis_mode = str(body.get("analysis_mode", "single_trace")).strip().lower()
 
-    if analysis_mode in {"fleet_1h", "all_traces_1h", "fleet"}:
-        # 1-hour fleet mode intentionally ignores anchors and aggregates all traces in timeframe.
+    if analysis_mode in {"fleet_1h", "all_traces_1h", "fleet", "fleet_window"}:
+        # Fleet mode ignores anchors and aggregates all traces in the requested timeframe.
         fleet_hours = max(1, min(24, int(body.get("lookback_hours", 1))))
         return _handle_fleet_insights(question=question, lookback_hours=fleet_hours)
 
@@ -1504,7 +1854,10 @@ def _handle_session_insights(event: Dict[str, Any]) -> Dict[str, Any]:
         "xray_error": xray_error,
     }
 
-    answer = _build_diagnosis(question, merged)
+    answer = _sanitize_analysis_answer(
+        _build_diagnosis(question, merged),
+        traces_total=0,
+    )
     return {
         "statusCode": 200,
         "headers": CORS_HEADERS,
@@ -1587,6 +1940,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     try:
         result = _signed_post(RUNTIME_URL, payload)
         answer = result.get("answer", "") if isinstance(result, dict) else str(result)
+        answer = _sanitize_user_answer(answer)
         result_trace_id = str(result.get("xray_trace_id", "")).strip() if isinstance(result, dict) else ""
         otel_session_id = _find_otel_session_id(result_trace_id, lookback_hours=6) if result_trace_id else ""
 
@@ -1627,6 +1981,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                         if isinstance(regenerated, dict)
                         else str(regenerated)
                     )
+                    answer_after_prompt_update = _sanitize_user_answer(answer_after_prompt_update)
                 except Exception as regen_exc:
                     regeneration_error = str(regen_exc)
 
