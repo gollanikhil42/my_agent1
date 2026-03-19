@@ -239,6 +239,17 @@ h1 {
   font-size: 0.81rem;
 }
 
+.anchor-grid select {
+  width: 100%;
+  border: 1px solid rgba(149, 178, 255, 0.3);
+  border-radius: 10px;
+  background: rgba(5, 12, 30, 0.88);
+  color: #e8f0ff;
+  padding: 10px 12px;
+  font-family: "JetBrains Mono", monospace;
+  font-size: 0.81rem;
+}
+
 .copy-icon {
   border: 1px solid rgba(131, 171, 255, 0.45);
   border-radius: 10px;

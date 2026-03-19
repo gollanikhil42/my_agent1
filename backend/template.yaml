@@ -77,6 +77,10 @@ Resources:
           EVALUATOR_RUNTIME_ID: hyperGray_Agent-bNWvhnEOaB
           EVALUATOR_LOG_GROUP: /aws/bedrock-agentcore/evaluations/results/evaluation_quick_start_1773400924069-RMD3JBHdQM
           DIAGNOSIS_MODEL_ID: arn:aws:bedrock:us-east-1:636052469006:inference-profile/global.anthropic.claude-sonnet-4-6
+          FLEET_RUNTIME_LIMIT: "1800"
+          FLEET_EVALUATOR_MAX_GROUPS: "10"
+          FLEET_EVALUATOR_PER_GROUP_LIMIT: "300"
+          FLEET_XRAY_MAX_TRACES: "600"
       Events:
         ChatPost:
           Type: HttpApi

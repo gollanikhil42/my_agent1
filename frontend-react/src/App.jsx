@@ -99,6 +99,7 @@ function App({ signOut, user }) {
   const [latestMerged, setLatestMerged] = useState(null);
   const [busyChat, setBusyChat] = useState(false);
   const [busyLog, setBusyLog] = useState(false);
+  const [analystMode, setAnalystMode] = useState("fleet_1h");
   const [copiedId, setCopiedId] = useState("");
   const [profile, setProfile] = useState({ name: user?.username || "User", department: "", role: "" });
 
@@ -252,7 +253,7 @@ function App({ signOut, user }) {
       return;
     }
 
-    if (!effectiveAnchors.xray_trace_id) {
+    if (analystMode === "single_trace" && !effectiveAnchors.xray_trace_id) {
       setLogMessages((prev) => [
         ...prev,
         makeMessage("system", "No trace ID available yet. Send one assistant prompt first to capture a trace ID.", "metric"),
@@ -278,12 +279,13 @@ function App({ signOut, user }) {
         },
         body: JSON.stringify({
           question: trimmed,
-          request_id: effectiveAnchors.request_id,
-          client_request_id: effectiveAnchors.client_request_id,
-          session_id: effectiveAnchors.session_id,
-          evaluator_session_id: effectiveAnchors.evaluator_session_id,
-          xray_trace_id: effectiveAnchors.xray_trace_id,
-          lookback_hours: 48,
+          analysis_mode: analystMode,
+          request_id: analystMode === "single_trace" ? effectiveAnchors.request_id : "",
+          client_request_id: analystMode === "single_trace" ? effectiveAnchors.client_request_id : "",
+          session_id: analystMode === "single_trace" ? effectiveAnchors.session_id : "",
+          evaluator_session_id: analystMode === "single_trace" ? effectiveAnchors.evaluator_session_id : "",
+          xray_trace_id: analystMode === "single_trace" ? effectiveAnchors.xray_trace_id : "",
+          lookback_hours: analystMode === "fleet_1h" ? 1 : 48,
         }),
       });
 
@@ -295,7 +297,7 @@ function App({ signOut, user }) {
       setLogMessages((prev) => {
         const next = [...prev, makeMessage("assistant", answer)];
 
-        if (response.ok && data?.anchors) {
+        if (response.ok && data?.anchors && analystMode === "single_trace") {
           next.push({
             ...makeMessage(
               "system",
@@ -308,23 +310,37 @@ function App({ signOut, user }) {
 
         if (response.ok && data?.merged) {
           const merged = data.merged;
-          const slow = merged?.xray?.slowest_step;
-          const runtimeCount = merged?.runtime_records_found ?? 0;
-          const evaluatorCount = merged?.evaluator_records_found ?? 0;
-          next.push({
-            ...makeMessage(
-              "system",
-              `Records: runtime=${runtimeCount}, evaluator=${evaluatorCount}${slow ? ` | slowest=${slow.name} (${slow.duration_ms} ms)` : ""}`,
-              "metric",
-            ),
-            variant: "metric",
-          });
+          if (merged?.analysis_mode === "fleet_1h") {
+            const tracesTotal = merged?.fleet_metrics?.traces_total ?? 0;
+            const e2eP95 = merged?.fleet_metrics?.e2e_ms?.p95 ?? 0;
+            const top = merged?.bottleneck_ranking?.[0];
+            next.push({
+              ...makeMessage(
+                "system",
+                `1h Fleet: traces=${tracesTotal} | e2e p95=${e2eP95} ms${top ? ` | top bottleneck=${top.component}` : ""}`,
+                "metric",
+              ),
+              variant: "metric",
+            });
+          } else {
+            const slow = merged?.xray?.slowest_step;
+            const runtimeCount = merged?.runtime_records_found ?? 0;
+            const evaluatorCount = merged?.evaluator_records_found ?? 0;
+            next.push({
+              ...makeMessage(
+                "system",
+                `Records: runtime=${runtimeCount}, evaluator=${evaluatorCount}${slow ? ` | slowest=${slow.name} (${slow.duration_ms} ms)` : ""}`,
+                "metric",
+              ),
+              variant: "metric",
+            });
+          }
         }
 
         return next;
       });
 
-      if (response.ok && data?.anchors) {
+      if (response.ok && data?.anchors && analystMode === "single_trace") {
         setAnalystAnchors((prev) => ({
           request_id: data.anchors.request_id || prev.request_id,
           client_request_id: data.anchors.client_request_id || prev.client_request_id,
@@ -445,46 +461,77 @@ function App({ signOut, user }) {
         <section className="chat-card glass">
           <div className="anchors-head">
             <h2>Session Anchors</h2>
-            <p>Trace ID is auto-captured from your last chat message. You can paste an older trace ID to query historical sessions.</p>
+            <p>{analystMode === "fleet_1h" ? "Fleet mode analyzes all traces in the last hour across X-Ray, runtime, and evaluator logs." : "Trace ID is auto-captured from your last chat message. You can paste an older trace ID to query historical sessions."}</p>
           </div>
 
-          <div className="anchor-grid anchor-grid--single">
+          <div className="anchor-grid">
             <label>
-              <span>X-Ray Trace ID</span>
-              <div className="anchor-input-wrap">
-                <input
-                  value={analystAnchors.xray_trace_id || ""}
-                  onChange={(e) =>
-                    setAnalystAnchors((prev) => ({
-                      ...prev,
-                      xray_trace_id: e.target.value.trim(),
-                    }))
-                  }
-                  placeholder={autoAnchors.xray_trace_id || "send a chat message to capture trace ID"}
-                />
-                <button
-                  type="button"
-                  className="copy-icon"
-                  onClick={() => copyToClipboard(effectiveAnchors.xray_trace_id, "anchor-xray")}
-                  title="Copy X-Ray Trace ID"
-                >
-                  {copiedId === "anchor-xray" ? "Copied" : "Copy"}
-                </button>
-              </div>
+              <span>Analyzer Mode</span>
+              <select
+                value={analystMode}
+                onChange={(e) => setAnalystMode(e.target.value)}
+              >
+                <option value="fleet_1h">All traces (last 1 hour)</option>
+                <option value="single_trace">Single trace deep-dive</option>
+              </select>
             </label>
           </div>
 
+          {analystMode === "single_trace" && (
+            <div className="anchor-grid anchor-grid--single">
+              <label>
+                <span>X-Ray Trace ID</span>
+                <div className="anchor-input-wrap">
+                  <input
+                    value={analystAnchors.xray_trace_id || ""}
+                    onChange={(e) =>
+                      setAnalystAnchors((prev) => ({
+                        ...prev,
+                        xray_trace_id: e.target.value.trim(),
+                      }))
+                    }
+                    placeholder={autoAnchors.xray_trace_id || "send a chat message to capture trace ID"}
+                  />
+                  <button
+                    type="button"
+                    className="copy-icon"
+                    onClick={() => copyToClipboard(effectiveAnchors.xray_trace_id, "anchor-xray")}
+                    title="Copy X-Ray Trace ID"
+                  >
+                    {copiedId === "anchor-xray" ? "Copied" : "Copy"}
+                  </button>
+                </div>
+              </label>
+            </div>
+          )}
+
           {latestMerged && (
             <div className="insight-strip">
-              <p>
-                Runtime logs: <strong>{latestMerged.runtime_records_found || 0}</strong>
-              </p>
-              <p>
-                Evaluator logs: <strong>{latestMerged.evaluator_records_found || 0}</strong>
-              </p>
-              <p>
-                Slowest step: <strong>{latestMerged?.xray?.slowest_step?.name || "n/a"}</strong>
-              </p>
+              {latestMerged?.analysis_mode === "fleet_1h" ? (
+                <>
+                  <p>
+                    Traces: <strong>{latestMerged?.fleet_metrics?.traces_total || 0}</strong>
+                  </p>
+                  <p>
+                    E2E p95: <strong>{latestMerged?.fleet_metrics?.e2e_ms?.p95 || 0} ms</strong>
+                  </p>
+                  <p>
+                    Top bottleneck: <strong>{latestMerged?.bottleneck_ranking?.[0]?.component || "n/a"}</strong>
+                  </p>
+                </>
+              ) : (
+                <>
+                  <p>
+                    Runtime logs: <strong>{latestMerged.runtime_records_found || 0}</strong>
+                  </p>
+                  <p>
+                    Evaluator logs: <strong>{latestMerged.evaluator_records_found || 0}</strong>
+                  </p>
+                  <p>
+                    Slowest step: <strong>{latestMerged?.xray?.slowest_step?.name || "n/a"}</strong>
+                  </p>
+                </>
+              )}
             </div>
           )}
 
