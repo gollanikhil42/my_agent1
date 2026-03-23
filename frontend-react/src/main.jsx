@@ -12,18 +12,16 @@ const authServices = {
     const username = input?.username || "";
     const password = input?.password || "";
     const options = input?.options || {};
-    const attrs = options?.userAttributes || {};
-    const formattedName = attrs["name.formatted"] || attrs.name || username;
+    const attrs = { ...(options?.userAttributes || {}) };
+    // Remove name.formatted — not a standard Cognito attribute; causes schema error
+    delete attrs["name.formatted"];
 
     return signUp({
       username,
       password,
       options: {
         ...options,
-        userAttributes: {
-          ...attrs,
-          "name.formatted": formattedName,
-        },
+        userAttributes: attrs,
       },
     });
   },

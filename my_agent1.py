@@ -14,7 +14,8 @@ import os
 
 # Keep runtime logs clean and deterministic for downstream parsing.
 #os.environ["AGENT_OBSERVABILITY_ENABLED"] = "false"
-os.environ["OTEL_RESOURCE_ATTRIBUTES"] = "service.name=my_agent1"
+if not os.environ.get("OTEL_RESOURCE_ATTRIBUTES"):
+    os.environ["OTEL_RESOURCE_ATTRIBUTES"] = f"service.name={os.environ.get('AGENT_NAME', 'agent-runtime')}"
 #os.environ["OTEL_SDK_DISABLED"] = "true"
 
 logging.getLogger("strands").setLevel(logging.ERROR)
@@ -26,25 +27,44 @@ logging.getLogger("bedrock_agentcore.app").setLevel(logging.ERROR)
 logging.basicConfig(level=logging.ERROR)
 
 # ── AWS Clients ──────────────────────────────────────────────
-dynamodb   = boto3.resource("dynamodb", region_name="us-east-1")
-logs_table = dynamodb.Table("AgentLogs")
-s3_client  = boto3.client("s3", region_name="us-east-1")
-logs_client = boto3.client("logs", region_name="us-east-1")
+REGION = os.environ.get("AWS_REGION") or os.environ.get("BEDROCK_REGION") or ""
+dynamodb = boto3.resource("dynamodb", region_name=REGION)
+s3_client = boto3.client("s3", region_name=REGION)
+logs_client = boto3.client("logs", region_name=REGION)
 
 # ── Constants ────────────────────────────────────────────────
-AGENT_NAME    = "my_agent1"
-RUNTIME_ID    = "my_agent1-EuvQcG3t0u"
-REGION        = "us-east-1"
-ACCOUNT_ID    = "636052469006"
-MODEL_ID      = "arn:aws:bedrock:us-east-1:636052469006:inference-profile/global.anthropic.claude-sonnet-4-6"
-AGENT_ARN     = f"arn:aws:bedrock-agentcore:{REGION}:{ACCOUNT_ID}:runtime/{RUNTIME_ID}"
-LOG_GROUP     = f"/aws/bedrock-agentcore/runtimes/{RUNTIME_ID}-DEFAULT"
+AGENT_NAME = os.environ.get("AGENT_NAME", "")
+RUNTIME_ID = os.environ.get("AGENTCORE_RUNTIME_ID", "")
+ACCOUNT_ID = os.environ.get("AWS_ACCOUNT_ID", "")
+MODEL_ID = os.environ.get("MODEL_ID", "").strip()
+AGENT_ARN = os.environ.get(
+    "AGENT_ARN",
+    f"arn:aws:bedrock-agentcore:{REGION}:{ACCOUNT_ID}:runtime/{RUNTIME_ID}"
+    if REGION and ACCOUNT_ID and RUNTIME_ID
+    else "",
+)
+LOG_GROUP = os.environ.get(
+    "RUNTIME_LOG_GROUP",
+    f"/aws/bedrock-agentcore/runtimes/{RUNTIME_ID}-DEFAULT" if RUNTIME_ID else "",
+)
 # Fixed stream – all agent_request_trace events land here so the backend
 # can read them reliably via get_log_events without per-invocation stream discovery.
-LOG_STREAM    = "agent-traces"
+LOG_STREAM = os.environ.get("RUNTIME_LOG_STREAM", "")
 LOG_GROUP_ENC = LOG_GROUP.replace("/", "%2F")
-PRICE_BUCKET  = os.environ.get("PRICE_BUCKET", f"my-agent1-price-catalog-{ACCOUNT_ID}-{REGION}")
-PRICE_KEY     = os.environ.get("PRICE_KEY", "pricing/catalog.json")
+PRICE_BUCKET = os.environ.get("PRICE_BUCKET", "")
+PRICE_KEY = os.environ.get("PRICE_KEY", "")
+
+REQUIRED_ENV_VARS = [
+    "MODEL_ID",
+]
+
+
+def _missing_required_env_vars() -> list:
+    missing = []
+    for key in REQUIRED_ENV_VARS:
+        if not str(os.environ.get(key, "")).strip():
+            missing.append(key)
+    return missing
 
 LINKS = {
     "genai_dashboard": (
@@ -60,10 +80,6 @@ LINKS = {
         f"#xray:traces/query?~(query~(filter~'service(id(name~%27{RUNTIME_ID}%27"
         f"~type~%27AWS%3A%3ABedrockAgentCore%3A%3ARuntime%27))))"
     ),
-    "dynamodb_logs": (
-        f"https://console.aws.amazon.com/dynamodbv2/home?region={REGION}"
-        f"#table?name=AgentLogs"
-    ),
     "agentcore_runtime": (
         f"https://console.aws.amazon.com/bedrock/home?region={REGION}"
         f"#/agentcore/runtimes/{RUNTIME_ID}"
@@ -75,6 +91,8 @@ _log_stream_ready = False
 
 def _put_trace_to_fixed_stream(record: dict) -> None:
     global _log_stream_ready
+    if not LOG_GROUP or not LOG_STREAM:
+        return
     if not _log_stream_ready:
         try:
             logs_client.create_log_stream(logGroupName=LOG_GROUP, logStreamName=LOG_STREAM)
@@ -127,22 +145,45 @@ def decode_jwt_user(token: str) -> dict:
             "auth_type":  "unknown",
         }
 
-# ── Helper: Get system prompt from DynamoDB ─────────────────
+# ── System prompt (hardcoded — no DynamoDB lookup needed) ──────
+SYSTEM_PROMPT = """You are a strict calculator agent.
+
+Your job is to:
+1. Extract machine names (uppercase) and quantities.
+2. Use the provided price list. MRI = 30000 and CT = 50000
+3. Decide the correct operation.
+4. Perform the full calculation.
+5. Generate the explanation in one consistent structured format.
+
+Rules:
+
+- If quantity is not mentioned, assume 1.
+- If more than one machine is mentioned -> add totals.
+- If only one machine and quantity > 1 -> multiply.
+- If user explicitly says subtract -> subtract.
+- If user explicitly says divide -> divide.
+- The explanation must always follow the same structure.
+- Start with a single sentence stating the total price.
+- Then list each machine calculation on a new line.
+- End with one final line showing the combined total.
+- Keep wording consistent across all responses.
+- Do not change structure between responses.
+
+Return ONLY valid JSON.
+
+The JSON must contain only one field:
+- explanation
+
+Do not return operation.
+Do not return items.
+Do not return total separately.
+Do not add extra text outside JSON.
+
+You are also a knowledgeable, friendly assistant. Provide accurate, concise, and clear answers. Use simple analogies for complex topics. Match the user's tone and show empathy. Avoid filler and unnecessary formatting. For casual greetings, respond warmly and briefly hint at your capabilities. For contradictory or impossible requests, acknowledge briefly and offer alternatives. Always recommend professional consultation for legal, medical, tax, or financial matters."""
+
+
 def get_system_prompt() -> str:
-    """
-    Read the current system prompt from AgentConfig table.
-    Falls back to default if DynamoDB is unreachable.
-    This enables dynamic prompt evolution without redeploying.
-    """
-    try:
-        config_table = dynamodb.Table("AgentConfig")
-        result = config_table.get_item(Key={"config_key": "system_prompt"})
-        if "Item" in result:
-            return result["Item"]["prompt_text"]
-    except Exception as e:
-        print(f"WARNING: Could not read system prompt from AgentConfig: {e}", flush=True)
-    # Fallback if DynamoDB is unreachable
-    return "Helpful general chatbot. Keep responses concise and clear."
+    return SYSTEM_PROMPT
 
 
 def get_price_catalog() -> dict:
@@ -150,6 +191,8 @@ def get_price_catalog() -> dict:
     Read pricing data from S3 so the runtime can follow the latest catalog
     without code changes or redeploys.
     """
+    if not PRICE_BUCKET or not PRICE_KEY:
+        return {}
     try:
         result = s3_client.get_object(Bucket=PRICE_BUCKET, Key=PRICE_KEY)
         raw = result["Body"].read().decode("utf-8")
@@ -236,14 +279,6 @@ def _sanitize_answer_text(answer: str) -> str:
     text = re.sub(r"\s*source\s*:\s*my-agent1-price-catalog[^\n\r]*", "", text, flags=re.IGNORECASE)
     return text.strip()
 
-# ── Helper: write log to DynamoDB ───────────────────────────
-def write_log(data: dict):
-    try:
-        logs_table.put_item(Item=data)
-        return True, ""
-    except Exception:
-        return False, "put_item_failed"
-
 # ── AgentCore App ────────────────────────────────────────────
 app = BedrockAgentCoreApp()
 
@@ -261,6 +296,14 @@ def handler(payload, context):
     input_tokens  = 0
     output_tokens = 0
     retrieval_evidence = {}
+
+    missing_env = _missing_required_env_vars()
+    if missing_env:
+        return {
+            "error": f"Runtime configuration error: missing required environment variables: {', '.join(missing_env)}",
+            "status": "error",
+            "request_id": request_id,
+        }
 
     # ── Extract input params ─────────────────────────────────
     prompt      = payload.get("prompt", "")
@@ -424,11 +467,8 @@ def handler(payload, context):
             "link_xray_all_traces":   LINKS["xray_all_traces"],
             "link_cloudwatch_logs":   cw_log_link,
             "link_genai_dashboard":   LINKS["genai_dashboard"],
-            "link_dynamodb_logs":     LINKS["dynamodb_logs"],
             "link_agentcore_runtime": LINKS["agentcore_runtime"],
         }
-
-        ddb_logged, ddb_error = write_log(runtime_log)
 
         # Explicit structured runtime log for CloudWatch visibility.
         cloudwatch_trace = {
@@ -454,8 +494,6 @@ def handler(payload, context):
                 "total_tokens": input_tokens + output_tokens,
                 "tools_used": tools_used,
             },
-            "dynamodb_log_saved": ddb_logged,
-            "dynamodb_log_error": ddb_error,
         }
         cloudwatch_trace.update(runtime_log)
 

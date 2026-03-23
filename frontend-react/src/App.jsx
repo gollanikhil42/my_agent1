@@ -72,15 +72,7 @@ function App({ signOut, user }) {
     },
   ]);
   const [logQuestion, setLogQuestion] = useState("");
-  const [logMessages, setLogMessages] = useState([
-    {
-      id: crypto.randomUUID(),
-      role: "system",
-      text: "Analyser logs ready. Provide request/session/trace anchor and ask a question.",
-      variant: "status",
-      timestamp: stamp(),
-    },
-  ]);
+  const [logMessages, setLogMessages] = useState([]);
   const [autoAnchors, setAutoAnchors] = useState({
     request_id: "",
     client_request_id: "",
@@ -100,7 +92,7 @@ function App({ signOut, user }) {
   const [busyChat, setBusyChat] = useState(false);
   const [busyLog, setBusyLog] = useState(false);
   const [analystMode, setAnalystMode] = useState("fleet_window");
-  const [logLookbackHours, setLogLookbackHours] = useState(5);
+  const [logLookbackHours, setLogLookbackHours] = useState("5");
   const [copiedId, setCopiedId] = useState("");
   const [profile, setProfile] = useState({ name: user?.username || "User", department: "", role: "" });
 
@@ -186,38 +178,11 @@ function App({ signOut, user }) {
         ? data.answer || "No answer returned."
         : data.error || data.message || `Request failed (${response.status})`;
       const trace = response.ok ? data.trace || {} : {};
-      const improvedAnswer = response.ok ? data.answer_after_prompt_update : null;
-      const evaluator = response.ok ? data?.evaluator?.result : null;
-      const postEval = response.ok ? data?.post_update_evaluator?.result : null;
 
       setMessages((prev) => {
         const next = [...prev, makeMessage("assistant", answer)];
 
         // Trace metadata is captured but not displayed in chat to keep UI clean
-
-        if (evaluator?.evaluation?.scores) {
-          const s = evaluator.evaluation.scores;
-          next.push({
-            ...makeMessage(
-              "system",
-              `Quality score: ${s.overall} | Accuracy ${s.accuracy} | Clarity ${s.clarity} | Helpfulness ${s.helpfulness}`,
-              "metric",
-            ),
-            variant: "metric",
-          });
-        }
-
-        if (improvedAnswer) {
-          next.push(makeMessage("assistant", improvedAnswer, "bot-updated"));
-        }
-
-        if (postEval?.evaluation?.scores) {
-          const ps = postEval.evaluation.scores;
-          next.push({
-            ...makeMessage("system", `Post-update score: ${ps.overall} (after prompt refinement)`, "metric"),
-            variant: "metric",
-          });
-        }
 
         return next;
       });
@@ -277,7 +242,18 @@ function App({ signOut, user }) {
           session_id: analystMode === "single_trace" ? effectiveAnchors.session_id : "",
           evaluator_session_id: analystMode === "single_trace" ? effectiveAnchors.evaluator_session_id : "",
           xray_trace_id: analystMode === "single_trace" ? effectiveAnchors.xray_trace_id : "",
-          lookback_hours: analystMode === "single_trace" ? 48 : logLookbackHours,
+          lookback_hours:
+            analystMode === "single_trace"
+              ? 48
+              : logLookbackHours === "overall"
+                ? "overall"
+                : Number(logLookbackHours),
+          lookback_mode:
+            analystMode === "single_trace"
+              ? "window"
+              : logLookbackHours === "overall"
+                ? "overall"
+                : "window",
         }),
       });
 
@@ -411,7 +387,7 @@ function App({ signOut, user }) {
         <section className="chat-card glass">
           <div className="anchors-head">
             <h2>Session Anchors</h2>
-            <p>{analystMode !== "single_trace" ? `Fleet mode analyzes all traces in the last ${logLookbackHours} hours across X-Ray, runtime, and evaluator logs.` : "Trace ID is auto-captured from your last chat message. You can paste an older trace ID to query historical sessions."}</p>
+            <p>{analystMode !== "single_trace" ? `Fleet mode analyzes ${logLookbackHours === "overall" ? "all available traces from start to now" : `all traces in the last ${logLookbackHours} hours`} across X-Ray, runtime, and evaluator logs.` : "Trace ID is auto-captured from your last chat message. You can paste an older trace ID to query historical sessions."}</p>
           </div>
 
           <div className="anchor-grid">
@@ -429,14 +405,15 @@ function App({ signOut, user }) {
               <span>Timeframe (hours)</span>
               <select
                 value={logLookbackHours}
-                onChange={(e) => setLogLookbackHours(Number(e.target.value) || 5)}
+                onChange={(e) => setLogLookbackHours(e.target.value || "5")}
                 disabled={analystMode === "single_trace"}
               >
-                <option value={1}>1 hour</option>
-                <option value={3}>3 hours</option>
-                <option value={5}>5 hours</option>
-                <option value={12}>12 hours</option>
-                <option value={24}>24 hours</option>
+                <option value="1">1 hour</option>
+                <option value="3">3 hours</option>
+                <option value="5">5 hours</option>
+                <option value="12">12 hours</option>
+                <option value="24">24 hours</option>
+                <option value="overall">Overall</option>
               </select>
             </label>
           </div>
@@ -477,7 +454,7 @@ function App({ signOut, user }) {
                     Traces: <strong>{latestMerged?.fleet_metrics?.traces_total || 0}</strong>
                   </p>
                   <p>
-                    E2E p95: <strong>{latestMerged?.fleet_metrics?.e2e_ms?.p95 || 0} ms</strong>
+                    E2E avg: <strong>{latestMerged?.fleet_metrics?.e2e_ms?.avg || 0} ms</strong>
                   </p>
                   <p>
                     Top bottleneck: <strong>{latestMerged?.bottleneck_ranking?.[0]?.component || "n/a"}</strong>

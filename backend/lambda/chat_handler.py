@@ -15,11 +15,8 @@ from botocore.awsrequest import AWSRequest
 from botocore.session import Session
 
 HTTP = urllib3.PoolManager()
-REGION = os.environ.get("AWS_REGION", "us-east-1")
+REGION = os.environ.get("AWS_REGION") or os.environ.get("BEDROCK_REGION") or ""
 RUNTIME_URL = os.environ.get("AGENTCORE_RUNTIME_URL", "")
-EVALUATOR_RUNTIME_URL = os.environ.get("EVALUATOR_RUNTIME_URL", "")
-# Temporary kill-switch: set to True to stop all evaluator traffic while investigating cost spikes.
-TEMP_DISABLE_EVALUATOR = True
 CORS_HEADERS = {
     "Content-Type": "application/json",
     "Access-Control-Allow-Origin": "*",
@@ -29,11 +26,8 @@ CORS_HEADERS = {
 LOGS_CLIENT = boto3.client("logs", region_name=REGION)
 XRAY_CLIENT = boto3.client("xray", region_name=REGION)
 BEDROCK_CLIENT = boto3.client("bedrock-runtime", region_name=REGION)
-DIAGNOSIS_MODEL_ID = os.environ.get(
-    "DIAGNOSIS_MODEL_ID",
-    "us.anthropic.claude-3-5-haiku-20241022-v1:0",
-)
-RUNTIME_SERVICE_NAME = os.environ.get("RUNTIME_SERVICE_NAME", "my_agent1.DEFAULT")
+DIAGNOSIS_MODEL_ID = os.environ.get("DIAGNOSIS_MODEL_ID", "")
+RUNTIME_SERVICE_NAME = os.environ.get("RUNTIME_SERVICE_NAME", "")
 
 
 def _extract_runtime_id(url: str) -> str:
@@ -44,24 +38,31 @@ def _extract_runtime_id(url: str) -> str:
 
 
 RUNTIME_ID = os.environ.get("AGENTCORE_RUNTIME_ID", _extract_runtime_id(RUNTIME_URL))
-EVALUATOR_RUNTIME_ID = os.environ.get("EVALUATOR_RUNTIME_ID", _extract_runtime_id(EVALUATOR_RUNTIME_URL))
 RUNTIME_LOG_GROUP = os.environ.get(
     "RUNTIME_LOG_GROUP",
     f"/aws/bedrock-agentcore/runtimes/{RUNTIME_ID}-DEFAULT" if RUNTIME_ID else "",
 )
 # Fixed stream written to by my_agent1.py directly — read first before scanning per-invocation streams.
-RUNTIME_LOG_STREAM = os.environ.get("RUNTIME_LOG_STREAM", "agent-traces")
-OTEL_RUNTIME_LOG_STREAM = os.environ.get("OTEL_RUNTIME_LOG_STREAM", "otel-rt-logs")
+RUNTIME_LOG_STREAM = os.environ.get("RUNTIME_LOG_STREAM", "")
+OTEL_RUNTIME_LOG_STREAM = os.environ.get("OTEL_RUNTIME_LOG_STREAM", "")
 EVALUATOR_LOG_GROUP = os.environ.get(
     "EVALUATOR_LOG_GROUP",
-    f"/aws/bedrock-agentcore/evaluations/{EVALUATOR_RUNTIME_ID}-DEFAULT" if EVALUATOR_RUNTIME_ID else "",
+    "",
 )
-EVALUATOR_LOG_PREFIX = os.environ.get("EVALUATOR_LOG_PREFIX", "/aws/bedrock-agentcore/evaluations")
+EVALUATOR_LOG_PREFIX = os.environ.get("EVALUATOR_LOG_PREFIX", "")
 FLEET_RUNTIME_LIMIT = int(os.environ.get("FLEET_RUNTIME_LIMIT", "1800"))
 FLEET_EVALUATOR_MAX_GROUPS = int(os.environ.get("FLEET_EVALUATOR_MAX_GROUPS", "10"))
 FLEET_EVALUATOR_PER_GROUP_LIMIT = int(os.environ.get("FLEET_EVALUATOR_PER_GROUP_LIMIT", "300"))
 FLEET_XRAY_MAX_TRACES = int(os.environ.get("FLEET_XRAY_MAX_TRACES", "600"))
 DELAY_THRESHOLD_MS = float(os.environ.get("DELAY_THRESHOLD_MS", "6000"))
+OVERALL_LOOKBACK_HOURS = int(os.environ.get("OVERALL_LOOKBACK_HOURS", "87600"))
+MAX_ANALYSIS_LOOKBACK_HOURS = int(os.environ.get("MAX_ANALYSIS_LOOKBACK_HOURS", "2160"))
+RUNTIME_STREAM_PAGES_PER_PREFIX = int(os.environ.get("RUNTIME_STREAM_PAGES_PER_PREFIX", "4"))
+RUNTIME_STREAMS_PER_PREFIX = int(os.environ.get("RUNTIME_STREAMS_PER_PREFIX", "200"))
+RUNTIME_LOG_SCAN_MULTIPLIER = int(os.environ.get("RUNTIME_LOG_SCAN_MULTIPLIER", "8"))
+XRAY_QUERY_CHUNK_HOURS = int(os.environ.get("XRAY_QUERY_CHUNK_HOURS", "24"))
+# X-Ray retains traces for 30 days; querying beyond that returns nothing.
+XRAY_MAX_LOOKBACK_HOURS = int(os.environ.get("XRAY_MAX_LOOKBACK_HOURS", "720"))
 
 def _build_user_claims(event: Dict[str, Any]) -> Dict[str, str]:
     claims = (
@@ -521,33 +522,70 @@ def _fetch_recent_stream_events(log_group: str, start_time_ms: int, limit: int) 
 
     candidate_streams: list = []
     seen: set = set()
+    max_candidate_streams = min(max(limit * 3, 500), 4000)
     for prefix in date_prefixes:
-        try:
-            resp = LOGS_CLIENT.describe_log_streams(
-                logGroupName=log_group,
-                logStreamNamePrefix=prefix,
-                orderBy="LastEventTime",
-                descending=True,
-                limit=50,
-            )
+        prefix_seen = 0
+        next_token = None
+        pages = 0
+        while pages < max(1, RUNTIME_STREAM_PAGES_PER_PREFIX):
+            try:
+                kwargs: Dict[str, Any] = {
+                    "logGroupName": log_group,
+                    "logStreamNamePrefix": prefix,
+                    "orderBy": "LastEventTime",
+                    "descending": True,
+                    "limit": 50,
+                }
+                if next_token:
+                    kwargs["nextToken"] = next_token
+                resp = LOGS_CLIENT.describe_log_streams(**kwargs)
+            except Exception:
+                break
+
             for stream in resp.get("logStreams", []):
                 name = stream.get("logStreamName")
                 if name and name not in seen:
                     seen.add(name)
                     candidate_streams.append(stream)
-        except Exception:
-            pass
+                    prefix_seen += 1
+                    if len(candidate_streams) >= max_candidate_streams or prefix_seen >= max(1, RUNTIME_STREAMS_PER_PREFIX):
+                        break
+
+            if len(candidate_streams) >= max_candidate_streams or prefix_seen >= max(1, RUNTIME_STREAMS_PER_PREFIX):
+                break
+
+            next_token = resp.get("nextToken")
+            pages += 1
+            if not next_token:
+                break
+
+        if len(candidate_streams) >= max_candidate_streams:
+            break
 
     # Generic fallback for non-AgentCore log groups (no date-prefix streams found).
     if not candidate_streams:
         try:
-            resp = LOGS_CLIENT.describe_log_streams(
-                logGroupName=log_group,
-                orderBy="LastEventTime",
-                descending=True,
-                limit=50,
-            )
-            candidate_streams = resp.get("logStreams", [])
+            next_token = None
+            pages = 0
+            while pages < max(1, RUNTIME_STREAM_PAGES_PER_PREFIX):
+                kwargs: Dict[str, Any] = {
+                    "logGroupName": log_group,
+                    "orderBy": "LastEventTime",
+                    "descending": True,
+                    "limit": 50,
+                }
+                if next_token:
+                    kwargs["nextToken"] = next_token
+                resp = LOGS_CLIENT.describe_log_streams(**kwargs)
+                for stream in resp.get("logStreams", []):
+                    name = stream.get("logStreamName")
+                    if name and name not in seen:
+                        seen.add(name)
+                        candidate_streams.append(stream)
+                next_token = resp.get("nextToken")
+                pages += 1
+                if not next_token or len(candidate_streams) >= max_candidate_streams:
+                    break
         except Exception:
             return []
 
@@ -565,7 +603,7 @@ def _fetch_recent_stream_events(log_group: str, start_time_ms: int, limit: int) 
                 logStreamName=stream_name,
                 startTime=start_time_ms,
                 startFromHead=False,
-                limit=min(limit, 100),
+                limit=min(max(200, limit), 1000),
             )
         except Exception:
             continue
@@ -875,7 +913,7 @@ def _build_diagnosis(question: str, merged: Dict[str, Any]) -> str:
             modelId=DIAGNOSIS_MODEL_ID,
             system=[{"text": system_prompt}],
             messages=[{"role": "user", "content": [{"text": user_content}]}],
-            inferenceConfig={"maxTokens": 1024, "temperature": 0.1},
+            inferenceConfig={"maxTokens": 1150, "temperature": 0.1},
         )
         return response["output"]["message"]["content"][0]["text"]
     except Exception as exc:
@@ -889,17 +927,18 @@ def _to_float(value: Any) -> float:
         return 0.0
 
 
-def _percentile(values: List[float], pct: float) -> float:
-    if not values:
-        return 0.0
-    ordered = sorted(float(v) for v in values)
-    if len(ordered) == 1:
-        return ordered[0]
-    rank = max(0.0, min(1.0, pct / 100.0)) * (len(ordered) - 1)
-    lower = int(rank)
-    upper = min(lower + 1, len(ordered) - 1)
-    frac = rank - lower
-    return ordered[lower] + (ordered[upper] - ordered[lower]) * frac
+def _resolve_lookback_hours(body: Dict[str, Any], default_hours: int = 24) -> int:
+    lookback_mode = str(body.get("lookback_mode", "")).strip().lower()
+    lookback_raw = body.get("lookback_hours", default_hours)
+    max_hours = max(1, int(MAX_ANALYSIS_LOOKBACK_HOURS))
+
+    if lookback_mode == "overall" or str(lookback_raw).strip().lower() == "overall":
+        return min(max(1, OVERALL_LOOKBACK_HOURS), max_hours)
+
+    try:
+        return min(max(1, int(lookback_raw)), max_hours)
+    except (TypeError, ValueError):
+        return min(max(1, int(default_hours)), max_hours)
 
 
 def _extract_trace_id_from_payload(payload: Dict[str, Any], message: str = "") -> str:
@@ -919,34 +958,53 @@ def _fetch_runtime_records_window(lookback_hours: int, limit: int = 1500) -> Lis
 
     start_ms = int((time.time() - lookback_hours * 3600) * 1000)
     records: List[Dict[str, Any]] = []
+    seen_runtime_keys = set()
+
+    def _append_runtime_event(row: Dict[str, Any]) -> None:
+        payload = _json_from_log_message(row.get("message", ""))
+        if not payload or payload.get("event") != "agent_request_trace":
+            return
+        ts = int(row.get("timestamp", 0) or 0)
+        request_id = str(payload.get("request_id", "")).strip()
+        trace_id = str(payload.get("xray_trace_id", "")).strip()
+        dedupe_key = (request_id, trace_id, ts)
+        if dedupe_key in seen_runtime_keys:
+            return
+        seen_runtime_keys.add(dedupe_key)
+        payload["_cloudwatch_timestamp"] = ts
+        records.append(payload)
 
     # Primary path: fixed stream populated by runtime.
     if RUNTIME_LOG_STREAM:
         try:
-            response = LOGS_CLIENT.get_log_events(
-                logGroupName=RUNTIME_LOG_GROUP,
-                logStreamName=RUNTIME_LOG_STREAM,
-                startTime=start_ms,
-                startFromHead=False,
-                limit=min(limit, 10000),
-            )
-            for row in response.get("events", []):
-                payload = _json_from_log_message(row.get("message", ""))
-                if not payload or payload.get("event") != "agent_request_trace":
-                    continue
-                payload["_cloudwatch_timestamp"] = row.get("timestamp")
-                records.append(payload)
+            next_token = None
+            pages = 0
+            while pages < 25 and len(records) < limit:
+                kwargs: Dict[str, Any] = {
+                    "logGroupName": RUNTIME_LOG_GROUP,
+                    "logStreamName": RUNTIME_LOG_STREAM,
+                    "startTime": start_ms,
+                    "startFromHead": False,
+                    "limit": min(1000, max(100, limit)),
+                }
+                if next_token:
+                    kwargs["nextToken"] = next_token
+                response = LOGS_CLIENT.get_log_events(**kwargs)
+                for row in response.get("events", []):
+                    _append_runtime_event(row)
+                new_token = response.get("nextForwardToken") or response.get("nextToken")
+                pages += 1
+                if not new_token or new_token == next_token:
+                    break
+                next_token = new_token
         except Exception:
             pass
 
-    # Fallback path: broad scan of group when fixed stream is not available.
-    if not records:
-        for row in _fetch_recent_stream_events(RUNTIME_LOG_GROUP, start_ms, limit=min(limit, 2000)):
-            payload = _json_from_log_message(row.get("message", ""))
-            if not payload or payload.get("event") != "agent_request_trace":
-                continue
-            payload["_cloudwatch_timestamp"] = row.get("timestamp")
-            records.append(payload)
+    # Always backfill from per-invocation streams so "overall" can include historical traces
+    # that predate fixed-stream writes.
+    stream_scan_limit = min(max(limit * max(2, RUNTIME_LOG_SCAN_MULTIPLIER), 2500), 20000)
+    for row in _fetch_recent_stream_events(RUNTIME_LOG_GROUP, start_ms, limit=stream_scan_limit):
+        _append_runtime_event(row)
 
     records.sort(key=lambda item: item.get("_cloudwatch_timestamp", 0), reverse=True)
     return records[:limit]
@@ -982,57 +1040,78 @@ def _fetch_evaluator_records_window(
 
 def _fetch_xray_trace_summaries_window(lookback_hours: int, max_traces: int = 500) -> Dict[str, Dict[str, Any]]:
     out: Dict[str, Dict[str, Any]] = {}
-    start = datetime.fromtimestamp(time.time() - lookback_hours * 3600, tz=timezone.utc)
-    end = datetime.now(timezone.utc)
-    next_token = None
-    pages = 0
+    # X-Ray only retains data for 30 days; cap the window so we never make empty API calls beyond that.
+    effective_lookback = min(lookback_hours, max(1, XRAY_MAX_LOOKBACK_HOURS))
+    window_end = datetime.now(timezone.utc)
+    window_start = datetime.fromtimestamp(time.time() - effective_lookback * 3600, tz=timezone.utc)
+    cursor_end = window_end
+    # Prefer larger chunks for efficiency, but some environments enforce stricter windows.
+    configured_chunk_hours = max(1, min(24, XRAY_QUERY_CHUNK_HOURS))
+    max_segment_seconds = configured_chunk_hours * 3600
+    minimum_segment_seconds = 6 * 3600
+    max_segments = max(1, int((lookback_hours * 3600 + minimum_segment_seconds - 1) // minimum_segment_seconds) + 2)
+    segment_count = 0
 
-    while len(out) < max_traces and pages < 10:
-        kwargs: Dict[str, Any] = {
-            "StartTime": start,
-            "EndTime": end,
-            "Sampling": False,
-        }
-        if next_token:
-            kwargs["NextToken"] = next_token
+    while len(out) < max_traces and cursor_end > window_start and segment_count < max_segments:
+        cursor_start_ts = max(window_start.timestamp(), cursor_end.timestamp() - max_segment_seconds)
+        cursor_start = datetime.fromtimestamp(cursor_start_ts, tz=timezone.utc)
 
-        try:
-            response = XRAY_CLIENT.get_trace_summaries(**kwargs)
-        except Exception:
-            break
-
-        for summary in response.get("TraceSummaries", []):
-            trace_id = str(summary.get("Id", ""))
-            if not trace_id:
-                continue
-            norm = _normalize_trace_id(trace_id)
-            duration_ms = _to_float(summary.get("Duration", 0.0)) * 1000.0
-            out[norm] = {
-                "trace_id": trace_id,
-                "trace_id_normalized": norm,
-                "duration_ms": round(duration_ms, 2),
-                "has_error": bool(summary.get("HasError")),
-                "has_fault": bool(summary.get("HasFault")),
-                "has_throttle": bool(summary.get("HasThrottle")),
+        next_token = None
+        pages = 0
+        while len(out) < max_traces and pages < 10:
+            kwargs: Dict[str, Any] = {
+                "StartTime": cursor_start,
+                "EndTime": cursor_end,
+                "Sampling": False,
             }
-            if len(out) >= max_traces:
+            if next_token:
+                kwargs["NextToken"] = next_token
+
+            try:
+                response = XRAY_CLIENT.get_trace_summaries(**kwargs)
+            except Exception as exc:
+                # Some accounts enforce shorter query windows; shrink to 6h and retry segment.
+                if max_segment_seconds > minimum_segment_seconds and "Time range cannot be longer" in str(exc):
+                    max_segment_seconds = minimum_segment_seconds
+                    cursor_start_ts = max(window_start.timestamp(), cursor_end.timestamp() - max_segment_seconds)
+                    cursor_start = datetime.fromtimestamp(cursor_start_ts, tz=timezone.utc)
+                    continue
                 break
 
-        next_token = response.get("NextToken")
-        pages += 1
-        if not next_token:
-            break
+            for summary in response.get("TraceSummaries", []):
+                trace_id = str(summary.get("Id", ""))
+                if not trace_id:
+                    continue
+                norm = _normalize_trace_id(trace_id)
+                duration_ms = _to_float(summary.get("Duration", 0.0)) * 1000.0
+                out[norm] = {
+                    "trace_id": trace_id,
+                    "trace_id_normalized": norm,
+                    "duration_ms": round(duration_ms, 2),
+                    "has_error": bool(summary.get("HasError")),
+                    "has_fault": bool(summary.get("HasFault")),
+                    "has_throttle": bool(summary.get("HasThrottle")),
+                }
+                if len(out) >= max_traces:
+                    break
+
+            next_token = response.get("NextToken")
+            pages += 1
+            if not next_token:
+                break
+
+        cursor_end = cursor_start
+        segment_count += 1
 
     return out
 
 
-def _fleet_distribution(values: List[float]) -> Dict[str, float]:
+def _summary_stats(values: List[float]) -> Dict[str, float]:
     if not values:
-        return {"p50": 0.0, "p90": 0.0, "p95": 0.0, "max": 0.0}
+        return {"avg": 0.0, "min": 0.0, "max": 0.0}
     return {
-        "p50": round(_percentile(values, 50), 2),
-        "p90": round(_percentile(values, 90), 2),
-        "p95": round(_percentile(values, 95), 2),
+        "avg": round(sum(values) / len(values), 2),
+        "min": round(min(values), 2),
         "max": round(max(values), 2),
     }
 
@@ -1106,7 +1185,7 @@ def _build_fleet_digest(question: str, merged: Dict[str, Any]) -> str:
         "evaluator": "Evaluator",
     }
     top_component = component_labels.get(str(top.get("component", "")), str(top.get("component", "n/a") or "n/a"))
-    top_p95 = _to_float(top.get("p95_ms"))
+    top_avg = _to_float(top.get("avg_ms"))
     delayed_count = int(merged.get("delayed_traces_count", len(delayed)) or 0)
 
     lines = []
@@ -1115,10 +1194,10 @@ def _build_fleet_digest(question: str, merged: Dict[str, Any]) -> str:
         f"- Window: {int(window.get('duration_minutes', 0) or 0)} minutes | Traces: {traces_total} | Complete 3-stage: {complete_total}"
     )
     lines.append(
-        f"- Latency: p50 {round(_to_float(e2e.get('p50')), 0):.0f} ms | p95 {round(_to_float(e2e.get('p95')), 0):.0f} ms | max {round(_to_float(e2e.get('max')), 0):.0f} ms"
+        f"- Latency: avg {round(_to_float(e2e.get('avg')), 0):.0f} ms | max {round(_to_float(e2e.get('max')), 0):.0f} ms"
     )
     lines.append(
-        f"- Main bottleneck: {top_component} (p95 {round(top_p95, 0):.0f} ms, impact {round(_to_float(top.get('impact_score')) * 100, 0):.0f}%)"
+        f"- Main bottleneck: {top_component} (avg {round(top_avg, 0):.0f} ms, impact {round(_to_float(top.get('impact_score')) * 100, 0):.0f}%)"
     )
     lines.append(
         f"- Delayed traces (>{round(threshold, 0):.0f} ms): {delayed_count}"
@@ -1163,7 +1242,7 @@ def _ask_for_prompt_upgrade(question: str, merged: Dict[str, Any]) -> str:
             modelId=DIAGNOSIS_MODEL_ID,
             system=[{"text": meta_prompt}],
             messages=[{"role": "user", "content": [{"text": meta_content}]}],
-            inferenceConfig={"maxTokens": 800, "temperature": 0.2},
+            inferenceConfig={"maxTokens": 920, "temperature": 0.2},
         )
         return response["output"]["message"]["content"][0]["text"]
     except Exception as exc:
@@ -1203,9 +1282,9 @@ def _build_fleet_summary_with_llm(question: str, merged: Dict[str, Any]) -> str:
         "4. If user asks for delayed trace details: list each delayed trace on a new line with format 'Trace ID: [id], Latency: [time]ms, Runtime: [time]ms'\n"
         "5. Wrap up with actionable next steps\n\n"
         "CONTENT RULES:\n"
-        "- Avoid p50/p95/p99 distributions unless explicitly requested\n"
+        "- Avoid distribution jargon unless explicitly requested\n"
         "- Round latencies to nearest 100ms (e.g., '3.4 seconds' not '3412 ms')\n"
-        "- Use 'most requests', 'a few cases', 'one clear outlier' instead of percentile language\n"
+        "- Use 'most requests', 'a few cases', 'one clear outlier' style phrasing\n"
         "- If ResponseRelevance is low (< 0.5): say 'response quality is questionable'\n"
         "- If ResponseRelevance is moderate (0.5-0.7): say 'response may not fully match intent'\n"
         "- If list of delayed traces is requested: provide each on separate line, no table, no markdown\n"
@@ -1227,7 +1306,7 @@ def _build_fleet_summary_with_llm(question: str, merged: Dict[str, Any]) -> str:
             modelId=DIAGNOSIS_MODEL_ID,
             system=[{"text": system_prompt}],
             messages=[{"role": "user", "content": [{"text": user_content}]}],
-            inferenceConfig={"maxTokens": 520, "temperature": 0.1},
+            inferenceConfig={"maxTokens": 640, "temperature": 0.1},
         )
         answer = response["output"]["message"]["content"][0]["text"]
         return answer
@@ -1272,7 +1351,7 @@ def _build_fleet_diagnosis(question: str, merged: Dict[str, Any]) -> str:
             modelId=DIAGNOSIS_MODEL_ID,
             system=[{"text": system_prompt}],
             messages=[{"role": "user", "content": [{"text": user_content}]}],
-            inferenceConfig={"maxTokens": 1200, "temperature": 0.1},
+            inferenceConfig={"maxTokens": 1350, "temperature": 0.1},
         )
         return response["output"]["message"]["content"][0]["text"]
     except Exception as exc:
@@ -1439,34 +1518,34 @@ def _handle_fleet_insights(question: str, lookback_hours: int) -> Dict[str, Any]
     evaluator_values = [float(t.get("evaluator_latency_ms", 0.0)) for t in all_traces if _to_float(t.get("evaluator_latency_ms")) > 0]
     inferred_values = [float(t.get("inferred_model_or_gap_ms", 0.0)) for t in all_traces if _to_float(t.get("inferred_model_or_gap_ms")) > 0]
 
-    runtime_p95 = _percentile(runtime_values, 95)
-    evaluator_p95 = _percentile(evaluator_values, 95)
-    inferred_p95 = _percentile(inferred_values, 95)
-    total_p95 = runtime_p95 + evaluator_p95 + inferred_p95
+    runtime_avg = (sum(runtime_values) / len(runtime_values)) if runtime_values else 0.0
+    evaluator_avg = (sum(evaluator_values) / len(evaluator_values)) if evaluator_values else 0.0
+    inferred_avg = (sum(inferred_values) / len(inferred_values)) if inferred_values else 0.0
+    total_avg = runtime_avg + evaluator_avg + inferred_avg
 
-    def _impact(component_p95: float) -> float:
-        if total_p95 <= 0:
+    def _impact(component_avg: float) -> float:
+        if total_avg <= 0:
             return 0.0
-        return round(component_p95 / total_p95, 3)
+        return round(component_avg / total_avg, 3)
 
     bottlenecks = [
         {
             "component": "runtime",
-            "impact_score": _impact(runtime_p95),
-            "evidence": "runtime latency tail (p95)",
-            "p95_ms": round(runtime_p95, 2),
+            "impact_score": _impact(runtime_avg),
+            "evidence": "runtime average latency contribution",
+            "avg_ms": round(runtime_avg, 2),
         },
         {
             "component": "model_or_handoff_gap",
-            "impact_score": _impact(inferred_p95),
+            "impact_score": _impact(inferred_avg),
             "evidence": "inferred residual latency between runtime and evaluator",
-            "p95_ms": round(inferred_p95, 2),
+            "avg_ms": round(inferred_avg, 2),
         },
         {
             "component": "evaluator",
-            "impact_score": _impact(evaluator_p95),
-            "evidence": "evaluator processing tail (p95)",
-            "p95_ms": round(evaluator_p95, 2),
+            "impact_score": _impact(evaluator_avg),
+            "evidence": "evaluator average latency contribution",
+            "avg_ms": round(evaluator_avg, 2),
         },
     ]
     bottlenecks.sort(key=lambda row: float(row.get("impact_score", 0.0)), reverse=True)
@@ -1558,11 +1637,11 @@ def _handle_fleet_insights(question: str, lookback_hours: int) -> Dict[str, Any]
             "traces_complete_3stage": len(complete_3stage),
             "error_rate": round(len(error_traces) / len(all_traces), 4) if all_traces else 0.0,
             "timeout_rate": round(len(timeout_traces) / len(all_traces), 4) if all_traces else 0.0,
-            "e2e_ms": _fleet_distribution(e2e_values),
+            "e2e_ms": _summary_stats(e2e_values),
             "stage_ms": {
-                "runtime": _fleet_distribution(runtime_values),
-                "evaluator": _fleet_distribution(evaluator_values),
-                "model_or_handoff_gap": _fleet_distribution(inferred_values),
+                "runtime": _summary_stats(runtime_values),
+                "evaluator": _summary_stats(evaluator_values),
+                "model_or_handoff_gap": _summary_stats(inferred_values),
             },
         },
         "bottleneck_ranking": bottlenecks,
@@ -1634,12 +1713,12 @@ def _handle_session_insights(event: Dict[str, Any]) -> Dict[str, Any]:
     evaluator_session_id = str(body.get("evaluator_session_id", "")).strip()
     xray_trace_id = str(body.get("xray_trace_id", "")).strip()
     client_request_id = str(body.get("client_request_id", "")).strip()
-    lookback_hours = int(body.get("lookback_hours", 24))
+    lookback_hours = _resolve_lookback_hours(body, default_hours=24)
     analysis_mode = str(body.get("analysis_mode", "single_trace")).strip().lower()
 
     if analysis_mode in {"fleet_1h", "all_traces_1h", "fleet", "fleet_window"}:
         # Fleet mode ignores anchors and aggregates all traces in the requested timeframe.
-        fleet_hours = max(1, min(24, int(body.get("lookback_hours", 1))))
+        fleet_hours = _resolve_lookback_hours(body, default_hours=1)
         return _handle_fleet_insights(question=question, lookback_hours=fleet_hours)
 
     terms = {
@@ -1877,20 +1956,11 @@ def _handle_session_insights(event: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
-    method = (
-        event.get("requestContext", {})
-        .get("http", {})
-        .get("method", "")
-        .upper()
-    )
-    if method == "OPTIONS":
-        return {"statusCode": 200, "headers": CORS_HEADERS, "body": json.dumps({"ok": True})}
+def handle_analysis_request(event: Dict[str, Any], context: Any = None) -> Dict[str, Any]:
+    return _handle_session_insights(event)
 
-    path = event.get("rawPath") or event.get("requestContext", {}).get("http", {}).get("path", "")
-    if path.endswith("/session-insights"):
-        return _handle_session_insights(event)
 
+def handle_chat_request(event: Dict[str, Any], context: Any = None) -> Dict[str, Any]:
     if not RUNTIME_URL:
         return {
             "statusCode": 500,
@@ -1944,83 +2014,10 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         result_trace_id = str(result.get("xray_trace_id", "")).strip() if isinstance(result, dict) else ""
         otel_session_id = _find_otel_session_id(result_trace_id, lookback_hours=6) if result_trace_id else ""
 
-        # Optional cloud feedback loop:
-        # evaluate chatbot response using a second AgentCore runtime and
-        # optionally auto-apply improved prompt to AgentConfig.
-        evaluation_result = None
-        evaluator_error = None
-        answer_after_prompt_update = None
-        regeneration_error = None
-        post_update_evaluation_result = None
-        post_update_evaluator_error = None
-        # Default to running evaluator so one user prompt triggers the full feedback loop.
-        run_evaluator = (
-            (not TEMP_DISABLE_EVALUATOR)
-            and bool(body.get("run_evaluator", True))
-            and bool(EVALUATOR_RUNTIME_URL)
-        )
-        if run_evaluator:
-            eval_payload = {
-                "user_prompt": prompt,
-                "chatbot_response": answer,
-                "auto_apply": bool(body.get("auto_apply_prompt_update", True)),
-            }
-            try:
-                evaluation_result = _signed_post(EVALUATOR_RUNTIME_URL, eval_payload)
-            except Exception as eval_exc:
-                evaluator_error = str(eval_exc)
-
-        # If evaluator applied a new prompt version, run chatbot once more so callers can
-        # compare before/after outputs in a single API response.
-        if run_evaluator and isinstance(evaluation_result, dict):
-            if bool(evaluation_result.get("auto_applied")) and evaluation_result.get("new_prompt_version") is not None:
-                try:
-                    regenerated = _signed_post(RUNTIME_URL, payload)
-                    answer_after_prompt_update = (
-                        regenerated.get("answer", "")
-                        if isinstance(regenerated, dict)
-                        else str(regenerated)
-                    )
-                    answer_after_prompt_update = _sanitize_user_answer(answer_after_prompt_update)
-                except Exception as regen_exc:
-                    regeneration_error = str(regen_exc)
-
-                # Re-evaluate regenerated answer and persist a comparison record.
-                if answer_after_prompt_update:
-                    try:
-                        prior_overall = None
-                        if isinstance(evaluation_result.get("evaluation"), dict):
-                            prior_overall = (
-                                evaluation_result["evaluation"].get("scores", {}).get("overall")
-                            )
-                        post_eval_payload = {
-                            "user_prompt": prompt,
-                            "chatbot_response": answer_after_prompt_update,
-                            "auto_apply": False,
-                            "record_evaluation_only": True,
-                            "evaluation_record_key": f"post_update_eval_v{evaluation_result.get('new_prompt_version')}",
-                            "previous_overall_score": prior_overall,
-                            "previous_prompt_version": evaluation_result.get("current_version"),
-                        }
-                        post_update_evaluation_result = _signed_post(EVALUATOR_RUNTIME_URL, post_eval_payload)
-                    except Exception as post_eval_exc:
-                        post_update_evaluator_error = str(post_eval_exc)
-
         response_body: Dict[str, Any] = {
             "answer": answer,
             "trace": _build_trace_payload(result if isinstance(result, dict) else {}, otel_session_id=otel_session_id),
         }
-        if run_evaluator:
-            response_body["evaluator"] = {
-                "result": evaluation_result,
-                "error": evaluator_error,
-            }
-            response_body["answer_after_prompt_update"] = answer_after_prompt_update
-            response_body["regeneration_error"] = regeneration_error
-            response_body["post_update_evaluator"] = {
-                "result": post_update_evaluation_result,
-                "error": post_update_evaluator_error,
-            }
 
         return {
             "statusCode": 200,
@@ -2033,3 +2030,19 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             "headers": CORS_HEADERS,
             "body": json.dumps({"error": f"Backend invocation failed: {exc}"}),
         }
+
+
+def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+    method = (
+        event.get("requestContext", {})
+        .get("http", {})
+        .get("method", "")
+        .upper()
+    )
+    if method == "OPTIONS":
+        return {"statusCode": 200, "headers": CORS_HEADERS, "body": json.dumps({"ok": True})}
+
+    path = event.get("rawPath") or event.get("requestContext", {}).get("http", {}).get("path", "")
+    if path.endswith("/session-insights"):
+        return handle_analysis_request(event, context)
+    return handle_chat_request(event, context)

@@ -78,6 +78,25 @@ If deploy fails with `lambda:TagResource` AccessDenied:
   - `cloudformation:*` (or scoped stack create/update permissions)
   - `s3:PutObject`, `s3:GetObject`, `s3:ListBucket` on SAM artifact bucket
 
+If `agentcore deploy` shows observability warning with `logs:PutDeliverySource` AccessDenied:
+- The IAM identity running `agentcore deploy` needs CloudWatch Logs delivery permissions.
+- Add at least:
+  - `logs:PutDeliverySource`
+  - `logs:PutDeliveryDestination`
+  - `logs:CreateDelivery`
+  - `logs:UpdateDeliveryConfiguration`
+  - `logs:GetDelivery`
+  - `logs:ListDeliveries`
+  - `logs:DeleteDelivery`
+
+You can use the ready policy file in this repo:
+
+```powershell
+aws iam put-user-policy --user-name nikhil --policy-name AgentCoreObservabilityDelivery --policy-document file://scripts/agentcore-observability-deployer-policy.json
+```
+
+If you deploy with a role instead of IAM user, use `put-role-policy` on that role.
+
 Example quick fix policy statement (deployer permissions):
 
 ```json

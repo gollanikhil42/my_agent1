@@ -9,13 +9,85 @@ Globals:
     MemorySize: 256
 
 Parameters:
+  AwsRegion:
+    Type: String
+    Default: us-east-1
+    Description: AWS region used by runtime and diagnostics clients
   AgentRuntimeUrl:
     Type: String
     Description: HTTPS invoke URL for AgentCore runtime endpoint
-  EvaluatorRuntimeUrl:
+  AgentcoreRuntimeId:
+    Type: String
+    Default: my_agent1-EuvQcG3t0u
+    Description: AgentCore runtime ID
+  RuntimeLogGroup:
+    Type: String
+    Default: /aws/bedrock-agentcore/runtimes/my_agent1-EuvQcG3t0u-DEFAULT
+    Description: Runtime CloudWatch log group
+  RuntimeLogStream:
+    Type: String
+    Default: agent-traces
+    Description: Runtime fixed log stream name
+  OTelRuntimeLogStream:
+    Type: String
+    Default: otel-rt-logs
+    Description: Runtime OTEL log stream name
+  EvaluatorLogGroup:
     Type: String
     Default: ""
-    Description: Optional HTTPS invoke URL for evaluator AgentCore runtime endpoint
+    Description: Evaluator CloudWatch log group
+  EvaluatorLogPrefix:
+    Type: String
+    Default: /aws/bedrock-agentcore/evaluations
+    Description: Prefix for evaluator log groups discovery
+  DiagnosisModelId:
+    Type: String
+    Default: arn:aws:bedrock:us-east-1:636052469006:inference-profile/global.anthropic.claude-sonnet-4-6
+    Description: Bedrock model ID or ARN for diagnostics synthesis
+  RuntimeServiceName:
+    Type: String
+    Default: my_agent1.DEFAULT
+    Description: Runtime service name used to filter wrapper steps in traces
+  DelayThresholdMs:
+    Type: String
+    Default: "6000"
+    Description: Delay threshold in milliseconds
+  OverallLookbackHours:
+    Type: String
+    Default: "87600"
+    Description: Lookback hours for overall timeframe mode
+  MaxAnalysisLookbackHours:
+    Type: String
+    Default: "2160"
+    Description: Safety cap for analysis lookback to avoid Lambda timeout
+  XrayMaxLookbackHours:
+    Type: String
+    Default: "720"
+    Description: X-Ray data retention cap (30 days); never query X-Ray beyond this to avoid empty API calls
+  XrayQueryChunkHours:
+    Type: String
+    Default: "24"
+    Description: Hours per X-Ray GetTraceSummaries call (API max is 24h)
+  FleetRuntimeLimit:
+    Type: String
+    Default: "1800"
+  FleetEvaluatorMaxGroups:
+    Type: String
+    Default: "10"
+  FleetEvaluatorPerGroupLimit:
+    Type: String
+    Default: "300"
+  FleetXrayMaxTraces:
+    Type: String
+    Default: "600"
+  CognitoIssuer:
+    Type: String
+    Default: https://cognito-idp.us-east-1.amazonaws.com/us-east-1_l6dPnsMxY
+    Description: Cognito issuer URL for JWT validation
+  CognitoAudience:
+    Type: String
+    Default: 4hb4q7nat1kqbm6ehsgtq3e2op
+    Description: Cognito app client ID audience value
 
 Resources:
   ChatApi:
@@ -35,15 +107,15 @@ Resources:
         Authorizers:
           CognitoJwtAuthorizer:
             JwtConfiguration:
-              issuer: https://cognito-idp.us-east-1.amazonaws.com/us-east-1_l6dPnsMxY
+              issuer: !Ref CognitoIssuer
               audience:
-                - 4hb4q7nat1kqbm6ehsgtq3e2op
+                - !Ref CognitoAudience
             IdentitySource: "$request.header.Authorization"
 
   ChatFunction:
     Type: AWS::Serverless::Function
     Properties:
-      Handler: chat_handler.handler
+      Handler: chat_endpoint.handler
       CodeUri: lambda/
       Policies:
         - Statement:
@@ -72,15 +144,23 @@ Resources:
       Environment:
         Variables:
           AGENTCORE_RUNTIME_URL: !Ref AgentRuntimeUrl
-          EVALUATOR_RUNTIME_URL: !Ref EvaluatorRuntimeUrl
-          AGENTCORE_RUNTIME_ID: my_agent1-EuvQcG3t0u
-          EVALUATOR_RUNTIME_ID: hyperGray_Agent-bNWvhnEOaB
-          EVALUATOR_LOG_GROUP: /aws/bedrock-agentcore/evaluations/results/evaluation_quick_start_1773400924069-RMD3JBHdQM
-          DIAGNOSIS_MODEL_ID: arn:aws:bedrock:us-east-1:636052469006:inference-profile/global.anthropic.claude-sonnet-4-6
-          FLEET_RUNTIME_LIMIT: "1800"
-          FLEET_EVALUATOR_MAX_GROUPS: "10"
-          FLEET_EVALUATOR_PER_GROUP_LIMIT: "300"
-          FLEET_XRAY_MAX_TRACES: "600"
+          AGENTCORE_RUNTIME_ID: !Ref AgentcoreRuntimeId
+          RUNTIME_LOG_GROUP: !Ref RuntimeLogGroup
+          RUNTIME_LOG_STREAM: !Ref RuntimeLogStream
+          OTEL_RUNTIME_LOG_STREAM: !Ref OTelRuntimeLogStream
+          EVALUATOR_LOG_GROUP: !Ref EvaluatorLogGroup
+          EVALUATOR_LOG_PREFIX: !Ref EvaluatorLogPrefix
+          DIAGNOSIS_MODEL_ID: !Ref DiagnosisModelId
+          RUNTIME_SERVICE_NAME: !Ref RuntimeServiceName
+          DELAY_THRESHOLD_MS: !Ref DelayThresholdMs
+          OVERALL_LOOKBACK_HOURS: !Ref OverallLookbackHours
+          MAX_ANALYSIS_LOOKBACK_HOURS: !Ref MaxAnalysisLookbackHours
+          XRAY_MAX_LOOKBACK_HOURS: !Ref XrayMaxLookbackHours
+          XRAY_QUERY_CHUNK_HOURS: !Ref XrayQueryChunkHours
+          FLEET_RUNTIME_LIMIT: !Ref FleetRuntimeLimit
+          FLEET_EVALUATOR_MAX_GROUPS: !Ref FleetEvaluatorMaxGroups
+          FLEET_EVALUATOR_PER_GROUP_LIMIT: !Ref FleetEvaluatorPerGroupLimit
+          FLEET_XRAY_MAX_TRACES: !Ref FleetXrayMaxTraces
       Events:
         ChatPost:
           Type: HttpApi
@@ -88,6 +168,57 @@ Resources:
             ApiId: !Ref ChatApi
             Path: /chat
             Method: POST
+
+  SessionInsightsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: analysis_endpoint.handler
+      CodeUri: lambda/
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - bedrock-agentcore:Invoke*
+                - bedrock-agentcore-runtime:Invoke*
+              Resource: '*'
+            - Effect: Allow
+              Action:
+                - logs:FilterLogEvents
+                - logs:GetLogEvents
+                - logs:DescribeLogGroups
+                - logs:DescribeLogStreams
+              Resource: '*'
+            - Effect: Allow
+              Action:
+                - xray:BatchGetTraces
+                - xray:GetTraceSummaries
+              Resource: '*'
+            - Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+                - bedrock:InvokeModelWithResponseStream
+              Resource: '*'
+      Environment:
+        Variables:
+          AGENTCORE_RUNTIME_URL: !Ref AgentRuntimeUrl
+          AGENTCORE_RUNTIME_ID: !Ref AgentcoreRuntimeId
+          RUNTIME_LOG_GROUP: !Ref RuntimeLogGroup
+          RUNTIME_LOG_STREAM: !Ref RuntimeLogStream
+          OTEL_RUNTIME_LOG_STREAM: !Ref OTelRuntimeLogStream
+          EVALUATOR_LOG_GROUP: !Ref EvaluatorLogGroup
+          EVALUATOR_LOG_PREFIX: !Ref EvaluatorLogPrefix
+          DIAGNOSIS_MODEL_ID: !Ref DiagnosisModelId
+          RUNTIME_SERVICE_NAME: !Ref RuntimeServiceName
+          DELAY_THRESHOLD_MS: !Ref DelayThresholdMs
+          OVERALL_LOOKBACK_HOURS: !Ref OverallLookbackHours
+          MAX_ANALYSIS_LOOKBACK_HOURS: !Ref MaxAnalysisLookbackHours
+          XRAY_MAX_LOOKBACK_HOURS: !Ref XrayMaxLookbackHours
+          XRAY_QUERY_CHUNK_HOURS: !Ref XrayQueryChunkHours
+          FLEET_RUNTIME_LIMIT: !Ref FleetRuntimeLimit
+          FLEET_EVALUATOR_MAX_GROUPS: !Ref FleetEvaluatorMaxGroups
+          FLEET_EVALUATOR_PER_GROUP_LIMIT: !Ref FleetEvaluatorPerGroupLimit
+          FLEET_XRAY_MAX_TRACES: !Ref FleetXrayMaxTraces
+      Events:
         SessionInsightsPost:
           Type: HttpApi
           Properties:

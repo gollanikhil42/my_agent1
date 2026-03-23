@@ -1,0 +1,20 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AgentCoreObservabilityDelivery",
+      "Effect": "Allow",
+      "Action": [
+        "logs:PutDeliverySource",
+        "logs:PutDeliveryDestination",
+        "logs:CreateDelivery",
+        "logs:UpdateDeliveryConfiguration",
+        "logs:GetDelivery",
+        "logs:ListDeliveries",
+        "logs:DeleteDelivery",
+        "logs:DescribeLogGroups"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
