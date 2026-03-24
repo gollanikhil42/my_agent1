@@ -13,8 +13,11 @@ const authServices = {
     const password = input?.password || "";
     const options = input?.options || {};
     const attrs = { ...(options?.userAttributes || {}) };
-    // Remove name.formatted — not a standard Cognito attribute; causes schema error
-    delete attrs["name.formatted"];
+    // Cognito requires name.formatted when 'name' is a required attribute in the user pool.
+    // Always sync it from 'name' so the schema requirement is satisfied.
+    if (attrs["name"]) {
+      attrs["name.formatted"] = attrs["name"];
+    }
 
     return signUp({
       username,

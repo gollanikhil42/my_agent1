@@ -34,7 +34,7 @@ Parameters:
     Description: Runtime OTEL log stream name
   EvaluatorLogGroup:
     Type: String
-    Default: ""
+    Default: /aws/bedrock-agentcore/evaluations/results/evaluation_quick_start_1773400924069-RMD3JBHdQM
     Description: Evaluator CloudWatch log group
   EvaluatorLogPrefix:
     Type: String
@@ -44,6 +44,22 @@ Parameters:
     Type: String
     Default: arn:aws:bedrock:us-east-1:636052469006:inference-profile/global.anthropic.claude-sonnet-4-6
     Description: Bedrock model ID or ARN for diagnostics synthesis
+  DiagnosisSessionMaxTokens:
+    Type: String
+    Default: "1150"
+    Description: Max output tokens for single-session diagnostics answers
+  DiagnosisPromptUpgradeMaxTokens:
+    Type: String
+    Default: "920"
+    Description: Max output tokens for prompt-upgrade responses
+  DiagnosisFleetSummaryMaxTokens:
+    Type: String
+    Default: "2000"
+    Description: Max output tokens for fleet summary answers
+  DiagnosisFleetDeepDiveMaxTokens:
+    Type: String
+    Default: 2000"
+    Description: Max output tokens for fleet deep-dive answers
   RuntimeServiceName:
     Type: String
     Default: my_agent1.DEFAULT
@@ -160,6 +176,8 @@ Resources:
                 - logs:GetLogEvents
                 - logs:DescribeLogGroups
                 - logs:DescribeLogStreams
+                - logs:CreateLogStream
+                - logs:PutLogEvents
               Resource: '*'
             - Effect: Allow
               Action:
@@ -180,7 +198,13 @@ Resources:
           OTEL_RUNTIME_LOG_STREAM: !Ref OTelRuntimeLogStream
           EVALUATOR_LOG_GROUP: !Ref EvaluatorLogGroup
           EVALUATOR_LOG_PREFIX: !Ref EvaluatorLogPrefix
+          CHAT_RUNTIME_TIMEOUT_SECONDS: "20.0"
+          OTEL_LOOKUP_BUDGET_SECONDS: "1.5"
           DIAGNOSIS_MODEL_ID: !Ref DiagnosisModelId
+          DIAGNOSIS_SESSION_MAX_TOKENS: !Ref DiagnosisSessionMaxTokens
+          DIAGNOSIS_PROMPT_UPGRADE_MAX_TOKENS: !Ref DiagnosisPromptUpgradeMaxTokens
+          DIAGNOSIS_FLEET_SUMMARY_MAX_TOKENS: !Ref DiagnosisFleetSummaryMaxTokens
+          DIAGNOSIS_FLEET_DEEP_DIVE_MAX_TOKENS: !Ref DiagnosisFleetDeepDiveMaxTokens
           RUNTIME_SERVICE_NAME: !Ref RuntimeServiceName
           DELAY_THRESHOLD_MS: !Ref DelayThresholdMs
           OVERALL_LOOKBACK_HOURS: !Ref OverallLookbackHours
@@ -201,6 +225,7 @@ Resources:
           FLEET_FAST_XRAY_BUDGET_SECONDS: !Ref FleetFastXrayBudgetSeconds
           FLEET_FAST_XRAY_MAX_SEGMENTS: !Ref FleetFastXrayMaxSegments
           FLEET_FAST_XRAY_MAX_PAGES_PER_SEGMENT: !Ref FleetFastXrayMaxPagesPerSegment
+          ANALYZER_LOG_STREAM: analyzer-traces
       Events:
         ChatPost:
           Type: HttpApi
@@ -227,6 +252,8 @@ Resources:
                 - logs:GetLogEvents
                 - logs:DescribeLogGroups
                 - logs:DescribeLogStreams
+                - logs:CreateLogStream
+                - logs:PutLogEvents
               Resource: '*'
             - Effect: Allow
               Action:
@@ -247,7 +274,13 @@ Resources:
           OTEL_RUNTIME_LOG_STREAM: !Ref OTelRuntimeLogStream
           EVALUATOR_LOG_GROUP: !Ref EvaluatorLogGroup
           EVALUATOR_LOG_PREFIX: !Ref EvaluatorLogPrefix
+          CHAT_RUNTIME_TIMEOUT_SECONDS: "20.0"
+          OTEL_LOOKUP_BUDGET_SECONDS: "1.5"
           DIAGNOSIS_MODEL_ID: !Ref DiagnosisModelId
+          DIAGNOSIS_SESSION_MAX_TOKENS: !Ref DiagnosisSessionMaxTokens
+          DIAGNOSIS_PROMPT_UPGRADE_MAX_TOKENS: !Ref DiagnosisPromptUpgradeMaxTokens
+          DIAGNOSIS_FLEET_SUMMARY_MAX_TOKENS: !Ref DiagnosisFleetSummaryMaxTokens
+          DIAGNOSIS_FLEET_DEEP_DIVE_MAX_TOKENS: !Ref DiagnosisFleetDeepDiveMaxTokens
           RUNTIME_SERVICE_NAME: !Ref RuntimeServiceName
           DELAY_THRESHOLD_MS: !Ref DelayThresholdMs
           OVERALL_LOOKBACK_HOURS: !Ref OverallLookbackHours
@@ -268,6 +301,7 @@ Resources:
           FLEET_FAST_XRAY_BUDGET_SECONDS: !Ref FleetFastXrayBudgetSeconds
           FLEET_FAST_XRAY_MAX_SEGMENTS: !Ref FleetFastXrayMaxSegments
           FLEET_FAST_XRAY_MAX_PAGES_PER_SEGMENT: !Ref FleetFastXrayMaxPagesPerSegment
+          ANALYZER_LOG_STREAM: analyzer-traces
       Events:
         SessionInsightsPost:
           Type: HttpApi

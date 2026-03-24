@@ -1,9 +1,11 @@
 import json
 import os
 import base64
+import copy
 import re
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Any, Dict, List
 from collections import defaultdict
@@ -27,7 +29,51 @@ LOGS_CLIENT = boto3.client("logs", region_name=REGION)
 XRAY_CLIENT = boto3.client("xray", region_name=REGION)
 BEDROCK_CLIENT = boto3.client("bedrock-runtime", region_name=REGION)
 DIAGNOSIS_MODEL_ID = os.environ.get("DIAGNOSIS_MODEL_ID", "")
+DIAGNOSIS_SESSION_MAX_TOKENS = int(os.environ.get("DIAGNOSIS_SESSION_MAX_TOKENS", "1150"))
+DIAGNOSIS_PROMPT_UPGRADE_MAX_TOKENS = int(os.environ.get("DIAGNOSIS_PROMPT_UPGRADE_MAX_TOKENS", "920"))
+DIAGNOSIS_FLEET_SUMMARY_MAX_TOKENS = int(os.environ.get("DIAGNOSIS_FLEET_SUMMARY_MAX_TOKENS", "2000"))
+DIAGNOSIS_FLEET_DEEP_DIVE_MAX_TOKENS = int(os.environ.get("DIAGNOSIS_FLEET_DEEP_DIVE_MAX_TOKENS", "2000"))
 RUNTIME_SERVICE_NAME = os.environ.get("RUNTIME_SERVICE_NAME", "")
+
+# ── Analyzer structured logging (mirrors my_agent1.py trace format) ─────────────
+# Writes to RUNTIME_LOG_GROUP/analyzer-traces so analyzer activity is visible
+# alongside agent runtime traces in the same CloudWatch log group.
+ANALYZER_LOG_STREAM = os.environ.get("ANALYZER_LOG_STREAM", "analyzer-traces")
+_analyzer_stream_ready = False
+
+def _ensure_analyzer_stream() -> None:
+    global _analyzer_stream_ready
+    if not RUNTIME_LOG_GROUP:  # noqa: F821  (declared below, module-level)
+        return
+    if _analyzer_stream_ready:
+        return
+    try:
+        LOGS_CLIENT.create_log_stream(logGroupName=RUNTIME_LOG_GROUP, logStreamName=ANALYZER_LOG_STREAM)
+    except Exception:
+        pass
+    _analyzer_stream_ready = True
+
+def _emit_analyzer_trace(record: Dict[str, Any]) -> None:
+    """Write a structured trace event to RUNTIME_LOG_GROUP/analyzer-traces.
+
+    Mirrors the agent_request_trace pattern in my_agent1.py so the analyzer's
+    activity is visible in the same CloudWatch log group as the agent runtime.
+    Does NOT raise — logging failures must never abort the analysis.
+    """
+    if not ANALYZER_LOG_STREAM:
+        return
+    _ensure_analyzer_stream()
+    try:
+        LOGS_CLIENT.put_log_events(
+            logGroupName=RUNTIME_LOG_GROUP,
+            logStreamName=ANALYZER_LOG_STREAM,
+            logEvents=[{
+                "timestamp": int(time.time() * 1000),
+                "message": json.dumps({"event": "session_insights_trace", **record}, ensure_ascii=True, default=str),
+            }],
+        )
+    except Exception:
+        pass
 
 
 def _extract_runtime_id(url: str) -> str:
@@ -49,6 +95,7 @@ EVALUATOR_LOG_GROUP = os.environ.get(
     "EVALUATOR_LOG_GROUP",
     "",
 )
+DEFAULT_EVALUATOR_LOG_GROUP = "/aws/bedrock-agentcore/evaluations/results/evaluation_quick_start_1773400924069-RMD3JBHdQM"
 EVALUATOR_LOG_PREFIX = os.environ.get("EVALUATOR_LOG_PREFIX", "")
 FLEET_RUNTIME_LIMIT = int(os.environ.get("FLEET_RUNTIME_LIMIT", "1800"))
 FLEET_EVALUATOR_MAX_GROUPS = int(os.environ.get("FLEET_EVALUATOR_MAX_GROUPS", "10"))
@@ -67,6 +114,8 @@ FLEET_FAST_XRAY_MAX_PAGES_PER_SEGMENT = int(os.environ.get("FLEET_FAST_XRAY_MAX_
 DELAY_THRESHOLD_MS = float(os.environ.get("DELAY_THRESHOLD_MS", "6000"))
 OVERALL_LOOKBACK_HOURS = int(os.environ.get("OVERALL_LOOKBACK_HOURS", "87600"))
 MAX_ANALYSIS_LOOKBACK_HOURS = int(os.environ.get("MAX_ANALYSIS_LOOKBACK_HOURS", "2160"))
+CHAT_RUNTIME_TIMEOUT_SECONDS = float(os.environ.get("CHAT_RUNTIME_TIMEOUT_SECONDS", "20.0"))
+OTEL_LOOKUP_BUDGET_SECONDS = float(os.environ.get("OTEL_LOOKUP_BUDGET_SECONDS", "1.5"))
 RUNTIME_STREAM_PAGES_PER_PREFIX = int(os.environ.get("RUNTIME_STREAM_PAGES_PER_PREFIX", "4"))
 RUNTIME_STREAMS_PER_PREFIX = int(os.environ.get("RUNTIME_STREAMS_PER_PREFIX", "200"))
 RUNTIME_LOG_SCAN_MULTIPLIER = int(os.environ.get("RUNTIME_LOG_SCAN_MULTIPLIER", "8"))
@@ -143,7 +192,7 @@ def _signed_post(url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         url,
         body=body.encode("utf-8"),
         headers=dict(req.headers.items()),
-        timeout=120.0,
+        timeout=max(3.0, CHAT_RUNTIME_TIMEOUT_SECONDS),
     )
 
     if response.status >= 300:
@@ -154,6 +203,43 @@ def _signed_post(url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         return json.loads(text)
     except json.JSONDecodeError:
         return {"answer": text}
+
+
+def _extract_runtime_answer(result: Dict[str, Any]) -> str:
+    """Normalize AgentCore/Strands runtime response shapes into a user answer string."""
+    if not isinstance(result, dict):
+        return str(result or "")
+
+    direct = result.get("answer")
+    if isinstance(direct, str) and direct.strip():
+        return direct.strip()
+
+    output = result.get("output")
+    if isinstance(output, dict):
+        messages = output.get("messages")
+        if isinstance(messages, list):
+            for msg in messages:
+                if not isinstance(msg, dict):
+                    continue
+                content = msg.get("content")
+                if isinstance(content, dict):
+                    nested = content.get("message")
+                    if isinstance(nested, str) and nested.strip():
+                        text = nested.strip()
+                        json_block = re.search(r"\{[\s\S]*\}", text)
+                        if json_block:
+                            try:
+                                parsed = json.loads(json_block.group(0))
+                                explanation = parsed.get("explanation")
+                                if isinstance(explanation, str) and explanation.strip():
+                                    return explanation.strip()
+                            except Exception:
+                                pass
+                        return text
+                elif isinstance(content, str) and content.strip():
+                    return content.strip()
+
+    return ""
 
 
 def _json_from_log_message(message: str) -> Dict[str, Any]:
@@ -172,6 +258,15 @@ def _json_from_log_message(message: str) -> Dict[str, Any]:
 
 def _sanitize_user_answer(text: str) -> str:
     value = str(text or "")
+    json_block = re.search(r"\{[\s\S]*\}", value)
+    if json_block:
+        try:
+            parsed = json.loads(json_block.group(0))
+            explanation = parsed.get("explanation") if isinstance(parsed, dict) else None
+            if isinstance(explanation, str) and explanation.strip():
+                value = explanation
+        except Exception:
+            pass
     value = re.sub(r"\s*\(\s*source\s*:[^)]+\)", "", value, flags=re.IGNORECASE)
     value = re.sub(r"\s*source\s*:\s*my-agent1-price-catalog[^\n\r]*", "", value, flags=re.IGNORECASE)
     return value.strip()
@@ -215,6 +310,21 @@ def _normalize_trace_id(value: str) -> str:
     return text.replace("-", "")
 
 
+def _denormalize_trace_id(value: str) -> str:
+    """Convert a compact 32-char hex trace ID back to X-Ray API format 1-XXXXXXXX-XXXXXXXXXXXXXXXXXXXXXXXX.
+    Already-formatted IDs (starting with '1-') are returned unchanged."""
+    t = str(value or "").strip().lower()
+    if not t:
+        return ""
+    if t.startswith("1-") and t.count("-") >= 2:
+        return t  # already in X-Ray format
+    # Remove any stray dashes first, then reformat
+    compact = t.replace("-", "")
+    if len(compact) == 32 and re.fullmatch(r"[0-9a-f]{32}", compact):
+        return f"1-{compact[:8]}-{compact[8:]}"
+    return t  # unknown format, return as-is
+
+
 def _primary_filter_term(terms: Dict[str, str]) -> str:
     # Use one strong anchor; CloudWatch quoted terms can miss data when too restrictive.
     for key in ("xray_trace_id", "session_id", "request_id", "client_request_id"):
@@ -236,6 +346,7 @@ def _extract_record_anchors(record: Dict[str, Any]) -> Dict[str, str]:
 
     anchors["request_id"] = str(record.get("request_id") or attrs.get("request_id") or "")
     anchors["client_request_id"] = str(record.get("client_request_id") or attrs.get("client_request_id") or "")
+
     deep_session_ids = _extract_session_ids_deep(record)
     anchors["session_id"] = str(
         record.get("session_id")
@@ -259,6 +370,73 @@ def _extract_record_anchors(record: Dict[str, Any]) -> Dict[str, str]:
     )
     anchors["xray_trace_id"] = _normalize_trace_id(str(trace_raw))
     return anchors
+
+
+def _extract_trace_ids_from_text(text: str) -> List[str]:
+    out: List[str] = []
+    seen = set()
+    for match in re.findall(r"\b(?:1-[0-9a-fA-F]{8}-[0-9a-fA-F]{24}|[0-9a-fA-F]{32})\b", str(text or "")):
+        normalized = _normalize_trace_id(match)
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            out.append(normalized)
+    return out
+
+
+def _is_bulk_trace_listing_question(question: str, explicit_trace_ids: List[str] | None = None) -> bool:
+    """Detect requests that enumerate many traces, not questions about one specific trace."""
+    if explicit_trace_ids:
+        return False
+    text = str(question or "").strip().lower()
+    if not text:
+        return False
+
+    patterns = [
+        r"\b(list|show|enumerate|print|retrieve|get|return)\b.*\b(all|every)\b.*\btrace(?:\s*ids?|ids?)\b",
+        r"\b(list|show|enumerate|print|retrieve|get|return)\b.*\btrace(?:\s*ids?|ids?)\b",
+        r"\bwhat are\b.*\btrace(?:\s*ids?|ids?)\b",
+        r"\ball\b.*\btraces?\b",
+    ]
+    return any(re.search(pattern, text) for pattern in patterns)
+
+
+def _should_paginate_trace_context(
+    question: str,
+    traces_total: int,
+    page_size: int,
+    pre_llm_elapsed: float,
+    remaining_budget_seconds: float,
+    explicit_trace_ids: List[str] | None = None,
+) -> bool:
+    if traces_total <= page_size:
+        return False
+    if explicit_trace_ids:
+        return False
+    if _is_bulk_trace_listing_question(question, explicit_trace_ids):
+        return True
+    if remaining_budget_seconds < 10.0 and traces_total > page_size * 2:
+        return True
+    if pre_llm_elapsed > 18.0 and traces_total > page_size:
+        return True
+    return False
+
+
+def _apply_pagination_to_traces(
+    traces: List[Dict[str, Any]], page: int = 1, page_size: int = 15
+) -> tuple[List[Dict[str, Any]], int, bool]:
+    """Paginate traces and return (page_traces, total_pages, has_next)."""
+    page = max(1, int(page))
+    page_size = max(1, int(page_size))
+
+    total_count = len(traces)
+    total_pages = max(1, (total_count + page_size - 1) // page_size)
+    page = min(page, total_pages)
+
+    start_idx = (page - 1) * page_size
+    end_idx = start_idx + page_size
+    page_traces = traces[start_idx:end_idx]
+    has_next = page < total_pages
+    return page_traces, total_pages, has_next
 
 
 def _is_uuid(value: str) -> bool:
@@ -322,7 +500,7 @@ def _extract_session_ids_deep(payload: Any) -> list:
     return out
 
 
-def _find_otel_session_id(trace_id: str, lookback_hours: int = 24) -> str:
+def _find_otel_session_id(trace_id: str, lookback_hours: int = 24, max_seconds: float = 0.0) -> str:
     if not RUNTIME_LOG_GROUP or not OTEL_RUNTIME_LOG_STREAM or not trace_id:
         return ""
 
@@ -331,13 +509,18 @@ def _find_otel_session_id(trace_id: str, lookback_hours: int = 24) -> str:
         return ""
 
     start_time_ms = int((time.time() - lookback_hours * 3600) * 1000)
+    started = time.perf_counter()
     # OTEL events can arrive a few seconds after runtime returns.
     for _attempt in range(8):
+        if max_seconds > 0 and (time.perf_counter() - started) >= max_seconds:
+            break
         # Primary path: filter across log group by trace id and parse candidate events.
         filtered_events = []
         next_token = None
         pages = 0
         while pages < 5:
+            if max_seconds > 0 and (time.perf_counter() - started) >= max_seconds:
+                break
             try:
                 kwargs: Dict[str, Any] = {
                     "logGroupName": RUNTIME_LOG_GROUP,
@@ -640,7 +823,10 @@ def _fetch_recent_stream_events(
             )
         except Exception:
             continue
-        collected.extend(response.get("events", []))
+        for row in response.get("events", []):
+            if isinstance(row, dict):
+                row["_log_stream_name"] = stream_name
+            collected.append(row)
         if len(collected) >= limit:
             break
 
@@ -680,6 +866,9 @@ def _discover_log_groups(prefix: str, limit: int = 25) -> list:
 def _resolve_evaluator_log_groups() -> list:
     if EVALUATOR_LOG_GROUP:
         return [EVALUATOR_LOG_GROUP]
+    # Safety default: keep analyzer scoped to the configured quick-start group unless explicitly overridden.
+    if DEFAULT_EVALUATOR_LOG_GROUP:
+        return [DEFAULT_EVALUATOR_LOG_GROUP]
 
     groups = []
     discovered = _discover_log_groups(EVALUATOR_LOG_PREFIX, limit=40)
@@ -884,6 +1073,62 @@ def _summarize_xray(trace_id: str) -> Dict[str, Any]:
     }
 
 
+def _compact_xray_detail(summary: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "trace_id": str(summary.get("trace_id", "")),
+        "total_latency_ms": summary.get("total_latency_ms"),
+        "slowest_step": summary.get("slowest_step"),
+        "slowest_step_overall": summary.get("slowest_step_overall"),
+        "slowest_aggregate_step": summary.get("slowest_aggregate_step"),
+        "totals_by_name": summary.get("totals_by_name", {}),
+        "steps": (summary.get("steps") or [])[:40],
+        "error": summary.get("error", ""),
+    }
+
+
+def _fetch_detailed_xray_for_trace_ids(
+    trace_ids: List[str],
+    max_seconds: float = 4.0,
+    max_workers: int = 6,
+) -> Dict[str, Dict[str, Any]]:
+    if not trace_ids or max_seconds <= 0:
+        return {}
+
+    started = time.perf_counter()
+    unique_trace_ids = []
+    seen = set()
+    for trace_id in trace_ids:
+        normalized = _normalize_trace_id(trace_id)
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            unique_trace_ids.append(normalized)
+
+    if not unique_trace_ids:
+        return {}
+
+    out: Dict[str, Dict[str, Any]] = {}
+    futures = {}
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(unique_trace_ids))) as executor:
+        for trace_id in unique_trace_ids:
+            if (time.perf_counter() - started) >= max_seconds:
+                break
+            futures[executor.submit(_summarize_xray, _denormalize_trace_id(trace_id))] = trace_id
+
+        try:
+            for future in as_completed(list(futures.keys()), timeout=max(0.1, max_seconds)):
+                if (time.perf_counter() - started) >= max_seconds:
+                    break
+                trace_id = futures[future]
+                try:
+                    out[trace_id] = _compact_xray_detail(future.result())
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+    return out
+
+
 def _build_diagnosis_fallback(merged: Dict[str, Any], error: str) -> str:
     """Plain-text summary used when the Bedrock LLM call fails."""
     request = merged.get("request", {})
@@ -946,7 +1191,7 @@ def _build_diagnosis(question: str, merged: Dict[str, Any]) -> str:
             modelId=DIAGNOSIS_MODEL_ID,
             system=[{"text": system_prompt}],
             messages=[{"role": "user", "content": [{"text": user_content}]}],
-            inferenceConfig={"maxTokens": 1150, "temperature": 0.1},
+            inferenceConfig={"maxTokens": DIAGNOSIS_SESSION_MAX_TOKENS, "temperature": 0.1},
         )
         return response["output"]["message"]["content"][0]["text"]
     except Exception as exc:
@@ -1004,16 +1249,30 @@ def _fetch_runtime_records_window(
     limit: int = 1500,
     max_seconds: float = 0.0,
     max_candidate_streams: int = 0,
-) -> List[Dict[str, Any]]:
+) -> Dict[str, Any]:
     if not RUNTIME_LOG_GROUP:
-        return []
+        return {
+            "records": [],
+            "source_stats": {
+                "fixed_stream_name": RUNTIME_LOG_STREAM,
+                "fixed_stream_records": 0,
+                "backfill_records": 0,
+                "backfill_streams": [],
+            },
+        }
 
     start_ms = int((time.time() - lookback_hours * 3600) * 1000)
     records: List[Dict[str, Any]] = []
     seen_runtime_keys = set()
     started = time.perf_counter()
+    source_stats = {
+        "fixed_stream_name": RUNTIME_LOG_STREAM,
+        "fixed_stream_records": 0,
+        "backfill_records": 0,
+        "backfill_streams": set(),
+    }
 
-    def _append_runtime_event(row: Dict[str, Any]) -> None:
+    def _append_runtime_event(row: Dict[str, Any], source_kind: str) -> None:
         payload = _json_from_log_message(row.get("message", ""))
         if not payload or not _is_runtime_trace_payload(payload):
             return
@@ -1025,7 +1284,15 @@ def _fetch_runtime_records_window(
             return
         seen_runtime_keys.add(dedupe_key)
         payload["_cloudwatch_timestamp"] = ts
+        payload["_source_stream"] = str(row.get("_log_stream_name", ""))
         records.append(payload)
+        if source_kind == "fixed_stream":
+            source_stats["fixed_stream_records"] += 1
+        else:
+            source_stats["backfill_records"] += 1
+            source_stream = str(row.get("_log_stream_name", "")).strip()
+            if source_stream:
+                source_stats["backfill_streams"].add(source_stream)
 
     # Primary path: fixed stream populated by runtime.
     if RUNTIME_LOG_STREAM:
@@ -1046,7 +1313,9 @@ def _fetch_runtime_records_window(
                     kwargs["nextToken"] = next_token
                 response = LOGS_CLIENT.get_log_events(**kwargs)
                 for row in response.get("events", []):
-                    _append_runtime_event(row)
+                    if isinstance(row, dict):
+                        row["_log_stream_name"] = RUNTIME_LOG_STREAM
+                    _append_runtime_event(row, "fixed_stream")
                 new_token = response.get("nextForwardToken") or response.get("nextToken")
                 pages += 1
                 if not new_token or new_token == next_token:
@@ -1068,10 +1337,18 @@ def _fetch_runtime_records_window(
         max_seconds=stream_budget_seconds,
         max_candidate_streams_override=max_candidate_streams,
     ):
-        _append_runtime_event(row)
+        _append_runtime_event(row, "backfill")
 
     records.sort(key=lambda item: item.get("_cloudwatch_timestamp", 0), reverse=True)
-    return records[:limit]
+    return {
+        "records": records[:limit],
+        "source_stats": {
+            "fixed_stream_name": source_stats["fixed_stream_name"],
+            "fixed_stream_records": source_stats["fixed_stream_records"],
+            "backfill_records": source_stats["backfill_records"],
+            "backfill_streams": sorted(source_stats["backfill_streams"]),
+        },
+    }
 
 
 def _fetch_evaluator_records_window(
@@ -1223,25 +1500,6 @@ def _truncate_text(text: Any, limit: int = 220) -> str:
     return value[:limit].rstrip() + "..."
 
 
-def _is_deep_dive_question(question: str) -> bool:
-    q = str(question or "").strip().lower()
-    if not q:
-        return False
-    deep_markers = [
-        "deep",
-        "detail",
-        "inner",
-        "raw",
-        "json",
-        "per trace",
-        "trace by trace",
-        "breakdown",
-        "table",
-        "drill",
-    ]
-    return any(marker in q for marker in deep_markers)
-
-
 def _short_trace(trace_id: str) -> str:
     value = str(trace_id or "").strip()
     if not value:
@@ -1319,92 +1577,56 @@ def _build_fleet_digest(question: str, merged: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _ask_for_prompt_upgrade(question: str, merged: Dict[str, Any]) -> str:
-    """Generate an upgraded system prompt based on analysis of the current one and context."""
-    context_excerpt = json.dumps(merged.get("fleet_metrics", {}), indent=2, default=str)
-    
-    meta_prompt = (
-        "You are a prompt engineering expert. Based on the user's question about system prompt improvement, "
-        "suggest a concrete, improved version of the fleet analyzer system prompt. "
-        "The improved prompt should be: human-centric, example-driven, include signal detection logic "
-        "(ResponseRelevance thresholds, sample size warnings), and prioritize natural readability. "
-        "Return the improved prompt as a single multi-line string, ready to use. "
-        "Do not include explanation or commentary—just the prompt itself."
-    )
-    
-    meta_content = (
-        f"Current system prompt goal: Analyze AWS Bedrock AgentCore fleet diagnostics concisely.\n\n"
-        f"Fleet context (sample metrics):\n{context_excerpt}\n\n"
-        f"User request: {question}\n\n"
-        f"Provide an upgraded system prompt that is more natural, includes examples of what to avoid, "
-        f"and includes instructions for detecting low ResponseRelevance, missing data, and small sample sizes."
-    )
-    
-    try:
-        response = BEDROCK_CLIENT.converse(
-            modelId=DIAGNOSIS_MODEL_ID,
-            system=[{"text": meta_prompt}],
-            messages=[{"role": "user", "content": [{"text": meta_content}]}],
-            inferenceConfig={"maxTokens": 920, "temperature": 0.2},
-        )
-        return response["output"]["message"]["content"][0]["text"]
-    except Exception as exc:
-        return f"Could not generate upgraded prompt: {exc}"
-
-
-def _is_prompt_upgrade_request(question: str) -> bool:
-    """Detect if user is asking to improve/upgrade the system prompt."""
-    q = str(question or "").strip().lower()
-    markers = ["upgrade prompt", "improve prompt", "better prompt", "suggest prompt", "new prompt", "system prompt improvement", "refine prompt"]
-    return any(marker in q for marker in markers)
+def _target_fleet_summary_tokens(traces_total: int) -> int:
+    # Non-question-based sizing: increase budget with dataset size, but keep a
+    # bounded cap to avoid HTTP timeouts.
+    estimated = traces_total * 10 + 180
+    return max(500, min(DIAGNOSIS_FLEET_SUMMARY_MAX_TOKENS, estimated, 1400))
 
 
 def _build_fleet_summary_with_llm(question: str, merged: Dict[str, Any]) -> str:
-    # Handle prompt upgrade request separately
-    if _is_prompt_upgrade_request(question):
-        return _ask_for_prompt_upgrade(question, merged)
-    
     window_minutes = int(merged.get("window", {}).get("duration_minutes", 0) or 0)
     traces_total = int(merged.get("fleet_metrics", {}).get("traces_total", 0) or 0)
-    llm_context = _compact_fleet_merged(merged)
-    llm_context["delayed_traces"] = (merged.get("delayed_traces") or [])[:15]
-    llm_context["top_anomalies"] = (merged.get("top_anomalies") or [])[:15]
-    context_json = json.dumps(llm_context, indent=2, default=str)
+
+    # Build a minimal LLM context (only what is needed to answer the question).
+    # Keeping the JSON small reduces input-token count and cuts LLM latency by >50%.
+    fleet_m = merged.get("fleet_metrics", {})
+    delayed_traces = (merged.get("delayed_traces") or [])[:10]
+    top_anomalies = (merged.get("top_anomalies") or [])[:10]
+    trace_index = merged.get("trace_index") or []
     user_question = question.strip() if question and question.strip() else "Give me a short summary of the fleet window."
 
-    system_prompt = (
-        "You are a session log analyst for an AWS Bedrock AgentCore system.\n\n"
-        "Answer the user's question using ONLY the provided merged diagnostics payload.\n\n"
-        "FORMATTING RULES (STRICT):\n"
-        "- NO emojis, no special symbols, no quotation marks around examples\n"
-        "- Plain text only. Use line breaks for clarity, not markdown\n"
-        "- NO tables, NO bullet points, NO excessive indentation\n"
-        "- Use simple sentences and short paragraphs\n"
-        "- Professional and minimal tone\n\n"
-        "RESPONSE STRUCTURE:\n"
-        "1. Start with a one or two sentence summary of the main finding\n"
-        f"2. If sample size is very small (< 10 traces), briefly note limited data (current: {traces_total})\n"
-        "3. Describe the main bottleneck in plain language\n"
-        "4. If user asks for delayed trace details: list each delayed trace on a new line with format 'Trace ID: [id], Latency: [time]ms, Runtime: [time]ms'\n"
-        "5. Wrap up with actionable next steps\n\n"
-        "CONTENT RULES:\n"
-        "- Avoid distribution jargon unless explicitly requested\n"
-        "- Round latencies to nearest 100ms (e.g., '3.4 seconds' not '3412 ms')\n"
-        "- Use 'most requests', 'a few cases', 'one clear outlier' style phrasing\n"
-        "- If ResponseRelevance is low (< 0.5): say 'response quality is questionable'\n"
-        "- If ResponseRelevance is moderate (0.5-0.7): say 'response may not fully match intent'\n"
-        "- If list of delayed traces is requested: provide each on separate line, no table, no markdown\n"
-        "- No colons with quoted values (write 'Runtime took 5.4 seconds' not 'Runtime: \"5.4 seconds\"')\n\n"
-        "TONE: Direct, professional, factual. No marketing language, no dramatic language."
-    )
+    min_ctx = {
+        "traces_total": traces_total,
+        "delay_threshold_ms": merged.get("delay_threshold_ms", 0),
+        "delayed_count": merged.get("delayed_traces_count", len(delayed_traces)),
+        "e2e_ms": fleet_m.get("e2e_ms", {}),
+        "error_rate": fleet_m.get("error_rate", 0),
+        "bottleneck": (merged.get("bottleneck_ranking") or [{}])[0],
+        "delayed_traces": delayed_traces,
+        "top_anomalies": top_anomalies,
+        "trace_index": trace_index,
+        "quality": merged.get("quality_indicators", {}),
+    }
+    context_json = json.dumps(min_ctx, default=str)  # no indent — saves tokens
+    target_tokens = _target_fleet_summary_tokens(traces_total)
 
+    system_prompt = (
+        "You are a session log analyst for an AWS Bedrock AgentCore system. "
+        "Answer the user's question using ONLY the provided diagnostics payload. "
+        "Plain text only: no emojis, no tables, no markdown, no bullet points. "
+        "Professional and minimal tone. Round latencies to nearest 100ms. "
+        "If the user asks to list traces or trace IDs, use trace_index as the source of truth and preserve the exact order. "
+        "Keep responses transport-safe: if a response may exceed about 1200 tokens, prioritize concise output and explicitly state truncation. "
+        "For very long trace lists, return the first 150 trace IDs in order, then state exactly how many were omitted. "
+        "If delayed traces are requested: list each on a new line as 'Trace [id], Latency [time]ms, Runtime [time]ms'. "
+        "If no traces meet the filter, say so clearly, then offer the top anomalies. "
+        f"Dataset has {traces_total} total traces."
+    )
     user_content = (
-        f"Window size: {window_minutes} minutes. Total traces analyzed: {traces_total}.\n"
-        "Return a concise, natural answer that directly addresses the user's question.\n"
-        "If user asks for delayed trace details: list each trace as 'Trace [id], Latency [time]ms, Runtime [time]ms' on separate lines.\n"
-        "Keep formatting minimal and professional.\n\n"
-        f"Merged diagnostics payload:\n```json\n{context_json}\n```\n\n"
-        f"User question: {user_question}"
+        f"Window: {window_minutes} minutes. Traces: {traces_total}.\n"
+        f"Diagnostics: {context_json}\n"
+        f"Question: {user_question}"
     )
 
     try:
@@ -1412,7 +1634,7 @@ def _build_fleet_summary_with_llm(question: str, merged: Dict[str, Any]) -> str:
             modelId=DIAGNOSIS_MODEL_ID,
             system=[{"text": system_prompt}],
             messages=[{"role": "user", "content": [{"text": user_content}]}],
-            inferenceConfig={"maxTokens": 320, "temperature": 0.1},
+            inferenceConfig={"maxTokens": target_tokens, "temperature": 0.1},
         )
         answer = response["output"]["message"]["content"][0]["text"]
         return answer
@@ -1422,22 +1644,16 @@ def _build_fleet_summary_with_llm(question: str, merged: Dict[str, Any]) -> str:
 
 def _build_fleet_diagnosis(question: str, merged: Dict[str, Any]) -> str:
     window_minutes = int(merged.get("window", {}).get("duration_minutes", 0) or 0)
-    detail_level = "deep_dive" if _is_deep_dive_question(question) else "summary_first"
-
-    if detail_level == "summary_first":
-        try:
-            return _build_fleet_summary_with_llm(question, merged)
-        except Exception:
-            return _build_fleet_digest(question, merged)
-
     system_prompt = (
         "You are a session log analyst for an AWS Bedrock AgentCore system. "
         f"You receive merged diagnostics from X-Ray, runtime logs, and evaluator logs for a {window_minutes}-minute window. "
         "Identify latency bottlenecks, delay points between stages, and likely causes based only on provided data. "
         "If a metric is inferred/approximate, state that explicitly. "
+        "If trace_lookup.requested_trace_ids is present, treat the request as a focused trace lookup and answer only for the matched traces. "
+        "Do not say a trace is missing just because it is absent from another pagination page; rely on trace_lookup and the filtered payload. "
+        "When xray details are present under trace_diagnostics[].xray or xray_trace_details, use the step timeline and slowest_step fields directly. "
         "FORMATTING: Use plain text only, no emojis, no tables, no markdown. Keep it professional and concise. "
-        "Default behavior: provide a clean, human-readable executive summary first. "
-        "Only provide deep technical detail if the user explicitly asks for deep-dive/raw details. "
+        "Default behavior: provide a clean, human-readable executive summary first, then include requested details. "
         "Use short sections, plain language, and professional formatting. "
         "Do not fabricate values."
     )
@@ -1445,7 +1661,6 @@ def _build_fleet_diagnosis(question: str, merged: Dict[str, Any]) -> str:
     context_json = json.dumps(merged, indent=2, default=str)
     user_question = question.strip() if question and question.strip() else "Analyze this fleet window and rank bottlenecks."
     user_content = (
-        f"Requested response level: {detail_level}.\n"
         f"Window size: {window_minutes} minutes.\n"
         "Here is the merged diagnostics payload:\n\n"
         f"```json\n{context_json}\n```\n\n"
@@ -1457,7 +1672,7 @@ def _build_fleet_diagnosis(question: str, merged: Dict[str, Any]) -> str:
             modelId=DIAGNOSIS_MODEL_ID,
             system=[{"text": system_prompt}],
             messages=[{"role": "user", "content": [{"text": user_content}]}],
-            inferenceConfig={"maxTokens": 1350, "temperature": 0.1},
+            inferenceConfig={"maxTokens": DIAGNOSIS_FLEET_DEEP_DIVE_MAX_TOKENS, "temperature": 0.1},
         )
         return response["output"]["message"]["content"][0]["text"]
     except Exception as exc:
@@ -1503,6 +1718,7 @@ def _compact_fleet_merged(merged: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "analysis_mode": merged.get("analysis_mode"),
         "window": merged.get("window", {}),
+        "trace_lookup": merged.get("trace_lookup", {}),
         "quality_indicators": merged.get("quality_indicators", {}),
         "sources": merged.get("sources", {}),
         "fleet_metrics": merged.get("fleet_metrics", {}),
@@ -1512,30 +1728,41 @@ def _compact_fleet_merged(merged: Dict[str, Any]) -> Dict[str, Any]:
         "user_metadata_summary": merged.get("user_metadata_summary", {}),
         "top_anomalies": merged.get("top_anomalies", [])[:10],
         "delayed_traces": delayed[:10],
+        "trace_index": merged.get("trace_index", [])[:150],
+        "trace_diagnostics": merged.get("trace_diagnostics", [])[:150],
         "trace_samples": merged.get("trace_samples", [])[:5],
+        "xray_trace_details": merged.get("xray_trace_details", [])[:40],
+        "pagination_context": merged.get("pagination_context", {}),
         "evaluator_groups_used": merged.get("evaluator_groups_used", [])[:10],
     }
 
 
-def _handle_fleet_insights(question: str, lookback_hours: int, lookback_mode: str = "") -> Dict[str, Any]:
+def _handle_fleet_insights(question: str, lookback_hours: int, lookback_mode: str = "", page: int = 1, page_size: int = 15) -> Dict[str, Any]:
+    handler_start = time.perf_counter()
+    analysis_id = str(uuid.uuid4())[:8]
     window_minutes = int(lookback_hours * 60)
-    wants_deep_dive = _is_deep_dive_question(question)
     # Disable fast-mode for 'overall' analytical queries; they require completeness over speed.
     is_analytical_overall = lookback_mode == "overall"
-    fast_mode = (window_minutes > 24 * 60) and (not wants_deep_dive) and (not is_analytical_overall)
+    # Apply fast-mode only beyond 30 days. For normal UI ranges (<=30 days), always
+    # use full collection limits so results are driven by timeframe, not sampling mode.
+    fast_mode = (
+        (window_minutes > 30 * 24 * 60)
+        and (not is_analytical_overall)
+    )
 
     runtime_limit = max(200, FLEET_RUNTIME_LIMIT)
-    # ALWAYS apply time budgets; normal mode is generous, fast-mode is aggressive.
-    runtime_budget_seconds = 15.0  # Default: 15 seconds for normal queries
-    runtime_max_candidate_streams = 3000  # Default: scan more streams in normal mode
+    # ALWAYS apply time budgets; normal mode is generous (but still bounded), fast-mode is aggressive.
+    # These run IN PARALLEL so total wall time ≈ max(runtime, evaluator, xray) + LLM.
+    runtime_budget_seconds = 7.0    # Normal: 7s — parallel bottleneck; formerly 15s sequential
+    runtime_max_candidate_streams = 3000
     evaluator_max_groups = max(1, FLEET_EVALUATOR_MAX_GROUPS)
     evaluator_per_group_limit = max(50, FLEET_EVALUATOR_PER_GROUP_LIMIT)
-    evaluator_budget_seconds = 8.0  # Default: 8 seconds for normal evaluator queries
+    evaluator_budget_seconds = 5.0  # Normal: 5s — runs in parallel with runtime+xray
     xray_max_traces = max(100, FLEET_XRAY_MAX_TRACES)
-    xray_budget_seconds = 8.0  # Default: 8 seconds for normal X-Ray queries
-    xray_max_segments = 10  # Default: scan more segments in normal mode
-    xray_pages_per_segment = 10  # Default: scan more pages per segment in normal mode
-    
+    xray_budget_seconds = 5.0       # Normal: 5s — runs in parallel
+    xray_max_segments = 10
+    xray_pages_per_segment = 10
+
     if fast_mode:
         # Fast-mode applies strict time limits and candidate caps
         runtime_limit = max(200, min(runtime_limit, FLEET_FAST_RUNTIME_LIMIT))
@@ -1549,27 +1776,74 @@ def _handle_fleet_insights(question: str, lookback_hours: int, lookback_mode: st
         xray_max_segments = max(1, FLEET_FAST_XRAY_MAX_SEGMENTS)
         xray_pages_per_segment = max(1, FLEET_FAST_XRAY_MAX_PAGES_PER_SEGMENT)
 
-    runtime_records = _fetch_runtime_records_window(
-        lookback_hours=lookback_hours,
-        limit=runtime_limit,
-        max_seconds=runtime_budget_seconds,
-        max_candidate_streams=runtime_max_candidate_streams,
-    )
-    evaluator_fetch = _fetch_evaluator_records_window(
-        lookback_hours=lookback_hours,
-        max_groups=evaluator_max_groups,
-        per_group_limit=evaluator_per_group_limit,
-        max_seconds=evaluator_budget_seconds,
-    )
+    # ── Emit start trace (Strands-style structured logging) ────────────────────
+    _emit_analyzer_trace({
+        "phase": "data_collection_start",
+        "analysis_id": analysis_id,
+        "lookback_hours": lookback_hours,
+        "lookback_mode": lookback_mode,
+        "fast_mode": fast_mode,
+        "budgets": {
+            "runtime_seconds": runtime_budget_seconds,
+            "evaluator_seconds": evaluator_budget_seconds,
+            "xray_seconds": xray_budget_seconds,
+        },
+        "question_excerpt": question[:120] if question else "",
+    })
+
+    # ── Run all three data sources IN PARALLEL to stay within API Gateway 29s timeout ──
+    # Sequential was: runtime(≤15s) + evaluator(≤8s) + xray(≤8s) = ≤31s → timeout
+    # Parallel wall time ≈ max(runtime, evaluator, xray) + LLM ≈ 10s + 8s = 18s ✓
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        runtime_future = executor.submit(
+            _fetch_runtime_records_window,
+            lookback_hours=lookback_hours,
+            limit=runtime_limit,
+            max_seconds=runtime_budget_seconds,
+            max_candidate_streams=runtime_max_candidate_streams,
+        )
+        evaluator_future = executor.submit(
+            _fetch_evaluator_records_window,
+            lookback_hours=lookback_hours,
+            max_groups=evaluator_max_groups,
+            per_group_limit=evaluator_per_group_limit,
+            max_seconds=evaluator_budget_seconds,
+        )
+        xray_future = executor.submit(
+            _fetch_xray_trace_summaries_window,
+            lookback_hours=lookback_hours,
+            max_traces=xray_max_traces,
+            max_seconds=xray_budget_seconds,
+            max_segments_limit=xray_max_segments,
+            max_pages_per_segment=xray_pages_per_segment,
+        )
+        runtime_fetch = runtime_future.result()
+        evaluator_fetch = evaluator_future.result()
+        xray_summaries = xray_future.result()
+
+    data_elapsed = round(time.perf_counter() - handler_start, 2)
+    runtime_records = runtime_fetch["records"]
+    runtime_source_stats = runtime_fetch["source_stats"]
     evaluator_records = evaluator_fetch["records"]
     evaluator_groups_used = evaluator_fetch["groups_used"]
-    xray_summaries = _fetch_xray_trace_summaries_window(
-        lookback_hours=lookback_hours,
-        max_traces=xray_max_traces,
-        max_seconds=xray_budget_seconds,
-        max_segments_limit=xray_max_segments,
-        max_pages_per_segment=xray_pages_per_segment,
-    )
+    runtime_streams_used = sorted({
+        str(r.get("_source_stream", "")).strip()
+        for r in runtime_records
+        if str(r.get("_source_stream", "")).strip()
+    })
+
+    # ── Emit post-collection trace ──────────────────────────────────────────────
+    _emit_analyzer_trace({
+        "phase": "data_collection_complete",
+        "analysis_id": analysis_id,
+        "elapsed_seconds": data_elapsed,
+        "runtime_events": len(runtime_records),
+        "runtime_streams": runtime_streams_used,
+        "runtime_source_stats": runtime_source_stats,
+        "evaluator_events": len(evaluator_records),
+        "xray_summaries": len(xray_summaries),
+        "evaluator_groups": evaluator_groups_used,
+    })
 
     traces: Dict[str, Dict[str, Any]] = {}
     runtime_details_by_trace: Dict[str, Dict[str, Any]] = {}
@@ -1688,10 +1962,20 @@ def _handle_fleet_insights(question: str, lookback_hours: int, lookback_mode: st
         item["e2e_ms"] = round(base_e2e, 2)
         item["is_delayed"] = bool(item["e2e_ms"] >= DELAY_THRESHOLD_MS)
 
+    def _xray_summary_for_trace(trace_id: str) -> Dict[str, Any]:
+        summary = xray_summaries.get(str(trace_id), {}) if isinstance(xray_summaries, dict) else {}
+        return {
+            "trace_id": str(summary.get("trace_id", "")),
+            "duration_ms": round(_to_float(summary.get("duration_ms")), 2),
+            "has_error": bool(summary.get("has_error")),
+            "has_fault": bool(summary.get("has_fault")),
+            "has_throttle": bool(summary.get("has_throttle")),
+        }
+
     all_traces = list(traces.values())
     traces_total = len(all_traces)
     large_window = _is_large_fleet_window(window_minutes, traces_total)
-    include_deep_details = wants_deep_dive or not large_window
+    include_deep_details = not large_window
     complete_3stage = [
         t for t in all_traces if t.get("runtime_count", 0) > 0 and t.get("evaluator_count", 0) > 0 and t.get("xray_duration_ms", 0) > 0
     ]
@@ -1748,6 +2032,9 @@ def _handle_fleet_insights(question: str, lookback_hours: int, lookback_mode: st
             "evaluator_latency_ms": round(_to_float(t.get("evaluator_latency_ms")), 2),
             "inferred_model_or_gap_ms": round(_to_float(t.get("inferred_model_or_gap_ms")), 2),
             "status": t.get("status", "success"),
+            "user": (runtime_details_by_trace.get(str(t.get("trace_id", "")), {}) or {}).get("user", {}),
+            "evaluator_scores": t.get("evaluator_metrics", {}),
+            "xray": _xray_summary_for_trace(str(t.get("trace_id", ""))),
         }
         for i, t in enumerate(anomalies)
     ]
@@ -1761,35 +2048,54 @@ def _handle_fleet_insights(question: str, lookback_hours: int, lookback_mode: st
             "inferred_model_or_gap_ms": round(_to_float(t.get("inferred_model_or_gap_ms")), 2),
             "status": t.get("status", "success"),
             "user": (runtime_details_by_trace.get(str(t.get("trace_id", "")), {}) or {}).get("user", {}),
+            "evaluator_scores": t.get("evaluator_metrics", {}),
+            "xray": _xray_summary_for_trace(str(t.get("trace_id", ""))),
         }
         for t in sorted(all_traces, key=lambda row: _to_float(row.get("e2e_ms")), reverse=True)
         if bool(t.get("is_delayed"))
     ]
 
+    trace_index = [
+        {
+            "trace_id": str(t.get("trace_id", "")),
+            "e2e_ms": round(_to_float(t.get("e2e_ms")), 2),
+            "runtime_latency_ms": round(_to_float(t.get("runtime_latency_ms")), 2),
+            "evaluator_latency_ms": round(_to_float(t.get("evaluator_latency_ms")), 2),
+            "inferred_model_or_gap_ms": round(_to_float(t.get("inferred_model_or_gap_ms")), 2),
+            "status": t.get("status", "success"),
+            "is_delayed": bool(t.get("is_delayed")),
+            "user": (runtime_details_by_trace.get(str(t.get("trace_id", "")), {}) or {}).get("user", {}),
+            "evaluator_scores": t.get("evaluator_metrics", {}),
+            "xray": _xray_summary_for_trace(str(t.get("trace_id", ""))),
+        }
+        for t in sorted(all_traces, key=lambda row: _to_float(row.get("e2e_ms")), reverse=True)
+    ]
+
     trace_diagnostics = []
-    if include_deep_details:
-        for t in sorted(all_traces, key=lambda row: _to_float(row.get("e2e_ms")), reverse=True)[:120]:
-            trace_id = str(t.get("trace_id", ""))
-            rt = runtime_details_by_trace.get(trace_id, {})
-            trace_diagnostics.append(
-                {
-                    "trace_id": trace_id,
-                    "status": t.get("status", "success"),
-                    "is_delayed": bool(t.get("is_delayed")),
-                    "stage_latency_ms": {
-                        "runtime": round(_to_float(t.get("runtime_latency_ms")), 2),
-                        "model_or_handoff_gap": round(_to_float(t.get("inferred_model_or_gap_ms")), 2),
-                        "evaluator": round(_to_float(t.get("evaluator_latency_ms")), 2),
-                        "e2e": round(_to_float(t.get("e2e_ms")), 2),
-                    },
-                    "user": rt.get("user", {}),
-                    "token_usage": rt.get("token_usage", {}),
-                    "model_invocation": rt.get("model_invocation", {}),
-                    "tool_trace": rt.get("tool_trace", {}),
-                    "reasoning_steps": rt.get("reasoning_steps", {}),
-                    "evaluator_scores": t.get("evaluator_metrics", {}),
-                }
-            )
+    for t in sorted(all_traces, key=lambda row: _to_float(row.get("e2e_ms")), reverse=True):
+        trace_id = str(t.get("trace_id", ""))
+        rt = runtime_details_by_trace.get(trace_id, {})
+        diagnostic = {
+            "trace_id": trace_id,
+            "status": t.get("status", "success"),
+            "is_delayed": bool(t.get("is_delayed")),
+            "stage_latency_ms": {
+                "runtime": round(_to_float(t.get("runtime_latency_ms")), 2),
+                "model_or_handoff_gap": round(_to_float(t.get("inferred_model_or_gap_ms")), 2),
+                "evaluator": round(_to_float(t.get("evaluator_latency_ms")), 2),
+                "e2e": round(_to_float(t.get("e2e_ms")), 2),
+            },
+            "user": rt.get("user", {}),
+            "evaluator_scores": t.get("evaluator_metrics", {}),
+            "xray": _xray_summary_for_trace(trace_id),
+            # Include lightweight runtime context for every trace so all-traces mode has per-trace detail.
+            "token_usage": rt.get("token_usage", {}),
+            "model_invocation": rt.get("model_invocation", {}),
+            "tool_trace": rt.get("tool_trace", {}),
+        }
+        if include_deep_details:
+            diagnostic["reasoning_steps"] = rt.get("reasoning_steps", {})
+        trace_diagnostics.append(diagnostic)
 
     now_ts = time.time()
     delayed_with_user_metadata = sum(1 for row in delayed_traces if _has_recorded_user(row.get("user", {})))
@@ -1846,6 +2152,7 @@ def _handle_fleet_insights(question: str, lookback_hours: int, lookback_mode: st
         "delay_threshold_ms": DELAY_THRESHOLD_MS,
         "delayed_traces_count": len(delayed_traces),
         "delayed_traces": delayed_traces[:(50 if include_deep_details else 20)],
+        "trace_index": trace_index,
         "trace_diagnostics": trace_diagnostics,
         "user_metadata_summary": {
             "delayed_with_user_metadata": delayed_with_user_metadata,
@@ -1855,11 +2162,216 @@ def _handle_fleet_insights(question: str, lookback_hours: int, lookback_mode: st
         "trace_samples": top_anomalies[:5],
     }
     
+    # ── Check elapsed time before invoking LLM ──────────────────────────────────
+    pre_llm_elapsed = round(time.perf_counter() - handler_start, 2)
+    remaining_budget = 29.0 - pre_llm_elapsed  # API Gateway timeout ~29s
+
+    requested_trace_ids = _extract_trace_ids_from_text(question)
+    traces_by_id = {str(t.get("trace_id", "")): t for t in all_traces}
+    matched_trace_ids = [trace_id for trace_id in requested_trace_ids if trace_id in traces_by_id]
+    missing_trace_ids = [trace_id for trace_id in requested_trace_ids if trace_id not in traces_by_id]
+    should_paginate = _should_paginate_trace_context(
+        question=question,
+        traces_total=len(all_traces),
+        page_size=page_size,
+        pre_llm_elapsed=pre_llm_elapsed,
+        remaining_budget_seconds=remaining_budget,
+        explicit_trace_ids=requested_trace_ids,
+    )
+
+    pagination_info = {}
+    trace_lookup_context: Dict[str, Any] = {}
+    traces_for_llm = all_traces
+    selected_trace_ids_for_llm: List[str] = [str(t.get("trace_id", "")) for t in all_traces]
+
+    if requested_trace_ids:
+        traces_for_llm = [traces_by_id[trace_id] for trace_id in matched_trace_ids]
+        selected_trace_ids_for_llm = matched_trace_ids
+        trace_lookup_context = {
+            "requested_trace_ids": requested_trace_ids,
+            "matched_trace_ids": matched_trace_ids,
+            "missing_trace_ids": missing_trace_ids,
+            "matched_count": len(matched_trace_ids),
+            "window_traces_total": len(all_traces),
+        }
+        _emit_analyzer_trace({
+            "phase": "trace_lookup_applied",
+            "analysis_id": analysis_id,
+            "requested_trace_ids": requested_trace_ids,
+            "matched_trace_ids": matched_trace_ids,
+            "missing_trace_ids": missing_trace_ids,
+        })
+    elif should_paginate:
+        paged_traces, total_pages, has_next = _apply_pagination_to_traces(all_traces, page, page_size)
+        traces_for_llm = paged_traces
+        selected_trace_ids_for_llm = [str(tr.get("trace_id", "")) for tr in paged_traces]
+        effective_page = min(max(1, page), total_pages)
+        pagination_info = {
+            "page": effective_page,
+            "page_size": page_size,
+            "total_traces": len(all_traces),
+            "total_pages": total_pages,
+            "has_next_page": has_next,
+            "traces_on_this_page": len(paged_traces),
+        }
+        _emit_analyzer_trace({
+            "phase": "pagination_applied",
+            "analysis_id": analysis_id,
+            "page": effective_page,
+            "page_size": page_size,
+            "total_traces": len(all_traces),
+            "traces_to_analyze": len(paged_traces),
+            "reason": "bulk_listing_or_timeout_risk",
+        })
+
+    if pre_llm_elapsed > 20:
+        _emit_analyzer_trace({
+            "phase": "pre_llm_timing_warning",
+            "analysis_id": analysis_id,
+            "elapsed_before_llm": pre_llm_elapsed,
+            "remaining_budget_seconds": remaining_budget,
+            "warning": "Data collection took longer than expected; LLM generation must complete within remaining time",
+            "traces_for_llm": len(traces_for_llm),
+        })
+
+    merged_for_llm = copy.deepcopy(merged)
+    apply_trace_filter = bool(requested_trace_ids) or should_paginate
+    selected_trace_ids_set = set(selected_trace_ids_for_llm)
+    if apply_trace_filter:
+        merged_for_llm["trace_index"] = [
+            t for t in merged.get("trace_index", [])
+            if str(t.get("trace_id", "")) in selected_trace_ids_set
+        ]
+        merged_for_llm["trace_diagnostics"] = [
+            t for t in merged.get("trace_diagnostics", [])
+            if str(t.get("trace_id", "")) in selected_trace_ids_set
+        ]
+        merged_for_llm["delayed_traces"] = [
+            t for t in merged.get("delayed_traces", [])
+            if str(t.get("trace_id", "")) in selected_trace_ids_set
+        ]
+        merged_for_llm["top_anomalies"] = [
+            t for t in merged.get("top_anomalies", [])
+            if str(t.get("trace_id", "")) in selected_trace_ids_set
+        ]
+        merged_for_llm["trace_samples"] = [
+            t for t in merged.get("trace_samples", [])
+            if str(t.get("trace_id", "")) in selected_trace_ids_set
+        ]
+
+    if trace_lookup_context:
+        merged_for_llm["trace_lookup"] = trace_lookup_context
+
+    if pagination_info:
+        merged_for_llm["pagination_context"] = {
+            "page": pagination_info.get("page", 1),
+            "page_size": pagination_info.get("page_size", page_size),
+            "total_traces": len(all_traces),
+            "total_pages": pagination_info.get("total_pages", 1),
+            "traces_on_this_page": len(traces_for_llm),
+        }
+
+    detailed_xray_budget = min(6.0, max(1.0, remaining_budget - 7.0))
+    detailed_xray_ids = selected_trace_ids_for_llm[:max(1, min(page_size, 20))] if selected_trace_ids_for_llm else []
+    detailed_xray_by_trace = _fetch_detailed_xray_for_trace_ids(
+        detailed_xray_ids,
+        max_seconds=detailed_xray_budget,
+        max_workers=6,
+    )
+
+    if detailed_xray_by_trace:
+        merged_for_llm["trace_index"] = [
+            {
+                **row,
+                "xray": {
+                    **((row.get("xray") or {}) if isinstance(row.get("xray"), dict) else {}),
+                    **detailed_xray_by_trace.get(str(row.get("trace_id", "")), {}),
+                },
+            }
+            for row in merged_for_llm.get("trace_index", [])
+        ]
+        merged_for_llm["trace_diagnostics"] = [
+            {
+                **row,
+                "xray": {
+                    **((row.get("xray") or {}) if isinstance(row.get("xray"), dict) else {}),
+                    **detailed_xray_by_trace.get(str(row.get("trace_id", "")), {}),
+                },
+            }
+            for row in merged_for_llm.get("trace_diagnostics", [])
+        ]
+        merged_for_llm["delayed_traces"] = [
+            {
+                **row,
+                "xray": {
+                    **((row.get("xray") or {}) if isinstance(row.get("xray"), dict) else {}),
+                    **detailed_xray_by_trace.get(str(row.get("trace_id", "")), {}),
+                },
+            }
+            for row in merged_for_llm.get("delayed_traces", [])
+        ]
+        merged_for_llm["top_anomalies"] = [
+            {
+                **row,
+                "xray": {
+                    **((row.get("xray") or {}) if isinstance(row.get("xray"), dict) else {}),
+                    **detailed_xray_by_trace.get(str(row.get("trace_id", "")), {}),
+                },
+            }
+            for row in merged_for_llm.get("top_anomalies", [])
+        ]
+        merged_for_llm["trace_samples"] = [
+            {
+                **row,
+                "xray": {
+                    **((row.get("xray") or {}) if isinstance(row.get("xray"), dict) else {}),
+                    **detailed_xray_by_trace.get(str(row.get("trace_id", "")), {}),
+                },
+            }
+            for row in merged_for_llm.get("trace_samples", [])
+        ]
+        merged_for_llm["xray_trace_details"] = [
+            {
+                "trace_id": trace_id,
+                **detail,
+            }
+            for trace_id, detail in detailed_xray_by_trace.items()
+        ]
+    else:
+        merged_for_llm["xray_trace_details"] = []
+
+    # ── Invoke LLM to generate analysis answer ──────────────────────────────────
+    llm_start = time.perf_counter()
     answer = _sanitize_analysis_answer(
-        _build_fleet_diagnosis(question, merged),
+        _build_fleet_diagnosis(question, merged_for_llm),
         traces_total=len(all_traces),
     )
-    compact_merged = _compact_fleet_merged(merged)
+    llm_elapsed = round(time.perf_counter() - llm_start, 2)
+    
+    if llm_elapsed > 15:
+        # Warn: LLM generation took >15s
+        _emit_analyzer_trace({
+            "phase": "llm_timing_warning",
+            "analysis_id": analysis_id,
+            "llm_elapsed_seconds": llm_elapsed,
+            "total_before_response": round(time.perf_counter() - handler_start, 2),
+            "warning": "LLM generation took longer than typical. This is a bottleneck for large trace lists.",
+            "traces_processed": len(traces_for_llm),
+            "lookback_hours": lookback_hours,
+        })
+    
+    total_elapsed = round(time.perf_counter() - handler_start, 2)
+    # ── Emit completion trace (Strands-style structured logging) ───────────────
+    _emit_analyzer_trace({
+        "phase": "analysis_complete",
+        "analysis_id": analysis_id,
+        "total_elapsed_seconds": total_elapsed,
+        "traces_total": len(all_traces),
+        "delayed_traces": len(delayed_traces),
+        "complete_3stage": len(complete_3stage),
+        "answer_excerpt": answer[:200] if answer else "",
+    })
+    compact_merged = _compact_fleet_merged(merged_for_llm)
     return {
         "statusCode": 200,
         "headers": CORS_HEADERS,
@@ -1867,6 +2379,7 @@ def _handle_fleet_insights(question: str, lookback_hours: int, lookback_mode: st
             {
                 "answer": answer,
                 "merged": compact_merged,
+                "pagination": pagination_info if pagination_info else None,
                 "anchors": {
                     "request_id": "",
                     "client_request_id": "",
@@ -1897,6 +2410,9 @@ def _build_trace_payload(runtime_record: Dict[str, Any], otel_session_id: str = 
 
 
 def _handle_session_insights(event: Dict[str, Any]) -> Dict[str, Any]:
+    request_start = time.perf_counter()
+    analysis_id = str(uuid.uuid4())[:8]
+    
     try:
         body = json.loads(event.get("body") or "{}")
     except json.JSONDecodeError:
@@ -1916,10 +2432,85 @@ def _handle_session_insights(event: Dict[str, Any]) -> Dict[str, Any]:
     lookback_mode = str(body.get("lookback_mode", "")).strip().lower()
     analysis_mode = str(body.get("analysis_mode", "single_trace")).strip().lower()
 
+    # Extract pagination parameters for trace listing queries
+    try:
+        pagination_page = int(body.get("page", 1))
+    except (TypeError, ValueError):
+        pagination_page = 1
+    try:
+        pagination_page_size = int(body.get("page_size", 15))
+    except (TypeError, ValueError):
+        pagination_page_size = 15
+    # Clamp page_size between 5 and 50
+    pagination_page_size = max(5, min(50, pagination_page_size))
+
     if analysis_mode in {"fleet_1h", "all_traces_1h", "fleet", "fleet_window"}:
         # Fleet mode ignores anchors and aggregates all traces in the requested timeframe.
         fleet_hours = _resolve_lookback_hours(body, default_hours=1)
-        return _handle_fleet_insights(question=question, lookback_hours=fleet_hours, lookback_mode=lookback_mode)
+        try:
+            result = _handle_fleet_insights(
+                question=question, 
+                lookback_hours=fleet_hours, 
+                lookback_mode=lookback_mode,
+                page=pagination_page,
+                page_size=pagination_page_size,
+            )
+            elapsed = round(time.perf_counter() - request_start, 2)
+            # Log successful completion
+            _emit_analyzer_trace({
+                "phase": "request_complete",
+                "analysis_id": analysis_id,
+                "total_elapsed_seconds": elapsed,
+                "status": "success",
+            })
+            return result
+        except TimeoutError as exc:
+            elapsed = round(time.perf_counter() - request_start, 2)
+            error_msg = f"Fleet analysis timed out after {elapsed}s. LLM generation phase is taking too long for large trace-list queries."
+            _emit_analyzer_trace({
+                "phase": "request_timeout",
+                "analysis_id": analysis_id,
+                "elapsed_seconds": elapsed,
+                "error": error_msg,
+                "question_excerpt": question[:120] if question else "",
+                "lookback_hours": fleet_hours,
+            })
+            return {
+                "statusCode": 504,
+                "headers": CORS_HEADERS,
+                "body": json.dumps({
+                    "error": error_msg,
+                    "debug_info": {
+                        "analysis_id": analysis_id,
+                        "elapsed_seconds": elapsed,
+                        "reason": "Request exceeded API Gateway timeout limit (~29s). LLM generation for large trace lists can take 30-70 seconds.",
+                        "suggestion": "Please try: (1) Shorter time window (48h instead of 168h), (2) Fewer traces in result, or (3) Wait for system optimization",
+                    }
+                }),
+            }
+        except Exception as exc:
+            elapsed = round(time.perf_counter() - request_start, 2)
+            error_msg = str(exc)
+            _emit_analyzer_trace({
+                "phase": "request_error",
+                "analysis_id": analysis_id,
+                "elapsed_seconds": elapsed,
+                "error": error_msg,
+                "error_type": type(exc).__name__,
+                "question_excerpt": question[:120] if question else "",
+            })
+            return {
+                "statusCode": 500,
+                "headers": CORS_HEADERS,
+                "body": json.dumps({
+                    "error": f"Fleet analysis failed: {error_msg}",
+                    "debug_info": {
+                        "analysis_id": analysis_id,
+                        "elapsed_seconds": elapsed,
+                        "error_type": type(exc).__name__,
+                    }
+                }),
+            }
 
     terms = {
         "request_id": request_id,
@@ -1935,136 +2526,117 @@ def _handle_session_insights(event: Dict[str, Any]) -> Dict[str, Any]:
             "body": json.dumps({"error": "Provide at least one of request_id, session_id, evaluator_session_id, xray_trace_id, client_request_id"}),
         }
 
-    # Trace-first correlation: use xray_trace_id as the primary key whenever available.
-    runtime_terms: Dict[str, str] = {}
-    if xray_trace_id:
-        runtime_terms["xray_trace_id"] = xray_trace_id
-    else:
-        runtime_terms = {
-            "request_id": request_id,
-            "client_request_id": client_request_id,
-        }
-        if not any(runtime_terms.values()):
-            runtime_terms["session_id"] = session_id
+    trace_start = time.perf_counter()
+    trace_analysis_id = str(uuid.uuid4())[:8]
+    
+    try:
+        # Trace-first correlation: use xray_trace_id as the primary key whenever available.
+        runtime_terms: Dict[str, str] = {}
+        if xray_trace_id:
+            runtime_terms["xray_trace_id"] = xray_trace_id
+        else:
+            runtime_terms = {
+                "request_id": request_id,
+                "client_request_id": client_request_id,
+            }
+            if not any(runtime_terms.values()):
+                runtime_terms["session_id"] = session_id
 
-    runtime_records = []
-    _rt_start_ms = int((time.time() - lookback_hours * 3600) * 1000)
+        runtime_records = []
+        _rt_start_ms = int((time.time() - lookback_hours * 3600) * 1000)
 
-    # ── Primary path: fixed stream written to by the runtime directly ──
-    # my_agent1.py calls put_log_events to LOG_GROUP/agent-traces on every invocation,
-    # so get_log_events on the fixed stream is fast and completely reliable.
-    if RUNTIME_LOG_GROUP and RUNTIME_LOG_STREAM:
-        try:
-            resp = LOGS_CLIENT.get_log_events(
-                logGroupName=RUNTIME_LOG_GROUP,
-                logStreamName=RUNTIME_LOG_STREAM,
-                startTime=_rt_start_ms,
-                startFromHead=False,
-                limit=200,
-            )
-            for event_row in resp.get("events", []):
+        # ── Primary path: fixed stream written to by the runtime directly ──
+        # my_agent1.py calls put_log_events to LOG_GROUP/agent-traces on every invocation,
+        # so get_log_events on the fixed stream is fast and completely reliable.
+        if RUNTIME_LOG_GROUP and RUNTIME_LOG_STREAM:
+            try:
+                resp = LOGS_CLIENT.get_log_events(
+                    logGroupName=RUNTIME_LOG_GROUP,
+                    logStreamName=RUNTIME_LOG_STREAM,
+                    startTime=_rt_start_ms,
+                    startFromHead=False,
+                    limit=200,
+                )
+                for event_row in resp.get("events", []):
+                    payload = _json_from_log_message(event_row.get("message", ""))
+                    if not payload or not _is_runtime_trace_payload(payload):
+                        continue
+                    if _record_matches_terms(payload, event_row.get("message", ""), runtime_terms):
+                        payload["_cloudwatch_timestamp"] = event_row.get("timestamp")
+                        runtime_records.append(payload)
+            except Exception:
+                pass
+
+        # ── Fallback: per-invocation streams (pre-fix invocations, or if fixed stream unavailable) ──
+        if not runtime_records and RUNTIME_LOG_GROUP:
+            runtime_events = _fetch_log_events(RUNTIME_LOG_GROUP, runtime_terms, lookback_hours=lookback_hours, limit=500)
+            for event_row in runtime_events:
                 payload = _json_from_log_message(event_row.get("message", ""))
                 if not payload or not _is_runtime_trace_payload(payload):
                     continue
                 if _record_matches_terms(payload, event_row.get("message", ""), runtime_terms):
                     payload["_cloudwatch_timestamp"] = event_row.get("timestamp")
                     runtime_records.append(payload)
-        except Exception:
-            pass
 
-    # ── Fallback: per-invocation streams (pre-fix invocations, or if fixed stream unavailable) ──
-    if not runtime_records and RUNTIME_LOG_GROUP:
-        runtime_events = _fetch_log_events(RUNTIME_LOG_GROUP, runtime_terms, lookback_hours=lookback_hours, limit=500)
-        for event_row in runtime_events:
-            payload = _json_from_log_message(event_row.get("message", ""))
-            if not payload or not _is_runtime_trace_payload(payload):
-                continue
-            if _record_matches_terms(payload, event_row.get("message", ""), runtime_terms):
-                payload["_cloudwatch_timestamp"] = event_row.get("timestamp")
-                runtime_records.append(payload)
+        # ── Last resort: date-prefixed stream scanner ──
+        if not runtime_records and RUNTIME_LOG_GROUP:
+            for event_row in _fetch_recent_stream_events(RUNTIME_LOG_GROUP, _rt_start_ms, limit=500):
+                payload = _json_from_log_message(event_row.get("message", ""))
+                if not payload or not _is_runtime_trace_payload(payload):
+                    continue
+                if _record_matches_terms(payload, event_row.get("message", ""), runtime_terms):
+                    payload["_cloudwatch_timestamp"] = event_row.get("timestamp")
+                    runtime_records.append(payload)
 
-    # ── Last resort: date-prefixed stream scanner ──
-    if not runtime_records and RUNTIME_LOG_GROUP:
-        for event_row in _fetch_recent_stream_events(RUNTIME_LOG_GROUP, _rt_start_ms, limit=500):
-            payload = _json_from_log_message(event_row.get("message", ""))
-            if not payload or not _is_runtime_trace_payload(payload):
-                continue
-            if _record_matches_terms(payload, event_row.get("message", ""), runtime_terms):
-                payload["_cloudwatch_timestamp"] = event_row.get("timestamp")
-                runtime_records.append(payload)
+        runtime_records.sort(key=lambda row: row.get("_cloudwatch_timestamp", 0), reverse=True)
+        latest_runtime = runtime_records[0] if runtime_records else {}
 
-    runtime_records.sort(key=lambda row: row.get("_cloudwatch_timestamp", 0), reverse=True)
-    latest_runtime = runtime_records[0] if runtime_records else {}
+        # If request/session was provided and we found runtime data, use exact IDs for tighter evaluator matching.
+        if latest_runtime:
+            request_id = str(latest_runtime.get("request_id", request_id))
+            # Do not override a caller/session anchor with runtime trace session_id.
+            # Runtime session_id may differ from evaluator/OTEL correlation session.
+            if not session_id:
+                session_id = str(latest_runtime.get("session_id", session_id))
+            xray_trace_id = str(latest_runtime.get("xray_trace_id", xray_trace_id))
+            client_request_id = str(latest_runtime.get("client_request_id", client_request_id))
+            terms = {
+                "request_id": request_id,
+                "session_id": session_id,
+                "xray_trace_id": xray_trace_id,
+                "client_request_id": client_request_id,
+            }
 
-    # If request/session was provided and we found runtime data, use exact IDs for tighter evaluator matching.
-    if latest_runtime:
-        request_id = str(latest_runtime.get("request_id", request_id))
-        # Do not override a caller/session anchor with runtime trace session_id.
-        # Runtime session_id may differ from evaluator/OTEL correlation session.
-        if not session_id:
-            session_id = str(latest_runtime.get("session_id", session_id))
-        xray_trace_id = str(latest_runtime.get("xray_trace_id", xray_trace_id))
-        client_request_id = str(latest_runtime.get("client_request_id", client_request_id))
-        terms = {
-            "request_id": request_id,
-            "session_id": session_id,
-            "xray_trace_id": xray_trace_id,
-            "client_request_id": client_request_id,
-        }
+        evaluator_events = []
+        evaluator_groups_used = []
+        # Evaluator result logs usually anchor on session and trace, not request/client IDs.
+        evaluator_terms: Dict[str, str] = {}
+        if xray_trace_id:
+            evaluator_terms["xray_trace_id"] = xray_trace_id
+        elif evaluator_session_id or session_id:
+            evaluator_terms["session_id"] = evaluator_session_id or session_id
+        if not any(evaluator_terms.values()):
+            evaluator_terms["request_id"] = request_id
+            evaluator_terms["client_request_id"] = client_request_id
 
-    evaluator_events = []
-    evaluator_groups_used = []
-    # Evaluator result logs usually anchor on session and trace, not request/client IDs.
-    evaluator_terms: Dict[str, str] = {}
-    if xray_trace_id:
-        evaluator_terms["xray_trace_id"] = xray_trace_id
-    elif evaluator_session_id or session_id:
-        evaluator_terms["session_id"] = evaluator_session_id or session_id
-    if not any(evaluator_terms.values()):
-        evaluator_terms["request_id"] = request_id
-        evaluator_terms["client_request_id"] = client_request_id
+        for group in _resolve_evaluator_log_groups()[:40]:
+            evaluator_groups_used.append(group)
+            evaluator_events.extend(
+                _fetch_log_events(group, evaluator_terms, lookback_hours=lookback_hours, limit=200)
+            )
+        evaluator_records = []
+        evaluations: Dict[str, Dict[str, Any]] = {}
+        evaluator_session_candidates = []
+        runtime_session_id = str(latest_runtime.get("session_id", "")).strip() if latest_runtime else ""
 
-    for group in _resolve_evaluator_log_groups()[:40]:
-        evaluator_groups_used.append(group)
-        evaluator_events.extend(
-            _fetch_log_events(group, evaluator_terms, lookback_hours=lookback_hours, limit=200)
-        )
-    evaluator_records = []
-    evaluations: Dict[str, Dict[str, Any]] = {}
-    evaluator_session_candidates = []
-    runtime_session_id = str(latest_runtime.get("session_id", "")).strip() if latest_runtime else ""
+        def _add_evaluator_session_candidate(value: str) -> None:
+            v = str(value or "").strip()
+            if v and v not in evaluator_session_candidates:
+                evaluator_session_candidates.append(v)
 
-    def _add_evaluator_session_candidate(value: str) -> None:
-        v = str(value or "").strip()
-        if v and v not in evaluator_session_candidates:
-            evaluator_session_candidates.append(v)
-
-    for event_row in evaluator_events:
-        payload = _json_from_log_message(event_row.get("message", ""))
-        if not payload:
-            continue
-        if _record_matches_terms(payload, event_row.get("message", ""), evaluator_terms):
-            evaluator_records.append(payload)
-            _collect_evaluations(payload, evaluations)
-            for sid in _extract_session_ids_deep(payload):
-                _add_evaluator_session_candidate(sid)
-            for sid in _extract_session_ids_from_message(event_row.get("message", "")):
-                _add_evaluator_session_candidate(sid)
-
-    # Fallback: online evaluator metrics can appear in runtime OTEL logs rather than
-    # /evaluations/results groups, so scan runtime logs for gen_ai.evaluation.result.
-    if not evaluations:
-        runtime_otel_events = _fetch_log_events(
-            RUNTIME_LOG_GROUP,
-            evaluator_terms,
-            lookback_hours=lookback_hours,
-            limit=600,
-        )
-        for event_row in runtime_otel_events:
+        for event_row in evaluator_events:
             payload = _json_from_log_message(event_row.get("message", ""))
             if not payload:
-                continue
-            if str(payload.get("name", "")) != "gen_ai.evaluation.result":
                 continue
             if _record_matches_terms(payload, event_row.get("message", ""), evaluator_terms):
                 evaluator_records.append(payload)
@@ -2074,86 +2646,185 @@ def _handle_session_insights(event: Dict[str, Any]) -> Dict[str, Any]:
                 for sid in _extract_session_ids_from_message(event_row.get("message", "")):
                     _add_evaluator_session_candidate(sid)
 
-    otel_session_id = _find_otel_session_id(xray_trace_id, lookback_hours=lookback_hours) if xray_trace_id else ""
+        # Fallback: online evaluator metrics can appear in runtime OTEL logs rather than
+        # /evaluations/results groups, so scan runtime logs for gen_ai.evaluation.result.
+        if not evaluations:
+            runtime_otel_events = _fetch_log_events(
+                RUNTIME_LOG_GROUP,
+                evaluator_terms,
+                lookback_hours=lookback_hours,
+                limit=600,
+            )
+            for event_row in runtime_otel_events:
+                payload = _json_from_log_message(event_row.get("message", ""))
+                if not payload:
+                    continue
+                if str(payload.get("name", "")) != "gen_ai.evaluation.result":
+                    continue
+                if _record_matches_terms(payload, event_row.get("message", ""), evaluator_terms):
+                    evaluator_records.append(payload)
+                    _collect_evaluations(payload, evaluations)
+                    for sid in _extract_session_ids_deep(payload):
+                        _add_evaluator_session_candidate(sid)
+                    for sid in _extract_session_ids_from_message(event_row.get("message", "")):
+                        _add_evaluator_session_candidate(sid)
 
-    # Prefer evaluator/OTEL session.id for anchor echo-back when available.
-    evaluator_session_id = ""
-    # Prefer a candidate that differs from runtime event_request_trace session_id.
-    for value in evaluator_session_candidates:
-        if value and value != runtime_session_id:
-            evaluator_session_id = value
-            break
-    if not evaluator_session_id:
+        otel_session_id = _find_otel_session_id(xray_trace_id, lookback_hours=lookback_hours) if xray_trace_id else ""
+
+        # Prefer evaluator/OTEL session.id for anchor echo-back when available.
+        evaluator_session_id = ""
+        # Prefer a candidate that differs from runtime event_request_trace session_id.
         for value in evaluator_session_candidates:
-            if value:
+            if value and value != runtime_session_id:
                 evaluator_session_id = value
                 break
+        if not evaluator_session_id:
+            for value in evaluator_session_candidates:
+                if value:
+                    evaluator_session_id = value
+                    break
 
-    xray_summary = {}
-    xray_error = ""
-    if xray_trace_id:
-        try:
-            xray_summary = _summarize_xray(xray_trace_id)
-        except Exception as exc:
-            xray_error = str(exc)
-            xray_summary = {
-                "trace_id": xray_trace_id,
-                "steps": [],
-                "totals_by_name": {},
-                "slowest_step": None,
-                "error": str(exc),
-            }
+        xray_summary = {}
+        xray_error = ""
+        if xray_trace_id:
+            try:
+                # X-Ray batch_get_traces requires the 1-XXXXXXXX-XXXXXXXXXXXXXXXXXXXXXXXX format.
+                # Fleet mode normalises IDs to compact 32-hex; denormalise before lookup.
+                xray_summary = _summarize_xray(_denormalize_trace_id(xray_trace_id))
+            except Exception as exc:
+                xray_error = str(exc)
+                xray_summary = {
+                    "trace_id": xray_trace_id,
+                    "steps": [],
+                    "totals_by_name": {},
+                    "slowest_step": None,
+                    "error": str(exc),
+                }
 
-    request = {
-        "prompt": latest_runtime.get("request_payload", {}).get("prompt", ""),
-        "answer": latest_runtime.get("response_payload", {}).get("answer", ""),
-        "latency_ms": latest_runtime.get("metrics", {}).get("latency_ms") or xray_summary.get("total_latency_ms"),
-        "tokens": {
-            "input": latest_runtime.get("metrics", {}).get("input_tokens"),
-            "output": latest_runtime.get("metrics", {}).get("output_tokens"),
-            "total": latest_runtime.get("metrics", {}).get("total_tokens"),
-        },
-        "request_id": request_id,
-        "client_request_id": client_request_id,
-        "session_id": session_id,
-        "evaluator_session_id": otel_session_id or evaluator_session_id,
-        "trace_id": xray_trace_id,
-        "tools_used": latest_runtime.get("metrics", {}).get("tools_used", []),
-        "status": latest_runtime.get("response_payload", {}).get("status", ""),
-        "error": latest_runtime.get("response_payload", {}).get("error", ""),
-    }
+        request = {
+            "prompt": latest_runtime.get("request_payload", {}).get("prompt", ""),
+            "answer": latest_runtime.get("response_payload", {}).get("answer", ""),
+            "latency_ms": latest_runtime.get("metrics", {}).get("latency_ms") or xray_summary.get("total_latency_ms"),
+            "tokens": {
+                "input": latest_runtime.get("metrics", {}).get("input_tokens"),
+                "output": latest_runtime.get("metrics", {}).get("output_tokens"),
+                "total": latest_runtime.get("metrics", {}).get("total_tokens"),
+            },
+            "request_id": request_id,
+            "client_request_id": client_request_id,
+            "session_id": session_id,
+            "evaluator_session_id": otel_session_id or evaluator_session_id,
+            "trace_id": xray_trace_id,
+            "tools_used": latest_runtime.get("metrics", {}).get("tools_used", []),
+            "status": latest_runtime.get("response_payload", {}).get("status", ""),
+            "error": latest_runtime.get("response_payload", {}).get("error", ""),
+            # ── User identity ─────────────────────────────────────────────
+            "user": {
+                "user_id":    str(latest_runtime.get("user_id", "")),
+                "user_name":  str(latest_runtime.get("user_name", "")),
+                "user_email": str(latest_runtime.get("user_email", "")),
+                "name":       str(latest_runtime.get("name", "")),
+                "department": str(latest_runtime.get("department", "")),
+                "user_role":  str(latest_runtime.get("user_role", "")),
+                "auth_type":  str(latest_runtime.get("auth_type", "")),
+            },
+            # ── Model invocation detail ───────────────────────────────────
+            "model_invocation": {
+                "model_id": str(
+                    latest_runtime.get("model_id")
+                    or latest_runtime.get("request_payload", {}).get("model_id")
+                    or ""
+                ),
+                "max_tokens": latest_runtime.get("request_payload", {}).get("max_tokens"),
+                "temperature": latest_runtime.get("request_payload", {}).get("temperature"),
+                "retrieval_evidence": latest_runtime.get("request_payload", {}).get("retrieval_evidence") or {},
+                "jwt_present": latest_runtime.get("request_payload", {}).get("jwt_present"),
+            },
+        }
 
-    merged = {
-        "request": request,
-        "evaluations": evaluations,
-        "xray": xray_summary,
-        "runtime_records_found": len(runtime_records),
-        "evaluator_records_found": len(evaluator_records),
-        "evaluator_groups_used": evaluator_groups_used,
-        "xray_error": xray_error,
-    }
+        merged = {
+            "request": request,
+            "evaluations": evaluations,
+            "xray": xray_summary,
+            "runtime_records_found": len(runtime_records),
+            "evaluator_records_found": len(evaluator_records),
+            "evaluator_groups_used": evaluator_groups_used,
+            "xray_error": xray_error,
+        }
 
-    answer = _sanitize_analysis_answer(
-        _build_diagnosis(question, merged),
-        traces_total=0,
-    )
-    return {
-        "statusCode": 200,
-        "headers": CORS_HEADERS,
-        "body": json.dumps(
-            {
-                "answer": answer,
-                "merged": merged,
-                "anchors": {
-                    "request_id": request_id,
-                    "client_request_id": client_request_id,
-                    "session_id": session_id,
-                    "evaluator_session_id": otel_session_id or evaluator_session_id,
-                    "xray_trace_id": xray_trace_id,
-                },
-            }
-        ),
-    }
+        # Emit pre-model trace
+        pre_model_elapsed = round(time.perf_counter() - trace_start, 2)
+        _emit_analyzer_trace({
+            "phase": "trace_data_collection_complete",
+            "analysis_id": trace_analysis_id,
+            "elapsed_seconds": pre_model_elapsed,
+            "runtime_records": len(runtime_records),
+            "evaluator_records": len(evaluator_records),
+        })
+        
+        # Invoke LLM to generate analysis
+        llm_start = time.perf_counter()
+        answer = _sanitize_analysis_answer(
+            _build_diagnosis(question, merged),
+            traces_total=0,
+        )
+        llm_elapsed = round(time.perf_counter() - llm_start, 2)
+        total_elapsed = round(time.perf_counter() - trace_start, 2)
+        
+        # Emit completion trace
+        _emit_analyzer_trace({
+            "phase": "trace_analysis_complete",
+            "analysis_id": trace_analysis_id,
+            "total_elapsed_seconds": total_elapsed,
+            "llm_elapsed_seconds": llm_elapsed,
+            "data_collection_seconds": pre_model_elapsed,
+        })
+        
+        return {
+            "statusCode": 200,
+            "headers": CORS_HEADERS,
+            "body": json.dumps(
+                {
+                    "answer": answer,
+                    "merged": merged,
+                    "anchors": {
+                        "request_id": request_id,
+                        "client_request_id": client_request_id,
+                        "session_id": session_id,
+                        "evaluator_session_id": otel_session_id or evaluator_session_id,
+                        "xray_trace_id": xray_trace_id,
+                    },
+                    "debug_info": {
+                        "analysis_id": trace_analysis_id,
+                        "total_elapsed_seconds": total_elapsed,
+                        "llm_generation_seconds": llm_elapsed,
+                        "data_collection_seconds": pre_model_elapsed,
+                    },
+                }
+            ),
+        }
+    except Exception as exc:
+        elapsed = round(time.perf_counter() - trace_start, 2)
+        error_msg = str(exc)
+        _emit_analyzer_trace({
+            "phase": "trace_analysis_error",
+            "analysis_id": trace_analysis_id,
+            "elapsed_seconds": elapsed,
+            "error": error_msg,
+            "error_type": type(exc).__name__,
+        })
+        return {
+            "statusCode": 500,
+            "headers": CORS_HEADERS,
+            "body": json.dumps({
+                "error": f"Single-trace analysis failed: {error_msg}",
+                "debug_info": {
+                    "analysis_id": trace_analysis_id,
+                    "elapsed_seconds": elapsed,
+                    "error_type": type(exc).__name__,
+                }
+            }),
+        }
 
 
 def handle_analysis_request(event: Dict[str, Any], context: Any = None) -> Dict[str, Any]:
@@ -2209,10 +2880,16 @@ def handle_chat_request(event: Dict[str, Any], context: Any = None) -> Dict[str,
 
     try:
         result = _signed_post(RUNTIME_URL, payload)
-        answer = result.get("answer", "") if isinstance(result, dict) else str(result)
+        answer = _extract_runtime_answer(result if isinstance(result, dict) else {})
         answer = _sanitize_user_answer(answer)
+        if not answer:
+            answer = "No answer returned."
         result_trace_id = str(result.get("xray_trace_id", "")).strip() if isinstance(result, dict) else ""
-        otel_session_id = _find_otel_session_id(result_trace_id, lookback_hours=6) if result_trace_id else ""
+        otel_session_id = _find_otel_session_id(
+            result_trace_id,
+            lookback_hours=6,
+            max_seconds=max(0.2, OTEL_LOOKUP_BUDGET_SECONDS),
+        ) if result_trace_id else ""
 
         response_body: Dict[str, Any] = {
             "answer": answer,

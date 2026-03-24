@@ -39,12 +39,12 @@ body {
   position: relative;
   z-index: 1;
   height: 100dvh;
-  width: min(1220px, 100%);
+  width: 100%;
   margin: 0 auto;
-  padding: 14px;
+  padding: 8px;
   display: grid;
   grid-template-rows: auto 1fr;
-  gap: 16px;
+  gap: 8px;
 }
 
 .glass {
@@ -55,17 +55,17 @@ body {
 }
 
 .topbar {
-  border-radius: 20px;
-  padding: 18px;
+  border-radius: 16px;
+  padding: 10px 16px;
   display: grid;
-  gap: 14px;
+  gap: 8px;
 }
 
 h1 {
   margin: 0;
   font-family: "Inter", sans-serif;
-  font-size: clamp(1.35rem, 2.8vw, 2.15rem);
-  line-height: 1.1;
+  font-size: clamp(1.1rem, 2vw, 1.55rem);
+  line-height: 1;
   letter-spacing: 0.01em;
   color: #ffffff;
   font-weight: 700;
@@ -79,9 +79,9 @@ h1 {
 }
 
 .subtitle {
-  margin: 6px 0 0;
+  margin: 2px 0 0;
   color: rgba(210, 230, 255, 0.8);
-  font-size: 0.95rem;
+  font-size: 0.8rem;
 }
 
 .mode-switch {
@@ -89,6 +89,10 @@ h1 {
   align-items: center;
   gap: 10px;
   flex-wrap: wrap;
+}
+
+.mode-switch--assistant .signout {
+  margin-left: auto;
 }
 
 .mode-btn {
@@ -282,12 +286,41 @@ h1 {
   font-size: 0.83rem;
 }
 
+.pagination-strip {
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 9px 16px;
+  background: rgb(0, 74, 143);
+}
+
+.pagination-strip p {
+  margin: 0;
+  color: #d9e8ff;
+  font-size: 0.83rem;
+}
+
+.pagination-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.pagination-actions .mode-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+  transform: none;
+}
+
 .messages {
   min-height: 0;
   overflow-y: auto;
   display: grid;
-  gap: 12px;
-  padding: 15px;
+  gap: 16px;
+  padding: 20px;
   background: rgb(0, 74, 143);
 }
 
@@ -306,7 +339,7 @@ h1 {
 }
 
 .bubble-wrap {
-  max-width: min(78ch, 100%);
+  max-width: min(90ch, 100%);
   display: grid;
   gap: 6px;
 }
@@ -407,21 +440,21 @@ h1 {
 
 .composer {
   border-top: 1px solid var(--line);
-  padding: 13px;
+  padding: 20px;
   background: rgb(0, 74, 143);
   display: grid;
-  gap: 10px;
+  gap: 12px;
 }
 
 textarea {
   width: 100%;
-  min-height: 86px;
+  min-height: 120px;
   resize: vertical;
   border: 1px solid rgba(0, 74, 143, 0.3);
   border-radius: 16px;
   background: #ffffff;
   color: #153e70;
-  padding: 13px;
+  padding: 14px 16px;
   font: inherit;
   transition: all 240ms ease;
 }
@@ -517,6 +550,248 @@ textarea:focus {
   }
 }
 
+.workspace-layout {
+  min-height: 0;
+  height: 100%;
+  display: flex;
+  gap: 16px;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.control-drawer {
+  flex: 0 0 336px;
+  width: 336px;
+  max-width: 336px;
+  min-height: 0;
+  border-radius: 22px;
+  overflow: hidden;
+  display: grid;
+  grid-template-rows: auto 1fr;
+  transition: width 220ms ease, flex-basis 220ms ease, opacity 220ms ease, transform 220ms ease;
+}
+
+.control-drawer.collapsed {
+  flex-basis: 0;
+  width: 0;
+  max-width: 0;
+  opacity: 0;
+  transform: translateX(-12px);
+  border-width: 0;
+  margin: 0;
+}
+
+.drawer-header {
+  padding: 18px 18px 14px;
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: flex-start;
+  background: linear-gradient(180deg, rgba(255,255,255,0.08), rgba(255,255,255,0.02));
+}
+
+.drawer-header h2,
+.stage-heading h2 {
+  margin: 4px 0 0;
+  font-size: 1.05rem;
+}
+
+.drawer-header p,
+.stage-heading p {
+  margin: 6px 0 0;
+  color: var(--muted);
+  font-size: 0.84rem;
+  line-height: 1.45;
+}
+
+.drawer-eyebrow {
+  margin: 0;
+  color: #d2e7ff;
+  font-size: 0.72rem;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  font-family: "IBM Plex Mono", monospace;
+}
+
+.drawer-toggle {
+  border: 1px solid rgba(173, 211, 255, 0.36);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.12);
+  color: #eef6ff;
+  padding: 8px 12px;
+  cursor: pointer;
+  font-weight: 700;
+  transition: all 220ms ease;
+}
+
+.drawer-toggle:hover {
+  transform: translateY(-1px);
+  background: rgba(255, 255, 255, 0.18);
+}
+
+.drawer-toggle--inline {
+  margin-right: 12px;
+}
+
+.drawer-scroll {
+  min-height: 0;
+  overflow-y: auto;
+  padding: 16px;
+  display: grid;
+  gap: 14px;
+}
+
+.profile-card {
+  border: 1px solid rgba(203, 228, 255, 0.18);
+  border-radius: 18px;
+  padding: 16px;
+  background: rgba(255, 255, 255, 0.08);
+  display: grid;
+  gap: 6px;
+}
+
+.profile-card strong {
+  font-size: 1rem;
+}
+
+.profile-card p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
+.profile-label {
+  color: #d2e7ff;
+  font-size: 0.72rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  font-family: "IBM Plex Mono", monospace;
+}
+
+.control-stack {
+  display: grid;
+  gap: 12px;
+}
+
+.control-field {
+  display: grid;
+  gap: 7px;
+}
+
+.control-field span {
+  color: var(--muted);
+  font-size: 0.74rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.control-field input,
+.control-field select {
+  width: 100%;
+  border: 1px solid rgba(180, 210, 255, 0.3);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.96);
+  color: #103a6d;
+  padding: 11px 12px;
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 0.82rem;
+}
+
+.chat-stage {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  border-radius: 22px;
+  overflow: hidden;
+  display: grid;
+  grid-template-rows: auto auto auto 1fr auto;
+}
+
+.stage-header {
+  padding: 12px 16px 10px;
+  border-bottom: 1px solid var(--line);
+  background: linear-gradient(180deg, rgba(255,255,255,0.06), rgba(255,255,255,0.01));
+}
+
+.stage-heading {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.stage-heading h2 {
+  margin: 0;
+  font-size: 1.05rem;
+}
+
+.chat-stage .messages {
+  background:
+    radial-gradient(circle at top right, rgba(126, 200, 245, 0.12), transparent 32%),
+    linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.03)),
+    rgb(0, 74, 143);
+}
+
+.composer--expanded {
+  padding: 16px 18px 18px;
+}
+
+.composer--expanded textarea {
+  min-height: 144px;
+  border-radius: 22px;
+  padding: 16px;
+}
+
+.composer--collapsed {
+  padding: 12px 16px;
+}
+
+.composer--collapsed textarea {
+  min-height: 40px;
+  max-height: 40px;
+  border-radius: 16px;
+  padding: 8px 12px;
+  resize: none;
+  font-size: 0.95rem;
+}
+
+@media (max-width: 900px) {
+  .mode-switch {
+    gap: 8px;
+  }
+
+  .identity-pill {
+    margin-left: 0;
+    order: 3;
+    width: 100%;
+  }
+
+  .anchor-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .workspace-layout {
+    flex-direction: column;
+  }
+
+  .control-drawer,
+  .control-drawer.collapsed {
+    width: 100%;
+    flex-basis: auto;
+    transform: none;
+  }
+
+  .control-drawer.collapsed {
+    max-height: 0;
+    opacity: 0;
+    border-width: 0;
+  }
+
+  .chat-stage {
+    min-height: 68vh;
+  }
+}
+
 @media (max-width: 640px) {
   .shell {
     width: 100%;
@@ -529,7 +804,9 @@ textarea:focus {
     padding: 14px;
   }
 
-  .chat-card {
+  .chat-card,
+  .chat-stage,
+  .control-drawer {
     border-radius: 16px;
   }
 
@@ -544,5 +821,89 @@ textarea:focus {
 
   .bubble-wrap {
     max-width: 100%;
+  }
+
+  .stage-heading {
+    flex-direction: column;
+  }
+
+  .composer--expanded textarea {
+    min-height: 124px;
+  }
+}
+
+/* Enhanced responsive and layout improvements */
+@media (min-width: 901px) {
+  .control-drawer {
+    transition: all 280ms cubic-bezier(0.4, 0, 0.2, 1);
+  }
+
+  .control-drawer.collapsed {
+    margin-left: 0;
+  }
+}
+
+/* Better spacing for large screens */
+@media (min-width: 1200px) {
+  .shell {
+    max-width: 1400px;
+  }
+}
+
+/* Tablet optimizations */
+@media (max-width: 900px) and (min-width: 641px) {
+  .workspace-layout {
+    gap: 12px;
+  }
+
+  .control-drawer {
+    flex: 0 0 280px;
+    width: 280px;
+    max-width: 280px;
+  }
+
+  .control-drawer.collapsed {
+    flex-basis: 0;
+    width: 0;
+    max-width: 0;
+  }
+}
+
+/* Mobile-specific improvements */
+@media (max-width: 640px) {
+  .stage-header h2 {
+    font-size: 1rem;
+  }
+
+  .drawer-header h2 {
+    font-size: 0.95rem;
+  }
+
+  .messages {
+    gap: 12px;
+    padding: 16px;
+  }
+
+  .composer {
+    padding: 16px;
+    gap: 10px;
+  }
+
+  textarea {
+    min-height: 100px;
+    padding: 12px 14px;
+    font-size: 16px; /* Prevents zoom on iOS */
+  }
+
+  .composer--expanded textarea {
+    min-height: 120px;
+  }
+
+  .bubble-wrap {
+    max-width: 95vw;
+  }
+
+  .char-count {
+    font-size: 0.72rem;
   }
 }

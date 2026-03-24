@@ -4,6 +4,17 @@ import { fetchAuthSession, fetchUserAttributes } from "aws-amplify/auth";
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL;
 const ANALYSIS_MAX_RETRIES = 2;
 const RETRYABLE_STATUS = new Set([429, 502, 503, 504]);
+const DEFAULT_FLEET_PAGE_SIZE = 20;
+const LOOKBACK_OPTIONS = [
+  { value: "1", label: "1 hour" },
+  { value: "6", label: "6 hours" },
+  { value: "12", label: "12 hours" },
+  ...Array.from({ length: 30 }, (_, idx) => {
+    const day = idx + 1;
+    return { value: String(day * 24), label: `${day} day${day === 1 ? "" : "s"}` };
+  }),
+  { value: "overall", label: "Overall" },
+];
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -38,6 +49,35 @@ async function postWithRetry(url, options, maxRetries = ANALYSIS_MAX_RETRIES) {
 
 function stamp() {
   return new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+function isTraceListingQuestion(question) {
+  const text = String(question || "").trim().toLowerCase();
+  if (!text) {
+    return false;
+  }
+
+  return [
+    "list trace",
+    "show trace",
+    "all trace",
+    "trace id",
+    "traceid",
+    "trace ids",
+    "traceids",
+    "list out",
+    "list all trace",
+    "list all traces",
+    "enumerate trace",
+    "print trace",
+    "which trace",
+    "what trace",
+    "get all trace",
+    "retrieve trace",
+    "find trace",
+    "search trace",
+    "each trace",
+  ].some((keyword) => text.includes(keyword));
 }
 
 function normalizeMessageText(input) {
@@ -125,9 +165,16 @@ function App({ signOut, user }) {
   const [busyChat, setBusyChat] = useState(false);
   const [busyLog, setBusyLog] = useState(false);
   const [analystMode, setAnalystMode] = useState("fleet_window");
-  const [logLookbackHours, setLogLookbackHours] = useState("5");
+  const [logLookbackHours, setLogLookbackHours] = useState("1");
+  const [fleetPage, setFleetPage] = useState(1);
+  const [lastFleetQuestion, setLastFleetQuestion] = useState("");
+  const [latestPagination, setLatestPagination] = useState(null);
+  const [autoPageProgress, setAutoPageProgress] = useState(null);
+  const [controlsOpen, setControlsOpen] = useState(true);
   const [copiedId, setCopiedId] = useState("");
   const [profile, setProfile] = useState({ name: user?.username || "User", department: "", role: "" });
+  const [textareaExpanded, setTextareaExpanded] = useState(true);
+  const [chatDrawerOpen, setChatDrawerOpen] = useState(true);
 
   const effectiveAnchors = useMemo(
     () => ({
@@ -140,7 +187,15 @@ function App({ signOut, user }) {
     [analystAnchors, autoAnchors],
   );
 
+  const selectedLookbackLabel = useMemo(() => {
+    const found = LOOKBACK_OPTIONS.find((opt) => opt.value === logLookbackHours);
+    return found?.label || `${logLookbackHours} hours`;
+  }, [logLookbackHours]);
+
   const isBusy = busyChat || busyLog;
+
+  const isFleetMode = analystMode !== "single_trace";
+  const totalFleetTraces = latestPagination?.total_traces || latestMerged?.fleet_metrics?.traces_total || 0;
 
   useEffect(() => {
     async function loadProfile() {
@@ -188,6 +243,7 @@ function App({ signOut, user }) {
 
     setPrompt("");
     setBusyChat(true);
+       setTextareaExpanded(false);
     setMessages((prev) => [
       ...prev,
       makeMessage("user", trimmed),
@@ -251,69 +307,169 @@ function App({ signOut, user }) {
       return;
     }
 
-    setLogQuestion("");
+    if (isFleetMode) {
+      setLastFleetQuestion(trimmed);
+      setFleetPage(1);
+    }
+
+    await requestLogAnalysis(trimmed, {
+      page: 1,
+      addUserMessage: true,
+      autoPaginate: isFleetMode,
+    });
+  }
+
+  async function requestLogAnalysis(questionText, options = {}) {
+    const {
+      page = 1,
+      addUserMessage = false,
+      autoPaginate = false,
+    } = options;
+
+    if (!questionText || isBusy) {
+      return;
+    }
+
     setBusyLog(true);
-    setLogMessages((prev) => [
-      ...prev,
-      makeMessage("user", trimmed),
-    ]);
+    if (addUserMessage) {
+      setLogQuestion("");
+      setLogMessages((prev) => [
+        ...prev,
+        makeMessage("user", questionText),
+      ]);
+    }
 
     try {
       const session = await fetchAuthSession();
       const jwtToken = session.tokens?.idToken?.toString() || "";
-      const response = await postWithRetry(`${API_BASE_URL}/session-insights`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: jwtToken ? `Bearer ${jwtToken}` : "",
-        },
-        body: JSON.stringify({
-          question: trimmed,
-          analysis_mode: analystMode,
-          request_id: analystMode === "single_trace" ? effectiveAnchors.request_id : "",
-          client_request_id: analystMode === "single_trace" ? effectiveAnchors.client_request_id : "",
-          session_id: analystMode === "single_trace" ? effectiveAnchors.session_id : "",
-          evaluator_session_id: analystMode === "single_trace" ? effectiveAnchors.evaluator_session_id : "",
-          xray_trace_id: analystMode === "single_trace" ? effectiveAnchors.xray_trace_id : "",
-          lookback_hours:
-            analystMode === "single_trace"
-              ? 48
-              : logLookbackHours === "overall"
-                ? "overall"
-                : Number(logLookbackHours),
-          lookback_mode:
-            analystMode === "single_trace"
-              ? "window"
-              : logLookbackHours === "overall"
-                ? "overall"
-                : "window",
-        }),
-      });
+      setAutoPageProgress(null);
 
-      const data = await response.json().catch(() => ({}));
-      const answer = response.ok
-        ? data.answer || "No analysis returned."
-        : data.error || data.message || `Request failed (${response.status})`;
+      async function fetchAnalysisPage(targetPage) {
+        const response = await postWithRetry(`${API_BASE_URL}/session-insights`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: jwtToken ? `Bearer ${jwtToken}` : "",
+          },
+          body: JSON.stringify({
+            question: questionText,
+            analysis_mode: analystMode,
+            request_id: analystMode === "single_trace" ? effectiveAnchors.request_id : "",
+            client_request_id: analystMode === "single_trace" ? effectiveAnchors.client_request_id : "",
+            session_id: analystMode === "single_trace" ? effectiveAnchors.session_id : "",
+            evaluator_session_id: analystMode === "single_trace" ? effectiveAnchors.evaluator_session_id : "",
+            xray_trace_id: analystMode === "single_trace" ? effectiveAnchors.xray_trace_id : "",
+            page: targetPage,
+            page_size: DEFAULT_FLEET_PAGE_SIZE,
+            lookback_hours:
+              analystMode === "single_trace"
+                ? 48
+                : logLookbackHours === "overall"
+                  ? "overall"
+                  : Number(logLookbackHours),
+            lookback_mode:
+              analystMode === "single_trace"
+                ? "window"
+                : logLookbackHours === "overall"
+                  ? "overall"
+                  : "window",
+          }),
+        });
 
-      setLogMessages((prev) => {
-        return [...prev, makeMessage("assistant", answer)];
-      });
+        const data = await response.json().catch(() => ({}));
+        const answer = response.ok
+          ? data.answer || "No analysis returned."
+          : data.error || data.message || `Request failed (${response.status})`;
 
-      if (response.ok && data?.anchors && analystMode === "single_trace") {
+        return { response, data, answer };
+      }
+
+      const firstResult = await fetchAnalysisPage(page);
+      const firstPagination = firstResult.data?.pagination || null;
+      const firstPrefix = isFleetMode && Number(firstPagination?.page || page) > 1 && Number(firstPagination?.total_pages || 1) > 1
+        ? `Page ${firstPagination.page} of ${firstPagination.total_pages}`
+        : "";
+
+      setLogMessages((prev) => [
+        ...prev,
+        makeMessage("assistant", firstPrefix ? `${firstPrefix}\n\n${firstResult.answer}` : firstResult.answer),
+      ]);
+
+      if (firstResult.response.ok && analystMode !== "single_trace") {
+        setFleetPage(Number(firstPagination?.page || page || 1));
+        setLatestPagination(firstPagination);
+      } else {
+        setLatestPagination(null);
+      }
+
+      if (firstResult.response.ok && firstResult.data?.anchors && analystMode === "single_trace") {
         setAnalystAnchors((prev) => ({
-          request_id: data.anchors.request_id || prev.request_id,
-          client_request_id: data.anchors.client_request_id || prev.client_request_id,
-          session_id: data.anchors.session_id || prev.session_id,
-          evaluator_session_id: data.anchors.evaluator_session_id || prev.evaluator_session_id,
-          xray_trace_id: data.anchors.xray_trace_id || prev.xray_trace_id,
+          request_id: firstResult.data.anchors.request_id || prev.request_id,
+          client_request_id: firstResult.data.anchors.client_request_id || prev.client_request_id,
+          session_id: firstResult.data.anchors.session_id || prev.session_id,
+          evaluator_session_id: firstResult.data.anchors.evaluator_session_id || prev.evaluator_session_id,
+          xray_trace_id: firstResult.data.anchors.xray_trace_id || prev.xray_trace_id,
         }));
       }
-      setLatestMerged(response.ok ? data?.merged || null : null);
+      setLatestMerged(firstResult.response.ok ? firstResult.data?.merged || null : null);
+
+      const shouldAutoLoadRemainingPages =
+        firstResult.response.ok
+        && analystMode !== "single_trace"
+        && autoPaginate
+        && Number(firstPagination?.total_pages || 1) > 1;
+
+      if (shouldAutoLoadRemainingPages) {
+        const totalPages = Number(firstPagination?.total_pages || 1);
+        let loadedPages = Number(firstPagination?.page || 1);
+        setAutoPageProgress({ loadedPages, totalPages });
+
+        for (let nextPage = loadedPages + 1; nextPage <= totalPages; nextPage += 1) {
+          const nextResult = await fetchAnalysisPage(nextPage);
+
+          if (!nextResult.response.ok) {
+            setLogMessages((prev) => [
+              ...prev,
+              makeMessage(
+                "system",
+                `Stopped auto-loading after page ${loadedPages}. Page ${nextPage} failed with: ${nextResult.answer}`,
+                "metric",
+              ),
+            ]);
+            break;
+          }
+
+          loadedPages = Number(nextResult.data?.pagination?.page || nextPage);
+          setFleetPage(loadedPages);
+          setLatestPagination(nextResult.data?.pagination || null);
+          setLatestMerged(nextResult.data?.merged || null);
+          setAutoPageProgress({ loadedPages, totalPages });
+          setLogMessages((prev) => [
+            ...prev,
+            makeMessage("assistant", `Page ${loadedPages} of ${totalPages}\n\n${nextResult.answer}`),
+          ]);
+        }
+      }
     } catch (error) {
+      setAutoPageProgress(null);
+      setLatestPagination(null);
       setLogMessages((prev) => [...prev, makeMessage("assistant", `Unable to fetch analysis. ${error?.message || ""}`.trim())]);
     } finally {
       setBusyLog(false);
     }
+  }
+
+  async function goToFleetPage(nextPage) {
+    if (!lastFleetQuestion || !isFleetMode || isBusy) {
+      return;
+    }
+    if (nextPage < 1) {
+      return;
+    }
+    if (latestPagination?.total_pages && nextPage > latestPagination.total_pages) {
+      return;
+    }
+    await requestLogAnalysis(lastFleetQuestion, { page: nextPage, addUserMessage: false, autoPaginate: false });
   }
 
   function renderMessages(items, loading) {
@@ -367,7 +523,7 @@ function App({ signOut, user }) {
           <p className="subtitle">AI operations cockpit for live chat intelligence and session diagnostics.</p>
         </div>
 
-        <nav className="mode-switch" role="tablist" aria-label="Console mode">
+        <nav className={`mode-switch ${mode === "assistant" ? "mode-switch--assistant" : "mode-switch--session"}`} role="tablist" aria-label="Console mode">
           <button
             className={`mode-btn ${mode === "assistant" ? "active" : ""}`}
             onClick={() => setMode("assistant")}
@@ -383,150 +539,298 @@ function App({ signOut, user }) {
             Analyser logs
           </button>
 
-          <div className="identity-pill">
-            <span className="avatar">{profile.name.slice(0, 1).toUpperCase()}</span>
-            <span className="online-dot" />
-            <span className="identity-text">
-              <strong>{profile.name}</strong>
-              <small>{[profile.role, profile.department].filter(Boolean).join(" | ") || "Active"}</small>
-            </span>
-          </div>
+          {mode === "session" && (
+            <div className="identity-pill">
+              <span className="avatar">{profile.name.slice(0, 1).toUpperCase()}</span>
+              <span className="online-dot" />
+              <span className="identity-text">
+                <strong>{profile.name}</strong>
+                <small>{[profile.role, profile.department].filter(Boolean).join(" | ") || "Active"}</small>
+              </span>
+            </div>
+          )}
           <button className="signout" onClick={signOut}>Sign out</button>
         </nav>
       </header>
 
       {mode === "assistant" ? (
-        <section className="chat-card glass">
-          {renderMessages(messages, busyChat)}
-
-          <form className="composer" onSubmit={sendPrompt}>
-            <textarea
-              value={prompt}
-              onChange={(e) => setPrompt(e.target.value)}
-              placeholder="Ask anything..."
-              rows={3}
-              maxLength={4000}
-              disabled={isBusy}
-            />
-            <div className="composer-row">
-              <p className="char-count">{prompt.length}/4000</p>
-              <button className="send" type="submit" disabled={isBusy} title="Send message" aria-label="Send message">
-                <span className="plane" aria-hidden="true">&#10148;</span>
+        <section className="workspace-layout workspace-layout--assistant">
+          <aside className={`control-drawer glass ${chatDrawerOpen ? "open" : "collapsed"}`}>
+            <div className="drawer-header">
+              <div>
+                <p className="drawer-eyebrow">Chat Profile</p>
+                <h2>Quick Info</h2>
+                <p>Your chat session, account details, and latest trace context.</p>
+              </div>
+              <button type="button" className="drawer-toggle" onClick={() => setChatDrawerOpen(false)}>
+                Hide
               </button>
             </div>
-          </form>
+
+            <div className="drawer-scroll">
+              <div className="profile-card">
+                <span className="profile-label">Signed in</span>
+                <strong>{profile.name}</strong>
+                <p>{[profile.role, profile.department].filter(Boolean).join(" | ") || "Chat session active"}</p>
+              </div>
+
+              <div className="control-stack">
+                <label className="control-field">
+                  <span>Session ID</span>
+                  <div className="anchor-input-wrap">
+                    <input
+                      value={chatSessionId}
+                      readOnly
+                      placeholder="Session ID"
+                    />
+                    <button
+                      type="button"
+                      className="copy-icon"
+                      onClick={() => copyToClipboard(chatSessionId, "chat-session")}
+                      title="Copy Session ID"
+                    >
+                      {copiedId === "chat-session" ? "Copied" : "Copy"}
+                    </button>
+                  </div>
+                </label>
+
+                <label className="control-field">
+                  <span>User</span>
+                  <input
+                    value={[profile.role, profile.department].filter(Boolean).join(" | ") || "Active"}
+                    readOnly
+                  />
+                </label>
+
+                {autoAnchors.xray_trace_id && (
+                  <label className="control-field">
+                    <span>Latest Trace ID</span>
+                    <div className="anchor-input-wrap">
+                      <input
+                        value={autoAnchors.xray_trace_id || ""}
+                        readOnly
+                        placeholder="No trace captured yet"
+                      />
+                      <button
+                        type="button"
+                        className="copy-icon"
+                        onClick={() => copyToClipboard(autoAnchors.xray_trace_id, "chat-xray")}
+                        title="Copy Trace ID"
+                      >
+                        {copiedId === "chat-xray" ? "Copied" : "Copy"}
+                      </button>
+                    </div>
+                  </label>
+                )}
+              </div>
+            </div>
+          </aside>
+
+          <section className="chat-stage glass chat-stage--assistant">
+            <div className="stage-header">
+              <div className="stage-heading">
+                <button type="button" className="drawer-toggle drawer-toggle--inline" onClick={() => setChatDrawerOpen((prev) => !prev)}>
+                  {chatDrawerOpen ? "−" : "+"}
+                </button>
+                <h2>Assistant Chat</h2>
+              </div>
+            </div>
+
+            {renderMessages(messages, busyChat)}
+
+            <form className={`composer ${textareaExpanded ? "composer--expanded" : "composer--collapsed"}`} onSubmit={sendPrompt}>
+              <textarea
+                value={prompt}
+                onChange={(e) => setPrompt(e.target.value)}
+                onFocus={() => setTextareaExpanded(true)}
+                onBlur={(e) => {
+                  if (!e.currentTarget.value.trim()) {
+                    setTextareaExpanded(false);
+                  }
+                }}
+                placeholder={textareaExpanded ? "Ask anything..." : "Click to ask..."}
+                maxLength={4000}
+                disabled={isBusy}
+              />
+              <div className="composer-row">
+                <p className="char-count">{prompt.length}/4000</p>
+                <button className="send" type="submit" disabled={isBusy} title="Send message" aria-label="Send message">
+                  <span className="plane" aria-hidden="true">&#10148;</span>
+                </button>
+              </div>
+            </form>
+          </section>
         </section>
       ) : (
-        <section className="chat-card glass">
-          <div className="anchors-head">
-            <h2>Session Anchors</h2>
-            <p>{analystMode !== "single_trace" ? `Fleet mode analyzes ${logLookbackHours === "overall" ? "all available traces from start to now" : `all traces in the last ${logLookbackHours} hours`} across X-Ray, runtime, and evaluator logs.` : "Trace ID is auto-captured from your last chat message. You can paste an older trace ID to query historical sessions."}</p>
-          </div>
-
-          <div className="anchor-grid">
-            <label>
-              <span>Analyzer Mode</span>
-              <select
-                value={analystMode}
-                onChange={(e) => setAnalystMode(e.target.value)}
-              >
-                <option value="fleet_window">All traces (fleet window)</option>
-                <option value="single_trace">Single trace deep-dive</option>
-              </select>
-            </label>
-            <label>
-              <span>Timeframe (hours)</span>
-              <select
-                value={logLookbackHours}
-                onChange={(e) => setLogLookbackHours(e.target.value || "5")}
-                disabled={analystMode === "single_trace"}
-              >
-                <option value="1">1 hour</option>
-                <option value="3">3 hours</option>
-                <option value="5">5 hours</option>
-                <option value="12">12 hours</option>
-                <option value="24">24 hours</option>
-                <option value="overall">Overall</option>
-              </select>
-            </label>
-          </div>
-
-          {analystMode === "single_trace" && (
-            <div className="anchor-grid anchor-grid--single">
-              <label>
-                <span>X-Ray Trace ID</span>
-                <div className="anchor-input-wrap">
-                  <input
-                    value={analystAnchors.xray_trace_id || ""}
-                    onChange={(e) =>
-                      setAnalystAnchors((prev) => ({
-                        ...prev,
-                        xray_trace_id: e.target.value.trim(),
-                      }))
-                    }
-                    placeholder={autoAnchors.xray_trace_id || "send a chat message to capture trace ID"}
-                  />
-                  <button
-                    type="button"
-                    className="copy-icon"
-                    onClick={() => copyToClipboard(effectiveAnchors.xray_trace_id, "anchor-xray")}
-                    title="Copy X-Ray Trace ID"
-                  >
-                    {copiedId === "anchor-xray" ? "Copied" : "Copy"}
-                  </button>
-                </div>
-              </label>
-            </div>
-          )}
-
-          {latestMerged && (
-            <div className="insight-strip">
-              {latestMerged?.analysis_mode === "fleet_window" || analystMode !== "single_trace" ? (
-                <>
-                  <p>
-                    Traces: <strong>{latestMerged?.fleet_metrics?.traces_total || 0}</strong>
-                  </p>
-                  <p>
-                    E2E avg: <strong>{latestMerged?.fleet_metrics?.e2e_ms?.avg || 0} ms</strong>
-                  </p>
-                  <p>
-                    Top bottleneck: <strong>{latestMerged?.bottleneck_ranking?.[0]?.component || "n/a"}</strong>
-                  </p>
-                </>
-              ) : (
-                <>
-                  <p>
-                    Runtime logs: <strong>{latestMerged.runtime_records_found || 0}</strong>
-                  </p>
-                  <p>
-                    Evaluator logs: <strong>{latestMerged.evaluator_records_found || 0}</strong>
-                  </p>
-                  <p>
-                    Slowest step: <strong>{latestMerged?.xray?.slowest_step?.name || "n/a"}</strong>
-                  </p>
-                </>
-              )}
-            </div>
-          )}
-
-          {renderMessages(logMessages, busyLog)}
-
-          <form className="composer" onSubmit={sendLogQuestion}>
-            <textarea
-              value={logQuestion}
-              onChange={(e) => setLogQuestion(e.target.value)}
-              placeholder="Ask diagnostics questions, e.g. Which step took the most time for this session?"
-              rows={3}
-              maxLength={4000}
-              disabled={isBusy}
-            />
-            <div className="composer-row">
-              <p className="char-count">{logQuestion.length}/4000</p>
-              <button className="send" type="submit" disabled={isBusy} title="Analyze session" aria-label="Analyze session">
-                <span className="plane" aria-hidden="true">&#10148;</span>
+        <section className="workspace-layout">
+          <aside className={`control-drawer glass ${controlsOpen ? "open" : "collapsed"}`}>
+            <div className="drawer-header">
+              <div>
+                <p className="drawer-eyebrow">Diagnostics controls</p>
+                <h2>Session Anchors</h2>
+                <p>{analystMode !== "single_trace" ? `Fleet mode analyzes ${logLookbackHours === "overall" ? "all available traces from start to now" : `all traces in the last ${selectedLookbackLabel}`} across X-Ray, runtime, and evaluator logs.` : "Trace ID is auto-captured from your last chat message. You can paste an older trace ID to query historical sessions."}</p>
+              </div>
+              <button type="button" className="drawer-toggle" onClick={() => setControlsOpen(false)}>
+                Hide
               </button>
             </div>
-          </form>
+
+            <div className="drawer-scroll">
+              <div className="profile-card">
+                <span className="profile-label">Signed in</span>
+                <strong>{profile.name}</strong>
+                <p>{[profile.role, profile.department].filter(Boolean).join(" | ") || "Analyst session active"}</p>
+              </div>
+
+              <div className="control-stack">
+                <label className="control-field">
+                  <span>Analyzer Mode</span>
+                  <select
+                    value={analystMode}
+                    onChange={(e) => setAnalystMode(e.target.value)}
+                  >
+                    <option value="fleet_window">All traces (fleet window)</option>
+                    <option value="single_trace">Single trace deep-dive</option>
+                  </select>
+                </label>
+
+                <label className="control-field">
+                  <span>Timeframe</span>
+                  <select
+                    value={logLookbackHours}
+                    onChange={(e) => setLogLookbackHours(e.target.value || "1")}
+                    disabled={analystMode === "single_trace"}
+                  >
+                    {LOOKBACK_OPTIONS.map((opt) => (
+                      <option key={opt.value} value={opt.value}>{opt.label}</option>
+                    ))}
+                  </select>
+                </label>
+
+                {analystMode === "single_trace" && (
+                  <label className="control-field">
+                    <span>X-Ray Trace ID</span>
+                    <div className="anchor-input-wrap">
+                      <input
+                        value={analystAnchors.xray_trace_id || ""}
+                        onChange={(e) =>
+                          setAnalystAnchors((prev) => ({
+                            ...prev,
+                            xray_trace_id: e.target.value.trim(),
+                          }))
+                        }
+                        placeholder={autoAnchors.xray_trace_id || "send a chat message to capture trace ID"}
+                      />
+                      <button
+                        type="button"
+                        className="copy-icon"
+                        onClick={() => copyToClipboard(effectiveAnchors.xray_trace_id, "anchor-xray")}
+                        title="Copy X-Ray Trace ID"
+                      >
+                        {copiedId === "anchor-xray" ? "Copied" : "Copy"}
+                      </button>
+                    </div>
+                  </label>
+                )}
+              </div>
+            </div>
+          </aside>
+
+          <section className="chat-stage glass">
+            <div className="stage-header">
+              <div className="stage-heading">
+                <button type="button" className="drawer-toggle drawer-toggle--inline" onClick={() => setControlsOpen((prev) => !prev)}>
+                  {controlsOpen ? "−" : "+"}
+                </button>
+                <h2>{isFleetMode ? "Fleet Analysis" : "Trace Deep-Dive"}</h2>
+              </div>
+            </div>
+
+            {latestMerged && (
+              <div className="insight-strip">
+                {latestMerged?.analysis_mode === "fleet_window" || analystMode !== "single_trace" ? (
+                  <>
+                    <p>
+                      Traces: <strong>{totalFleetTraces}</strong>
+                    </p>
+                    <p>
+                      E2E avg: <strong>{latestMerged?.fleet_metrics?.e2e_ms?.avg || 0} ms</strong>
+                    </p>
+                    <p>
+                      Top bottleneck: <strong>{latestMerged?.bottleneck_ranking?.[0]?.component || "n/a"}</strong>
+                    </p>
+                  </>
+                ) : (
+                  <>
+                    <p>
+                      Runtime logs: <strong>{latestMerged.runtime_records_found || 0}</strong>
+                    </p>
+                    <p>
+                      Evaluator logs: <strong>{latestMerged.evaluator_records_found || 0}</strong>
+                    </p>
+                    <p>
+                      Slowest step: <strong>{latestMerged?.xray?.slowest_step?.name || "n/a"}</strong>
+                    </p>
+                  </>
+                )}
+              </div>
+            )}
+
+            {isFleetMode && latestPagination && (
+              <div className="pagination-strip">
+                <p>
+                  {autoPageProgress?.totalPages > 1 ? (
+                    <>
+                      Loaded <strong>{autoPageProgress.loadedPages}</strong> of <strong>{autoPageProgress.totalPages}</strong> pages automatically
+                    </>
+                  ) : (
+                    <>
+                      Page <strong>{latestPagination.page}</strong> of <strong>{latestPagination.total_pages}</strong>
+                    </>
+                  )}
+                  {" "}
+                  (<strong>{latestPagination.total_traces}</strong> total traces in this window, {latestPagination.traces_on_this_page} on this page)
+                </p>
+                <div className="pagination-actions">
+                  <button
+                    type="button"
+                    className="mode-btn"
+                    onClick={() => goToFleetPage(Math.max(1, fleetPage - 1))}
+                    disabled={isBusy || latestPagination.page <= 1}
+                  >
+                    Previous
+                  </button>
+                  <button
+                    type="button"
+                    className="mode-btn"
+                    onClick={() => goToFleetPage(fleetPage + 1)}
+                    disabled={isBusy || !latestPagination.has_next_page}
+                  >
+                    Next
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {renderMessages(logMessages, busyLog)}
+
+            <form className="composer composer--expanded" onSubmit={sendLogQuestion}>
+              <textarea
+                value={logQuestion}
+                onChange={(e) => setLogQuestion(e.target.value)}
+                placeholder="Ask diagnostics questions, e.g. get the evaluator metric scores for trace 69c27b2d13ded83308a2dbbe15a019df and tell me the slowest X-Ray step"
+                rows={6}
+                maxLength={4000}
+                disabled={isBusy}
+              />
+              <div className="composer-row">
+                <p className="char-count">{logQuestion.length}/4000</p>
+                <button className="send" type="submit" disabled={isBusy} title="Analyze session" aria-label="Analyze session">
+                  <span className="plane" aria-hidden="true">&#10148;</span>
+                </button>
+              </div>
+            </form>
+          </section>
         </section>
       )}
     </main>
