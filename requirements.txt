@@ -4,3 +4,4 @@ botocore
 bedrock-agentcore
 aws-opentelemetry-distro  
 opentelemetry-sdk
+python-dotenv

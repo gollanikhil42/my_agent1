@@ -239,6 +239,12 @@ def _extract_runtime_answer(result: Dict[str, Any]) -> str:
                 elif isinstance(content, str) and content.strip():
                     return content.strip()
 
+    # Surface runtime error strings (e.g. missing env vars, early-return error paths)
+    # so the user sees a real message instead of the generic "No answer returned." fallback.
+    error_field = result.get("error")
+    if isinstance(error_field, str) and error_field.strip():
+        return f"Agent error: {error_field.strip()}"
+
     return ""
 
 
@@ -262,9 +268,15 @@ def _sanitize_user_answer(text: str) -> str:
     if json_block:
         try:
             parsed = json.loads(json_block.group(0))
-            explanation = parsed.get("explanation") if isinstance(parsed, dict) else None
-            if isinstance(explanation, str) and explanation.strip():
-                value = explanation
+            if isinstance(parsed, dict):
+                explanation = parsed.get("explanation")
+                if isinstance(explanation, str) and explanation.strip():
+                    # Extracted a clean explanation from JSON — use it.
+                    value = explanation
+                elif explanation is not None:
+                    # explanation key exists but is empty/null — fall back to the
+                    # whole raw text so the user sees something instead of nothing.
+                    pass  # value stays as the original text
         except Exception:
             pass
     value = re.sub(r"\s*\(\s*source\s*:[^)]+\)", "", value, flags=re.IGNORECASE)
@@ -2865,7 +2877,10 @@ def handle_chat_request(event: Dict[str, Any], context: Any = None) -> Dict[str,
             user_context = decoded_claims
 
     client_request_id = str(body.get("client_request_id", "")).strip() or str(uuid.uuid4())
-    client_session_id = str(body.get("session_id", "")).strip()
+    # Accept session_id from caller; generate a new one if absent so every request
+    # belongs to a traceable session. The same session_id is forwarded to the
+    # AgentCore runtime and returned to the client so it can be reused next turn.
+    client_session_id = str(body.get("session_id", "")).strip() or str(uuid.uuid4())
     payload = {
         "prompt": prompt,
         "client_request_id": client_request_id,

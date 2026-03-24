@@ -11,6 +11,12 @@ from strands import Agent
 from strands.models.bedrock import BedrockModel
 from opentelemetry import trace as otel_trace
 import os
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
+# In AgentCore containers, .env may be absent; fall back to checked-in env example values.
+load_dotenv(dotenv_path=".env.example", override=False)
 
 # Keep runtime logs clean and deterministic for downstream parsing.
 #os.environ["AGENT_OBSERVABILITY_ENABLED"] = "false"
@@ -36,7 +42,12 @@ logs_client = boto3.client("logs", region_name=REGION)
 AGENT_NAME = os.environ.get("AGENT_NAME", "")
 RUNTIME_ID = os.environ.get("AGENTCORE_RUNTIME_ID", "")
 ACCOUNT_ID = os.environ.get("AWS_ACCOUNT_ID", "")
-MODEL_ID = os.environ.get("MODEL_ID", "").strip()
+MODEL_ID = (
+    os.environ.get("MODEL_ID")
+    or os.environ.get("BEDROCK_MODEL_ID")
+    or os.environ.get("MODEL_ARN")
+    or ""
+).strip()
 AGENT_ARN = os.environ.get(
     "AGENT_ARN",
     f"arn:aws:bedrock-agentcore:{REGION}:{ACCOUNT_ID}:runtime/{RUNTIME_ID}"
@@ -51,11 +62,13 @@ LOG_GROUP = os.environ.get(
 # can read them reliably via get_log_events without per-invocation stream discovery.
 LOG_STREAM = os.environ.get("RUNTIME_LOG_STREAM", "")
 LOG_GROUP_ENC = LOG_GROUP.replace("/", "%2F")
-PRICE_BUCKET = os.environ.get("PRICE_BUCKET", "")
-PRICE_KEY = os.environ.get("PRICE_KEY", "")
+PRICE_BUCKET = os.environ.get("PRICE_BUCKET", "").strip()
+PRICE_KEY = os.environ.get("PRICE_KEY", "").strip()
 
 REQUIRED_ENV_VARS = [
     "MODEL_ID",
+    "PRICE_BUCKET",
+    "PRICE_KEY",
 ]
 
 
@@ -150,7 +163,7 @@ SYSTEM_PROMPT = """You are a strict calculator agent.
 
 Your job is to:
 1. Extract machine names (uppercase) and quantities.
-2. Use the provided price list. MRI = 30000 and CT = 50000
+2. Use the latest provided runtime price list exactly as the source of truth.
 3. Decide the correct operation.
 4. Perform the full calculation.
 5. Generate the explanation in one consistent structured format.
@@ -186,6 +199,21 @@ def get_system_prompt() -> str:
     return SYSTEM_PROMPT
 
 
+def _normalize_catalog(catalog: dict) -> dict:
+    normalized = {}
+    if not isinstance(catalog, dict):
+        return normalized
+    for raw_key, raw_value in catalog.items():
+        key = str(raw_key).strip().upper()
+        if not key:
+            continue
+        try:
+            normalized[key] = int(float(raw_value))
+        except Exception:
+            continue
+    return normalized
+
+
 def get_price_catalog() -> dict:
     """
     Read pricing data from S3 so the runtime can follow the latest catalog
@@ -196,12 +224,92 @@ def get_price_catalog() -> dict:
     try:
         result = s3_client.get_object(Bucket=PRICE_BUCKET, Key=PRICE_KEY)
         raw = result["Body"].read().decode("utf-8")
-        catalog = json.loads(raw)
-        if isinstance(catalog, dict):
-            return catalog
+        normalized = _normalize_catalog(json.loads(raw))
+        if normalized:
+            return normalized
     except Exception as e:
         print(f"WARNING: Could not read pricing catalog from S3: {e}", flush=True)
+
     return {}
+
+
+def _extract_requested_items(prompt: str, catalog: dict):
+    text = str(prompt or "").upper()
+    if not text:
+        return [], []
+
+    keys = set(_normalize_catalog(catalog).keys())
+    found_qty = {}
+    unknown = []
+    ignore_words = {
+        "AND", "FOR", "THE", "OF", "PRICE", "PRICES", "MACHINE", "MACHINES",
+        "GIVE", "ME", "PLEASE", "TOTAL",
+    }
+
+    for qty_text, machine_text in re.findall(r"(\d+)\s*([A-Z][A-Z0-9_-]*)", text):
+        machine = machine_text.strip().upper()
+        qty = int(qty_text)
+        if qty <= 0:
+            continue
+        if machine in keys:
+            found_qty[machine] = found_qty.get(machine, 0) + qty
+        elif machine not in ignore_words:
+            unknown.append(machine)
+
+    for machine_text, qty_text in re.findall(r"([A-Z][A-Z0-9_-]*)\s*(\d+)", text):
+        machine = machine_text.strip().upper()
+        qty = int(qty_text)
+        if qty <= 0:
+            continue
+        if machine in keys:
+            found_qty[machine] = found_qty.get(machine, 0) + qty
+        elif machine not in ignore_words:
+            unknown.append(machine)
+
+    if not found_qty:
+        for machine in keys:
+            if re.search(rf"\b{re.escape(machine)}\b", text):
+                found_qty[machine] = found_qty.get(machine, 0) + 1
+
+    items = [{"machine": machine, "quantity": qty} for machine, qty in sorted(found_qty.items()) if qty > 0]
+    unknown_unique = sorted(set(unknown))
+    return items, unknown_unique
+
+
+def _build_direct_price_answer(prompt: str, catalog: dict):
+    normalized_catalog = _normalize_catalog(catalog)
+    if not normalized_catalog:
+        return None
+
+    items, unknown = _extract_requested_items(prompt, normalized_catalog)
+    if not items:
+        return None
+
+    lines = []
+    grand_total = 0
+    for item in items:
+        machine = item["machine"]
+        qty = int(item["quantity"])
+        unit_price = int(normalized_catalog[machine])
+        line_total = qty * unit_price
+        grand_total += line_total
+        lines.append(f"{machine}: {qty} x {unit_price} = {line_total}")
+
+    explanation = (
+        f"Total price is {grand_total}.\n"
+        + "\n".join(lines)
+        + f"\nCombined total = {grand_total}"
+    )
+
+    if unknown:
+        explanation += (
+            "\nUnavailable machines requested: "
+            + ", ".join(unknown)
+            + "\nAvailable machines: "
+            + ", ".join(sorted(normalized_catalog.keys()))
+        )
+
+    return json.dumps({"explanation": explanation}, ensure_ascii=True)
 
 
 def _build_retrieval_evidence(prompt: str, catalog: dict) -> dict:
@@ -209,7 +317,7 @@ def _build_retrieval_evidence(prompt: str, catalog: dict) -> dict:
         return {}
 
     text = str(prompt).upper()
-    keys = {str(k).upper(): int(v) for k, v in catalog.items() if isinstance(v, (int, float, str))}
+    keys = _normalize_catalog(catalog)
     matched = []
     seen = set()
     for qty_text, machine_text in re.findall(r"(\d+)\s*([A-Z]+)", text):
@@ -287,8 +395,12 @@ def handler(payload, context):
     start_time    = time.time()
     request_id    = str(uuid.uuid4())
     client_request_id = str(payload.get("client_request_id", "")).strip()
-    context_session_id = getattr(context, "session_id", None)
-    session_id    = context_session_id or str(payload.get("session_id", "")).strip() or None
+    # Prefer the session_id the client sent (stable across all prompts in a conversation).
+    # Only fall back to the AgentCore context session if the client didn't provide one,
+    # and generate a fresh UUID as a last resort so session_id is NEVER empty in logs.
+    client_session_id  = str(payload.get("session_id", "")).strip()
+    context_session_id = getattr(context, "session_id", None) or ""
+    session_id = client_session_id or context_session_id or str(uuid.uuid4())
     tools_used    = []
     error_msg     = ""
     answer        = ""
@@ -367,27 +479,34 @@ def handler(payload, context):
     try:
         price_catalog = get_price_catalog()
         retrieval_evidence = _build_retrieval_evidence(prompt, price_catalog)
+        direct_answer = _build_direct_price_answer(prompt, price_catalog)
 
-        model = BedrockModel(**model_kwargs)
+        if direct_answer:
+            answer = _sanitize_answer_text(direct_answer)
+            status = "success"
+        else:
+            model = BedrockModel(**model_kwargs)
 
-        agent = Agent(
-            model=model,
-            system_prompt=build_runtime_system_prompt(retrieval_evidence=retrieval_evidence),
-        )
+            agent = Agent(
+                model=model,
+                system_prompt=build_runtime_system_prompt(retrieval_evidence=retrieval_evidence),
+            )
 
-        result = agent(prompt)
-        answer = _sanitize_answer_text(str(result))
+            result = agent(prompt)
+            answer = _sanitize_answer_text(str(result))
+            if not answer:
+                answer = "The agent did not return a response. Check that the model ID is valid and that pricing data is available."
 
-        try:
-            tools_used = list(result.metrics.tool_metrics.keys())
-        except Exception:
-            tools_used = []
+            try:
+                tools_used = list(result.metrics.tool_metrics.keys())
+            except Exception:
+                tools_used = []
 
-        try:
-            input_tokens  = result.metrics.accumulated_usage.get("inputTokens", 0)
-            output_tokens = result.metrics.accumulated_usage.get("outputTokens", 0)
-        except Exception:
-            pass
+            try:
+                input_tokens  = result.metrics.accumulated_usage.get("inputTokens", 0)
+                output_tokens = result.metrics.accumulated_usage.get("outputTokens", 0)
+            except Exception:
+                pass
 
     except Exception as e:
         answer    = f"Agent error: {str(e)}"
@@ -407,6 +526,11 @@ def handler(payload, context):
                 f"https://console.aws.amazon.com/cloudwatch/home?region={REGION}"
                 f"#xray:traces/{xray_trace_id}"
             )
+            # Stamp the current OTEL span with the stable session ID so all
+            # OTEL records for this conversation share the same session.id attribute.
+            current_span = otel_trace.get_current_span()
+            current_span.set_attribute("session.id", session_id)
+            current_span.set_attribute("session_id", session_id)
             print(xray_trace_id)
         except Exception:
             xray_trace_id = "unavailable"
