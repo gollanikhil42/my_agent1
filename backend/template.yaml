@@ -80,6 +80,36 @@ Parameters:
   FleetXrayMaxTraces:
     Type: String
     Default: "600"
+  FleetFastRuntimeLimit:
+    Type: String
+    Default: "300"
+  FleetFastEvaluatorMaxGroups:
+    Type: String
+    Default: "2"
+  FleetFastEvaluatorPerGroupLimit:
+    Type: String
+    Default: "60"
+  FleetFastEvaluatorBudgetSeconds:
+    Type: String
+    Default: "2.0"
+  FleetFastRuntimeBudgetSeconds:
+    Type: String
+    Default: "3.0"
+  FleetFastRuntimeMaxCandidateStreams:
+    Type: String
+    Default: "1200"
+  FleetFastXrayMaxTraces:
+    Type: String
+    Default: "40"
+  FleetFastXrayBudgetSeconds:
+    Type: String
+    Default: "1.5"
+  FleetFastXrayMaxSegments:
+    Type: String
+    Default: "1"
+  FleetFastXrayMaxPagesPerSegment:
+    Type: String
+    Default: "1"
   CognitoIssuer:
     Type: String
     Default: https://cognito-idp.us-east-1.amazonaws.com/us-east-1_l6dPnsMxY
@@ -161,6 +191,16 @@ Resources:
           FLEET_EVALUATOR_MAX_GROUPS: !Ref FleetEvaluatorMaxGroups
           FLEET_EVALUATOR_PER_GROUP_LIMIT: !Ref FleetEvaluatorPerGroupLimit
           FLEET_XRAY_MAX_TRACES: !Ref FleetXrayMaxTraces
+          FLEET_FAST_RUNTIME_LIMIT: !Ref FleetFastRuntimeLimit
+          FLEET_FAST_RUNTIME_BUDGET_SECONDS: !Ref FleetFastRuntimeBudgetSeconds
+          FLEET_FAST_RUNTIME_MAX_CANDIDATE_STREAMS: !Ref FleetFastRuntimeMaxCandidateStreams
+          FLEET_FAST_EVALUATOR_MAX_GROUPS: !Ref FleetFastEvaluatorMaxGroups
+          FLEET_FAST_EVALUATOR_PER_GROUP_LIMIT: !Ref FleetFastEvaluatorPerGroupLimit
+          FLEET_FAST_EVALUATOR_BUDGET_SECONDS: !Ref FleetFastEvaluatorBudgetSeconds
+          FLEET_FAST_XRAY_MAX_TRACES: !Ref FleetFastXrayMaxTraces
+          FLEET_FAST_XRAY_BUDGET_SECONDS: !Ref FleetFastXrayBudgetSeconds
+          FLEET_FAST_XRAY_MAX_SEGMENTS: !Ref FleetFastXrayMaxSegments
+          FLEET_FAST_XRAY_MAX_PAGES_PER_SEGMENT: !Ref FleetFastXrayMaxPagesPerSegment
       Events:
         ChatPost:
           Type: HttpApi
@@ -218,6 +258,16 @@ Resources:
           FLEET_EVALUATOR_MAX_GROUPS: !Ref FleetEvaluatorMaxGroups
           FLEET_EVALUATOR_PER_GROUP_LIMIT: !Ref FleetEvaluatorPerGroupLimit
           FLEET_XRAY_MAX_TRACES: !Ref FleetXrayMaxTraces
+          FLEET_FAST_RUNTIME_LIMIT: !Ref FleetFastRuntimeLimit
+          FLEET_FAST_RUNTIME_BUDGET_SECONDS: !Ref FleetFastRuntimeBudgetSeconds
+          FLEET_FAST_RUNTIME_MAX_CANDIDATE_STREAMS: !Ref FleetFastRuntimeMaxCandidateStreams
+          FLEET_FAST_EVALUATOR_MAX_GROUPS: !Ref FleetFastEvaluatorMaxGroups
+          FLEET_FAST_EVALUATOR_PER_GROUP_LIMIT: !Ref FleetFastEvaluatorPerGroupLimit
+          FLEET_FAST_EVALUATOR_BUDGET_SECONDS: !Ref FleetFastEvaluatorBudgetSeconds
+          FLEET_FAST_XRAY_MAX_TRACES: !Ref FleetFastXrayMaxTraces
+          FLEET_FAST_XRAY_BUDGET_SECONDS: !Ref FleetFastXrayBudgetSeconds
+          FLEET_FAST_XRAY_MAX_SEGMENTS: !Ref FleetFastXrayMaxSegments
+          FLEET_FAST_XRAY_MAX_PAGES_PER_SEGMENT: !Ref FleetFastXrayMaxPagesPerSegment
       Events:
         SessionInsightsPost:
           Type: HttpApi

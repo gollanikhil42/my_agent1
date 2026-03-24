@@ -54,6 +54,16 @@ FLEET_RUNTIME_LIMIT = int(os.environ.get("FLEET_RUNTIME_LIMIT", "1800"))
 FLEET_EVALUATOR_MAX_GROUPS = int(os.environ.get("FLEET_EVALUATOR_MAX_GROUPS", "10"))
 FLEET_EVALUATOR_PER_GROUP_LIMIT = int(os.environ.get("FLEET_EVALUATOR_PER_GROUP_LIMIT", "300"))
 FLEET_XRAY_MAX_TRACES = int(os.environ.get("FLEET_XRAY_MAX_TRACES", "600"))
+FLEET_FAST_XRAY_MAX_TRACES = int(os.environ.get("FLEET_FAST_XRAY_MAX_TRACES", "40"))
+FLEET_FAST_XRAY_BUDGET_SECONDS = float(os.environ.get("FLEET_FAST_XRAY_BUDGET_SECONDS", "1.5"))
+FLEET_FAST_RUNTIME_LIMIT = int(os.environ.get("FLEET_FAST_RUNTIME_LIMIT", "300"))
+FLEET_FAST_EVALUATOR_MAX_GROUPS = int(os.environ.get("FLEET_FAST_EVALUATOR_MAX_GROUPS", "2"))
+FLEET_FAST_EVALUATOR_PER_GROUP_LIMIT = int(os.environ.get("FLEET_FAST_EVALUATOR_PER_GROUP_LIMIT", "60"))
+FLEET_FAST_EVALUATOR_BUDGET_SECONDS = float(os.environ.get("FLEET_FAST_EVALUATOR_BUDGET_SECONDS", "2.0"))
+FLEET_FAST_RUNTIME_BUDGET_SECONDS = float(os.environ.get("FLEET_FAST_RUNTIME_BUDGET_SECONDS", "3.0"))
+FLEET_FAST_RUNTIME_MAX_CANDIDATE_STREAMS = int(os.environ.get("FLEET_FAST_RUNTIME_MAX_CANDIDATE_STREAMS", "1200"))
+FLEET_FAST_XRAY_MAX_SEGMENTS = int(os.environ.get("FLEET_FAST_XRAY_MAX_SEGMENTS", "1"))
+FLEET_FAST_XRAY_MAX_PAGES_PER_SEGMENT = int(os.environ.get("FLEET_FAST_XRAY_MAX_PAGES_PER_SEGMENT", "1"))
 DELAY_THRESHOLD_MS = float(os.environ.get("DELAY_THRESHOLD_MS", "6000"))
 OVERALL_LOOKBACK_HOURS = int(os.environ.get("OVERALL_LOOKBACK_HOURS", "87600"))
 MAX_ANALYSIS_LOOKBACK_HOURS = int(os.environ.get("MAX_ANALYSIS_LOOKBACK_HOURS", "2160"))
@@ -502,7 +512,13 @@ def _fetch_log_events(log_group: str, terms: Dict[str, str], lookback_hours: int
     return _fetch_recent_stream_events(log_group, start_time_ms, limit)
 
 
-def _fetch_recent_stream_events(log_group: str, start_time_ms: int, limit: int) -> list:
+def _fetch_recent_stream_events(
+    log_group: str,
+    start_time_ms: int,
+    limit: int,
+    max_seconds: float = 0.0,
+    max_candidate_streams_override: int = 0,
+) -> list:
     """Scan log streams covering the lookback window.
 
     AgentCore runtime streams use the format YYYY/MM/DD/[runtime-logs]<uuid> (one per
@@ -515,25 +531,38 @@ def _fetch_recent_stream_events(log_group: str, start_time_ms: int, limit: int) 
     lookback_days = max(1, int((now_s - start_time_s) / 86400) + 1)
 
     # Build date prefixes that cover the lookback window (UTC dates).
+    # AgentCore stream names have appeared with minor prefix variants over time.
     date_prefixes = []
     for days_back in range(lookback_days + 1):
         t = time.gmtime(now_s - days_back * 86400)
-        date_prefixes.append(f"{t.tm_year:04d}/{t.tm_mon:02d}/{t.tm_mday:02d}/[runtime-logs]")
+        day_prefix = f"{t.tm_year:04d}/{t.tm_mon:02d}/{t.tm_mday:02d}/"
+        date_prefixes.extend(
+            [
+                f"{day_prefix}[runtime-logs]",
+                f"{day_prefix}[runtime_logs]",
+                f"{day_prefix}runtime-logs",
+            ]
+        )
 
     candidate_streams: list = []
     seen: set = set()
     max_candidate_streams = min(max(limit * 3, 500), 4000)
+    if max_candidate_streams_override > 0:
+        max_candidate_streams = min(max_candidate_streams, max(100, int(max_candidate_streams_override)))
+    started = time.perf_counter()
     for prefix in date_prefixes:
+        if max_seconds > 0 and (time.perf_counter() - started) >= max_seconds:
+            break
         prefix_seen = 0
         next_token = None
         pages = 0
         while pages < max(1, RUNTIME_STREAM_PAGES_PER_PREFIX):
+            if max_seconds > 0 and (time.perf_counter() - started) >= max_seconds:
+                break
             try:
                 kwargs: Dict[str, Any] = {
                     "logGroupName": log_group,
                     "logStreamNamePrefix": prefix,
-                    "orderBy": "LastEventTime",
-                    "descending": True,
                     "limit": 50,
                 }
                 if next_token:
@@ -568,6 +597,8 @@ def _fetch_recent_stream_events(log_group: str, start_time_ms: int, limit: int) 
             next_token = None
             pages = 0
             while pages < max(1, RUNTIME_STREAM_PAGES_PER_PREFIX):
+                if max_seconds > 0 and (time.perf_counter() - started) >= max_seconds:
+                    break
                 kwargs: Dict[str, Any] = {
                     "logGroupName": log_group,
                     "orderBy": "LastEventTime",
@@ -591,6 +622,8 @@ def _fetch_recent_stream_events(log_group: str, start_time_ms: int, limit: int) 
 
     collected: list = []
     for stream in candidate_streams:
+        if max_seconds > 0 and (time.perf_counter() - started) >= max_seconds:
+            break
         stream_name = stream.get("logStreamName")
         if not stream_name:
             continue
@@ -952,17 +985,37 @@ def _extract_trace_id_from_payload(payload: Dict[str, Any], message: str = "") -
     return trace_match.group(0) if trace_match else ""
 
 
-def _fetch_runtime_records_window(lookback_hours: int, limit: int = 1500) -> List[Dict[str, Any]]:
+def _is_runtime_trace_payload(payload: Dict[str, Any]) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    if str(payload.get("event", "")).strip().lower() == "agent_request_trace":
+        return True
+
+    # Backward compatibility for older runtime formats that did not set event.
+    has_trace_anchor = bool(str(payload.get("xray_trace_id", "")).strip())
+    has_request_anchor = bool(str(payload.get("request_id", "")).strip())
+    has_latency = _to_float(payload.get("latency_ms")) > 0 or _to_float((payload.get("metrics") or {}).get("latency_ms")) > 0
+    has_payload_blocks = isinstance(payload.get("request_payload"), dict) or isinstance(payload.get("response_payload"), dict)
+    return (has_trace_anchor and (has_request_anchor or has_latency or has_payload_blocks))
+
+
+def _fetch_runtime_records_window(
+    lookback_hours: int,
+    limit: int = 1500,
+    max_seconds: float = 0.0,
+    max_candidate_streams: int = 0,
+) -> List[Dict[str, Any]]:
     if not RUNTIME_LOG_GROUP:
         return []
 
     start_ms = int((time.time() - lookback_hours * 3600) * 1000)
     records: List[Dict[str, Any]] = []
     seen_runtime_keys = set()
+    started = time.perf_counter()
 
     def _append_runtime_event(row: Dict[str, Any]) -> None:
         payload = _json_from_log_message(row.get("message", ""))
-        if not payload or payload.get("event") != "agent_request_trace":
+        if not payload or not _is_runtime_trace_payload(payload):
             return
         ts = int(row.get("timestamp", 0) or 0)
         request_id = str(payload.get("request_id", "")).strip()
@@ -980,6 +1033,8 @@ def _fetch_runtime_records_window(lookback_hours: int, limit: int = 1500) -> Lis
             next_token = None
             pages = 0
             while pages < 25 and len(records) < limit:
+                if max_seconds > 0 and (time.perf_counter() - started) >= max_seconds:
+                    break
                 kwargs: Dict[str, Any] = {
                     "logGroupName": RUNTIME_LOG_GROUP,
                     "logStreamName": RUNTIME_LOG_STREAM,
@@ -1003,7 +1058,16 @@ def _fetch_runtime_records_window(lookback_hours: int, limit: int = 1500) -> Lis
     # Always backfill from per-invocation streams so "overall" can include historical traces
     # that predate fixed-stream writes.
     stream_scan_limit = min(max(limit * max(2, RUNTIME_LOG_SCAN_MULTIPLIER), 2500), 20000)
-    for row in _fetch_recent_stream_events(RUNTIME_LOG_GROUP, start_ms, limit=stream_scan_limit):
+    stream_budget_seconds = 0.0
+    if max_seconds > 0:
+        stream_budget_seconds = max(0.0, max_seconds - (time.perf_counter() - started))
+    for row in _fetch_recent_stream_events(
+        RUNTIME_LOG_GROUP,
+        start_ms,
+        limit=stream_scan_limit,
+        max_seconds=stream_budget_seconds,
+        max_candidate_streams_override=max_candidate_streams,
+    ):
         _append_runtime_event(row)
 
     records.sort(key=lambda item: item.get("_cloudwatch_timestamp", 0), reverse=True)
@@ -1014,12 +1078,16 @@ def _fetch_evaluator_records_window(
     lookback_hours: int,
     max_groups: int = 10,
     per_group_limit: int = 300,
+    max_seconds: float = 0.0,
 ) -> Dict[str, Any]:
     groups_used: List[str] = []
     records: List[Dict[str, Any]] = []
+    started = time.perf_counter()
 
     groups = _resolve_evaluator_log_groups()[:max_groups]
     for group in groups:
+        if max_seconds > 0 and (time.perf_counter() - started) >= max_seconds:
+            break
         groups_used.append(group)
         events = _fetch_log_events(group, {}, lookback_hours=lookback_hours, limit=per_group_limit)
         for row in events:
@@ -1038,7 +1106,13 @@ def _fetch_evaluator_records_window(
     return {"records": records, "groups_used": groups_used}
 
 
-def _fetch_xray_trace_summaries_window(lookback_hours: int, max_traces: int = 500) -> Dict[str, Dict[str, Any]]:
+def _fetch_xray_trace_summaries_window(
+    lookback_hours: int,
+    max_traces: int = 500,
+    max_seconds: float = 0.0,
+    max_segments_limit: int = 0,
+    max_pages_per_segment: int = 10,
+) -> Dict[str, Dict[str, Any]]:
     out: Dict[str, Dict[str, Any]] = {}
     # X-Ray only retains data for 30 days; cap the window so we never make empty API calls beyond that.
     effective_lookback = min(lookback_hours, max(1, XRAY_MAX_LOOKBACK_HOURS))
@@ -1049,16 +1123,24 @@ def _fetch_xray_trace_summaries_window(lookback_hours: int, max_traces: int = 50
     configured_chunk_hours = max(1, min(24, XRAY_QUERY_CHUNK_HOURS))
     max_segment_seconds = configured_chunk_hours * 3600
     minimum_segment_seconds = 6 * 3600
-    max_segments = max(1, int((lookback_hours * 3600 + minimum_segment_seconds - 1) // minimum_segment_seconds) + 2)
+    max_segments = max(1, int((effective_lookback * 3600 + minimum_segment_seconds - 1) // minimum_segment_seconds) + 2)
+    if max_segments_limit > 0:
+        max_segments = min(max_segments, max(1, int(max_segments_limit)))
     segment_count = 0
+    started = time.perf_counter()
 
     while len(out) < max_traces and cursor_end > window_start and segment_count < max_segments:
+        if max_seconds > 0 and (time.perf_counter() - started) >= max_seconds:
+            break
         cursor_start_ts = max(window_start.timestamp(), cursor_end.timestamp() - max_segment_seconds)
         cursor_start = datetime.fromtimestamp(cursor_start_ts, tz=timezone.utc)
 
         next_token = None
         pages = 0
-        while len(out) < max_traces and pages < 10:
+        page_limit = max(1, int(max_pages_per_segment))
+        while len(out) < max_traces and pages < page_limit:
+            if max_seconds > 0 and (time.perf_counter() - started) >= max_seconds:
+                break
             kwargs: Dict[str, Any] = {
                 "StartTime": cursor_start,
                 "EndTime": cursor_end,
@@ -1168,12 +1250,27 @@ def _short_trace(trace_id: str) -> str:
     return compact[:8] + "..." if len(compact) > 8 else compact
 
 
+def _is_large_fleet_window(window_minutes: int, traces_total: int) -> bool:
+    return window_minutes > 24 * 60 or traces_total >= 100
+
+
+def _has_recorded_user(user: Dict[str, Any]) -> bool:
+    if not isinstance(user, dict):
+        return False
+    for key in ("user_id", "user_name", "department", "user_role"):
+        value = str(user.get(key, "")).strip().lower()
+        if value and value not in {"unknown", "anonymous", "n/a"}:
+            return True
+    return False
+
+
 def _build_fleet_digest(question: str, merged: Dict[str, Any]) -> str:
     window = merged.get("window", {})
     metrics = merged.get("fleet_metrics", {})
     bottlenecks = merged.get("bottleneck_ranking", [])
     delayed = merged.get("delayed_traces", [])
     threshold = _to_float(merged.get("delay_threshold_ms"))
+    user_meta = merged.get("user_metadata_summary", {})
     traces_total = int(metrics.get("traces_total", 0) or 0)
     complete_total = int(metrics.get("traces_complete_3stage", 0) or 0)
     e2e = metrics.get("e2e_ms", {})
@@ -1202,11 +1299,17 @@ def _build_fleet_digest(question: str, merged: Dict[str, Any]) -> str:
     lines.append(
         f"- Delayed traces (>{round(threshold, 0):.0f} ms): {delayed_count}"
     )
+    if delayed_count:
+        lines.append(
+            f"- Delayed traces with recorded user metadata: {int(user_meta.get('delayed_with_user_metadata', 0) or 0)}/{delayed_count}"
+        )
 
     if delayed:
         samples = []
         for row in delayed[:3]:
-            samples.append(f"{_short_trace(str(row.get('trace_id', '')))} ({round(_to_float(row.get('e2e_ms')), 0):.0f} ms)")
+            user_name = str((row.get("user") or {}).get("user_name", "")).strip()
+            suffix = f", user {user_name}" if user_name and user_name.lower() not in {"unknown", "anonymous"} else ""
+            samples.append(f"{_short_trace(str(row.get('trace_id', '')))} ({round(_to_float(row.get('e2e_ms')), 0):.0f} ms{suffix})")
         lines.append(f"- Delayed examples: {', '.join(samples)}")
 
     lines.append("- What this means: System is healthy if error/timeout rates are low, but response speed is mostly limited by runtime latency.")
@@ -1263,7 +1366,10 @@ def _build_fleet_summary_with_llm(question: str, merged: Dict[str, Any]) -> str:
     
     window_minutes = int(merged.get("window", {}).get("duration_minutes", 0) or 0)
     traces_total = int(merged.get("fleet_metrics", {}).get("traces_total", 0) or 0)
-    context_json = json.dumps(merged, indent=2, default=str)
+    llm_context = _compact_fleet_merged(merged)
+    llm_context["delayed_traces"] = (merged.get("delayed_traces") or [])[:15]
+    llm_context["top_anomalies"] = (merged.get("top_anomalies") or [])[:15]
+    context_json = json.dumps(llm_context, indent=2, default=str)
     user_question = question.strip() if question and question.strip() else "Give me a short summary of the fleet window."
 
     system_prompt = (
@@ -1306,7 +1412,7 @@ def _build_fleet_summary_with_llm(question: str, merged: Dict[str, Any]) -> str:
             modelId=DIAGNOSIS_MODEL_ID,
             system=[{"text": system_prompt}],
             messages=[{"role": "user", "content": [{"text": user_content}]}],
-            inferenceConfig={"maxTokens": 640, "temperature": 0.1},
+            inferenceConfig={"maxTokens": 320, "temperature": 0.1},
         )
         answer = response["output"]["message"]["content"][0]["text"]
         return answer
@@ -1376,16 +1482,94 @@ def _compute_response_relevance(trace_diagnostics: List[Dict[str, Any]]) -> floa
     return None
 
 
-def _handle_fleet_insights(question: str, lookback_hours: int) -> Dict[str, Any]:
-    runtime_records = _fetch_runtime_records_window(lookback_hours=lookback_hours, limit=max(200, FLEET_RUNTIME_LIMIT))
+def _compute_response_relevance_from_traces(all_traces: List[Dict[str, Any]]) -> float:
+    relevance_scores = []
+    for trace in all_traces:
+        eval_scores = trace.get("evaluator_metrics", {})
+        if isinstance(eval_scores, dict):
+            for metric_name, metric_data in eval_scores.items():
+                if "relevance" in str(metric_name).lower():
+                    score = (metric_data or {}).get("score")
+                    if score is not None:
+                        relevance_scores.append(_to_float(score))
+    if relevance_scores:
+        avg = sum(relevance_scores) / len(relevance_scores)
+        return round(min(1.0, max(0.0, avg)), 3)
+    return None
+
+
+def _compact_fleet_merged(merged: Dict[str, Any]) -> Dict[str, Any]:
+    delayed = merged.get("delayed_traces", [])
+    return {
+        "analysis_mode": merged.get("analysis_mode"),
+        "window": merged.get("window", {}),
+        "quality_indicators": merged.get("quality_indicators", {}),
+        "sources": merged.get("sources", {}),
+        "fleet_metrics": merged.get("fleet_metrics", {}),
+        "bottleneck_ranking": merged.get("bottleneck_ranking", []),
+        "delay_threshold_ms": merged.get("delay_threshold_ms", 0),
+        "delayed_traces_count": merged.get("delayed_traces_count", len(delayed)),
+        "user_metadata_summary": merged.get("user_metadata_summary", {}),
+        "top_anomalies": merged.get("top_anomalies", [])[:10],
+        "delayed_traces": delayed[:10],
+        "trace_samples": merged.get("trace_samples", [])[:5],
+        "evaluator_groups_used": merged.get("evaluator_groups_used", [])[:10],
+    }
+
+
+def _handle_fleet_insights(question: str, lookback_hours: int, lookback_mode: str = "") -> Dict[str, Any]:
+    window_minutes = int(lookback_hours * 60)
+    wants_deep_dive = _is_deep_dive_question(question)
+    # Disable fast-mode for 'overall' analytical queries; they require completeness over speed.
+    is_analytical_overall = lookback_mode == "overall"
+    fast_mode = (window_minutes > 24 * 60) and (not wants_deep_dive) and (not is_analytical_overall)
+
+    runtime_limit = max(200, FLEET_RUNTIME_LIMIT)
+    # ALWAYS apply time budgets; normal mode is generous, fast-mode is aggressive.
+    runtime_budget_seconds = 15.0  # Default: 15 seconds for normal queries
+    runtime_max_candidate_streams = 3000  # Default: scan more streams in normal mode
+    evaluator_max_groups = max(1, FLEET_EVALUATOR_MAX_GROUPS)
+    evaluator_per_group_limit = max(50, FLEET_EVALUATOR_PER_GROUP_LIMIT)
+    evaluator_budget_seconds = 8.0  # Default: 8 seconds for normal evaluator queries
+    xray_max_traces = max(100, FLEET_XRAY_MAX_TRACES)
+    xray_budget_seconds = 8.0  # Default: 8 seconds for normal X-Ray queries
+    xray_max_segments = 10  # Default: scan more segments in normal mode
+    xray_pages_per_segment = 10  # Default: scan more pages per segment in normal mode
+    
+    if fast_mode:
+        # Fast-mode applies strict time limits and candidate caps
+        runtime_limit = max(200, min(runtime_limit, FLEET_FAST_RUNTIME_LIMIT))
+        runtime_budget_seconds = max(1.0, FLEET_FAST_RUNTIME_BUDGET_SECONDS)
+        runtime_max_candidate_streams = max(100, FLEET_FAST_RUNTIME_MAX_CANDIDATE_STREAMS)
+        evaluator_max_groups = max(1, min(evaluator_max_groups, FLEET_FAST_EVALUATOR_MAX_GROUPS))
+        evaluator_per_group_limit = max(50, min(evaluator_per_group_limit, FLEET_FAST_EVALUATOR_PER_GROUP_LIMIT))
+        evaluator_budget_seconds = max(0.5, FLEET_FAST_EVALUATOR_BUDGET_SECONDS)
+        xray_max_traces = max(20, min(xray_max_traces, FLEET_FAST_XRAY_MAX_TRACES))
+        xray_budget_seconds = max(1.0, FLEET_FAST_XRAY_BUDGET_SECONDS)
+        xray_max_segments = max(1, FLEET_FAST_XRAY_MAX_SEGMENTS)
+        xray_pages_per_segment = max(1, FLEET_FAST_XRAY_MAX_PAGES_PER_SEGMENT)
+
+    runtime_records = _fetch_runtime_records_window(
+        lookback_hours=lookback_hours,
+        limit=runtime_limit,
+        max_seconds=runtime_budget_seconds,
+        max_candidate_streams=runtime_max_candidate_streams,
+    )
     evaluator_fetch = _fetch_evaluator_records_window(
         lookback_hours=lookback_hours,
-        max_groups=max(1, FLEET_EVALUATOR_MAX_GROUPS),
-        per_group_limit=max(50, FLEET_EVALUATOR_PER_GROUP_LIMIT),
+        max_groups=evaluator_max_groups,
+        per_group_limit=evaluator_per_group_limit,
+        max_seconds=evaluator_budget_seconds,
     )
     evaluator_records = evaluator_fetch["records"]
     evaluator_groups_used = evaluator_fetch["groups_used"]
-    xray_summaries = _fetch_xray_trace_summaries_window(lookback_hours=lookback_hours, max_traces=max(100, FLEET_XRAY_MAX_TRACES))
+    xray_summaries = _fetch_xray_trace_summaries_window(
+        lookback_hours=lookback_hours,
+        max_traces=xray_max_traces,
+        max_seconds=xray_budget_seconds,
+        max_segments_limit=xray_max_segments,
+        max_pages_per_segment=xray_pages_per_segment,
+    )
 
     traces: Dict[str, Dict[str, Any]] = {}
     runtime_details_by_trace: Dict[str, Dict[str, Any]] = {}
@@ -1505,6 +1689,9 @@ def _handle_fleet_insights(question: str, lookback_hours: int) -> Dict[str, Any]
         item["is_delayed"] = bool(item["e2e_ms"] >= DELAY_THRESHOLD_MS)
 
     all_traces = list(traces.values())
+    traces_total = len(all_traces)
+    large_window = _is_large_fleet_window(window_minutes, traces_total)
+    include_deep_details = wants_deep_dive or not large_window
     complete_3stage = [
         t for t in all_traces if t.get("runtime_count", 0) > 0 and t.get("evaluator_count", 0) > 0 and t.get("xray_duration_ms", 0) > 0
     ]
@@ -1550,7 +1737,8 @@ def _handle_fleet_insights(question: str, lookback_hours: int) -> Dict[str, Any]
     ]
     bottlenecks.sort(key=lambda row: float(row.get("impact_score", 0.0)), reverse=True)
 
-    anomalies = sorted(all_traces, key=lambda t: _to_float(t.get("e2e_ms")), reverse=True)[:20]
+    anomalies_limit = 20 if include_deep_details else 10
+    anomalies = sorted(all_traces, key=lambda t: _to_float(t.get("e2e_ms")), reverse=True)[:anomalies_limit]
     top_anomalies = [
         {
             "trace_id": t.get("trace_id", ""),
@@ -1572,39 +1760,44 @@ def _handle_fleet_insights(question: str, lookback_hours: int) -> Dict[str, Any]
             "evaluator_latency_ms": round(_to_float(t.get("evaluator_latency_ms")), 2),
             "inferred_model_or_gap_ms": round(_to_float(t.get("inferred_model_or_gap_ms")), 2),
             "status": t.get("status", "success"),
+            "user": (runtime_details_by_trace.get(str(t.get("trace_id", "")), {}) or {}).get("user", {}),
         }
         for t in sorted(all_traces, key=lambda row: _to_float(row.get("e2e_ms")), reverse=True)
         if bool(t.get("is_delayed"))
     ]
 
     trace_diagnostics = []
-    for t in sorted(all_traces, key=lambda row: _to_float(row.get("e2e_ms")), reverse=True)[:120]:
-        trace_id = str(t.get("trace_id", ""))
-        rt = runtime_details_by_trace.get(trace_id, {})
-        trace_diagnostics.append(
-            {
-                "trace_id": trace_id,
-                "status": t.get("status", "success"),
-                "is_delayed": bool(t.get("is_delayed")),
-                "stage_latency_ms": {
-                    "runtime": round(_to_float(t.get("runtime_latency_ms")), 2),
-                    "model_or_handoff_gap": round(_to_float(t.get("inferred_model_or_gap_ms")), 2),
-                    "evaluator": round(_to_float(t.get("evaluator_latency_ms")), 2),
-                    "e2e": round(_to_float(t.get("e2e_ms")), 2),
-                },
-                "user": rt.get("user", {}),
-                "token_usage": rt.get("token_usage", {}),
-                "model_invocation": rt.get("model_invocation", {}),
-                "tool_trace": rt.get("tool_trace", {}),
-                "reasoning_steps": rt.get("reasoning_steps", {}),
-                "evaluator_scores": t.get("evaluator_metrics", {}),
-            }
-        )
+    if include_deep_details:
+        for t in sorted(all_traces, key=lambda row: _to_float(row.get("e2e_ms")), reverse=True)[:120]:
+            trace_id = str(t.get("trace_id", ""))
+            rt = runtime_details_by_trace.get(trace_id, {})
+            trace_diagnostics.append(
+                {
+                    "trace_id": trace_id,
+                    "status": t.get("status", "success"),
+                    "is_delayed": bool(t.get("is_delayed")),
+                    "stage_latency_ms": {
+                        "runtime": round(_to_float(t.get("runtime_latency_ms")), 2),
+                        "model_or_handoff_gap": round(_to_float(t.get("inferred_model_or_gap_ms")), 2),
+                        "evaluator": round(_to_float(t.get("evaluator_latency_ms")), 2),
+                        "e2e": round(_to_float(t.get("e2e_ms")), 2),
+                    },
+                    "user": rt.get("user", {}),
+                    "token_usage": rt.get("token_usage", {}),
+                    "model_invocation": rt.get("model_invocation", {}),
+                    "tool_trace": rt.get("tool_trace", {}),
+                    "reasoning_steps": rt.get("reasoning_steps", {}),
+                    "evaluator_scores": t.get("evaluator_metrics", {}),
+                }
+            )
 
     now_ts = time.time()
+    delayed_with_user_metadata = sum(1 for row in delayed_traces if _has_recorded_user(row.get("user", {})))
     
     # Compute ResponseRelevance score from evaluator metrics
     response_relevance = _compute_response_relevance(trace_diagnostics)
+    if response_relevance is None:
+        response_relevance = _compute_response_relevance_from_traces(all_traces)
     
     merged = {
         "analysis_mode": "fleet_window",
@@ -1630,7 +1823,11 @@ def _handle_fleet_insights(question: str, lookback_hours: int) -> Dict[str, Any]
         "sources": {
             "runtime": {"events_scanned": len(runtime_records), "traces_found": len({r.get('xray_trace_id', '') for r in runtime_records if r.get('xray_trace_id')})},
             "evaluator": {"events_scanned": len(evaluator_records), "traces_found": len({t.get('trace_id', '') for t in all_traces if t.get('evaluator_count', 0) > 0})},
-            "xray": {"events_scanned": len(xray_summaries), "traces_found": len(xray_summaries)},
+            "xray": {
+                "events_scanned": len(xray_summaries),
+                "traces_found": len(xray_summaries),
+                "mode": "queried",
+            },
         },
         "fleet_metrics": {
             "traces_total": len(all_traces),
@@ -1648,26 +1845,28 @@ def _handle_fleet_insights(question: str, lookback_hours: int) -> Dict[str, Any]
         "top_anomalies": top_anomalies,
         "delay_threshold_ms": DELAY_THRESHOLD_MS,
         "delayed_traces_count": len(delayed_traces),
-        "delayed_traces": delayed_traces[:50],
+        "delayed_traces": delayed_traces[:(50 if include_deep_details else 20)],
         "trace_diagnostics": trace_diagnostics,
+        "user_metadata_summary": {
+            "delayed_with_user_metadata": delayed_with_user_metadata,
+            "delayed_without_user_metadata": max(0, len(delayed_traces) - delayed_with_user_metadata),
+        },
         "evaluator_groups_used": evaluator_groups_used,
         "trace_samples": top_anomalies[:5],
     }
-
-    # Log merged payload for debugging (what gets sent to Bedrock)
-    print(f"FLEET_ANALYSIS_MERGED_PAYLOAD: {json.dumps(merged, indent=2, default=str)}", flush=True)
     
     answer = _sanitize_analysis_answer(
         _build_fleet_diagnosis(question, merged),
         traces_total=len(all_traces),
     )
+    compact_merged = _compact_fleet_merged(merged)
     return {
         "statusCode": 200,
         "headers": CORS_HEADERS,
         "body": json.dumps(
             {
                 "answer": answer,
-                "merged": merged,
+                "merged": compact_merged,
                 "anchors": {
                     "request_id": "",
                     "client_request_id": "",
@@ -1714,12 +1913,13 @@ def _handle_session_insights(event: Dict[str, Any]) -> Dict[str, Any]:
     xray_trace_id = str(body.get("xray_trace_id", "")).strip()
     client_request_id = str(body.get("client_request_id", "")).strip()
     lookback_hours = _resolve_lookback_hours(body, default_hours=24)
+    lookback_mode = str(body.get("lookback_mode", "")).strip().lower()
     analysis_mode = str(body.get("analysis_mode", "single_trace")).strip().lower()
 
     if analysis_mode in {"fleet_1h", "all_traces_1h", "fleet", "fleet_window"}:
         # Fleet mode ignores anchors and aggregates all traces in the requested timeframe.
         fleet_hours = _resolve_lookback_hours(body, default_hours=1)
-        return _handle_fleet_insights(question=question, lookback_hours=fleet_hours)
+        return _handle_fleet_insights(question=question, lookback_hours=fleet_hours, lookback_mode=lookback_mode)
 
     terms = {
         "request_id": request_id,
@@ -1764,7 +1964,7 @@ def _handle_session_insights(event: Dict[str, Any]) -> Dict[str, Any]:
             )
             for event_row in resp.get("events", []):
                 payload = _json_from_log_message(event_row.get("message", ""))
-                if not payload or payload.get("event") != "agent_request_trace":
+                if not payload or not _is_runtime_trace_payload(payload):
                     continue
                 if _record_matches_terms(payload, event_row.get("message", ""), runtime_terms):
                     payload["_cloudwatch_timestamp"] = event_row.get("timestamp")
@@ -1777,7 +1977,7 @@ def _handle_session_insights(event: Dict[str, Any]) -> Dict[str, Any]:
         runtime_events = _fetch_log_events(RUNTIME_LOG_GROUP, runtime_terms, lookback_hours=lookback_hours, limit=500)
         for event_row in runtime_events:
             payload = _json_from_log_message(event_row.get("message", ""))
-            if not payload or payload.get("event") != "agent_request_trace":
+            if not payload or not _is_runtime_trace_payload(payload):
                 continue
             if _record_matches_terms(payload, event_row.get("message", ""), runtime_terms):
                 payload["_cloudwatch_timestamp"] = event_row.get("timestamp")
@@ -1787,7 +1987,7 @@ def _handle_session_insights(event: Dict[str, Any]) -> Dict[str, Any]:
     if not runtime_records and RUNTIME_LOG_GROUP:
         for event_row in _fetch_recent_stream_events(RUNTIME_LOG_GROUP, _rt_start_ms, limit=500):
             payload = _json_from_log_message(event_row.get("message", ""))
-            if not payload or payload.get("event") != "agent_request_trace":
+            if not payload or not _is_runtime_trace_payload(payload):
                 continue
             if _record_matches_terms(payload, event_row.get("message", ""), runtime_terms):
                 payload["_cloudwatch_timestamp"] = event_row.get("timestamp")

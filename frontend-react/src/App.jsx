@@ -2,6 +2,39 @@ import { useEffect, useMemo, useState } from "react";
 import { fetchAuthSession, fetchUserAttributes } from "aws-amplify/auth";
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL;
+const ANALYSIS_MAX_RETRIES = 2;
+const RETRYABLE_STATUS = new Set([429, 502, 503, 504]);
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function postWithRetry(url, options, maxRetries = ANALYSIS_MAX_RETRIES) {
+  let lastResponse = null;
+  let lastError = null;
+
+  for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
+    try {
+      const response = await fetch(url, options);
+      lastResponse = response;
+      if (!RETRYABLE_STATUS.has(response.status) || attempt === maxRetries) {
+        return response;
+      }
+    } catch (error) {
+      lastError = error;
+      if (attempt === maxRetries) {
+        throw error;
+      }
+    }
+
+    await sleep(900 * (attempt + 1));
+  }
+
+  if (lastResponse) {
+    return lastResponse;
+  }
+  throw lastError || new Error("Request failed after retries");
+}
 
 function stamp() {
   return new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
@@ -228,7 +261,7 @@ function App({ signOut, user }) {
     try {
       const session = await fetchAuthSession();
       const jwtToken = session.tokens?.idToken?.toString() || "";
-      const response = await fetch(`${API_BASE_URL}/session-insights`, {
+      const response = await postWithRetry(`${API_BASE_URL}/session-insights`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
