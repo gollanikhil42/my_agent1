@@ -45,6 +45,7 @@ DIAGNOSIS_SESSION_MAX_TOKENS = int(os.environ.get("DIAGNOSIS_SESSION_MAX_TOKENS"
 DIAGNOSIS_PROMPT_UPGRADE_MAX_TOKENS = int(os.environ.get("DIAGNOSIS_PROMPT_UPGRADE_MAX_TOKENS", "920"))
 DIAGNOSIS_FLEET_SUMMARY_MAX_TOKENS = int(os.environ.get("DIAGNOSIS_FLEET_SUMMARY_MAX_TOKENS", "2000"))
 DIAGNOSIS_FLEET_DISCOVERY_MAX_TOKENS = int(os.environ.get("DIAGNOSIS_FLEET_DISCOVERY_MAX_TOKENS", "450"))
+DIAGNOSIS_TRACE_LOOKUP_MAX_TOKENS = int(os.environ.get("DIAGNOSIS_TRACE_LOOKUP_MAX_TOKENS", "500"))
 DIAGNOSIS_FLEET_DEEP_DIVE_MAX_TOKENS = int(os.environ.get("DIAGNOSIS_FLEET_DEEP_DIVE_MAX_TOKENS", "2000"))
 RUNTIME_SERVICE_NAME = os.environ.get("RUNTIME_SERVICE_NAME", "")
 
@@ -1995,6 +1996,39 @@ def _build_discovery_diagnosis(question: str, merged: Dict[str, Any]) -> str:
         return f"Fleet discovery unavailable: {exc}"
 
 
+def _build_trace_lookup_diagnosis(question: str, merged: Dict[str, Any]) -> str:
+    system_prompt = (
+        "You are a trace diagnostics analyst for AWS AgentCore. "
+        "You are answering a focused trace lookup query, not a fleet summary. "
+        "Use trace_lookup, trace_diagnostics, and xray_trace_details as the primary sources. "
+        "For each matched trace, provide a compact segment delay breakdown and identify the dominant bottleneck. "
+        "If xray_trace_details contains steps or totals_by_name, use them directly. "
+        "If xray_trace_details is present but sparse, say exactly what fields are available. "
+        "Do not output generic discovery/fleet commentary. "
+        "Plain text only, no markdown, no tables, no emojis. "
+        "Keep the answer concise and bounded to the requested trace(s)."
+    )
+
+    user_question = question.strip() if question and question.strip() else "Analyze the requested trace IDs with X-Ray segment delays."
+    context_json = json.dumps(merged, default=str)
+    user_content = (
+        "Focused trace lookup context:\n"
+        f"{context_json}\n\n"
+        f"Question: {user_question}"
+    )
+
+    try:
+        response = BEDROCK_CLIENT.converse(
+            modelId=DIAGNOSIS_MODEL_ID,
+            system=[{"text": system_prompt}],
+            messages=[{"role": "user", "content": [{"text": user_content}]}],
+            inferenceConfig={"maxTokens": DIAGNOSIS_TRACE_LOOKUP_MAX_TOKENS, "temperature": 0.1},
+        )
+        return response["output"]["message"]["content"][0]["text"]
+    except Exception as exc:
+        return f"Trace lookup diagnosis unavailable: {exc}"
+
+
 def _compute_response_relevance(trace_diagnostics: List[Dict[str, Any]]) -> float:
     """Compute average ResponseRelevance score from evaluator_scores across all traces."""
     relevance_scores = []
@@ -2513,13 +2547,13 @@ def _build_deep_dive_context(merged: Dict[str, Any], session_id: str) -> Dict[st
 
     # Pull enriched xray details scoped to this session's traces
     session_trace_ids = {
-        str(tr.get("trace_id", ""))
+        _normalize_trace_id(str(tr.get("trace_id", "")))
         for tr in session.get("traces", [])
         if isinstance(tr, dict)
     }
     xray_details_for_session = [
         d for d in (merged.get("xray_trace_details") or [])
-        if str((d or {}).get("trace_id", "")) in session_trace_ids
+        if _normalize_trace_id(str((d or {}).get("trace_id", "") or (d or {}).get("trace_id_normalized", ""))) in session_trace_ids
     ]
 
     return {
@@ -3145,6 +3179,7 @@ def _handle_fleet_insights(question: str, lookback_hours: int, lookback_mode: st
     traces_by_id = {str(t.get("trace_id", "")): t for t in all_traces}
     matched_trace_ids = [trace_id for trace_id in requested_trace_ids if trace_id in traces_by_id]
     missing_trace_ids = [trace_id for trace_id in requested_trace_ids if trace_id not in traces_by_id]
+    _is_trace_lookup = bool(requested_trace_ids)
     should_paginate = _should_paginate_trace_context(
         question=question,
         traces_total=len(all_traces),
@@ -3213,7 +3248,7 @@ def _handle_fleet_insights(question: str, lookback_hours: int, lookback_mode: st
     # For DISCOVERY mode `merged` is used directly, so an expensive deep-copy is
     # unnecessary.  An empty stub lets all subsequent `merged_for_llm[x] = …`
     # assignments succeed harmlessly and the copy-back loop becomes a no-op.
-    merged_for_llm = copy.deepcopy(merged) if _is_deep_dive else {}
+    merged_for_llm = copy.deepcopy(merged) if (_is_deep_dive or _is_trace_lookup) else {}
     apply_trace_filter = bool(requested_trace_ids) or should_paginate
     selected_trace_ids_set = set(selected_trace_ids_for_llm)
     if apply_trace_filter:
@@ -3255,7 +3290,7 @@ def _handle_fleet_insights(question: str, lookback_hours: int, lookback_mode: st
 
     # ── Session pagination ────────────────────────────────────────────────────
     total_sessions = len((merged if not _is_deep_dive else merged_for_llm).get("sessions", {}))
-    should_paginate_sessions_flag = _should_paginate_sessions(
+    should_paginate_sessions_flag = (not _is_trace_lookup) and _should_paginate_sessions(
         question=question,
         sessions_total=total_sessions,
         page_size=page_size,
@@ -3319,12 +3354,12 @@ def _handle_fleet_insights(question: str, lookback_hours: int, lookback_mode: st
             "trace_ids_in_page": len(paged_trace_ids),
         })
 
-    # XRay detail is only needed for DEEP DIVE (one named session).
-    # For DISCOVERY mode skip this entirely — saves up to 6 s of network I/O.
+    # XRay detail is needed for DEEP DIVE and explicit trace lookups.
+    # For generic DISCOVERY mode skip this to save network I/O.
     xray_detail_elapsed = 0.0
     detailed_xray_by_trace: Dict[str, Any] = {}
-    if _is_deep_dive:
-        detailed_xray_budget = min(6.0, max(1.0, remaining_budget - 7.0))
+    if _is_deep_dive or _is_trace_lookup:
+        detailed_xray_budget = min(8.0, max(1.0, remaining_budget - 7.0))
         detailed_xray_ids = selected_trace_ids_for_llm[:max(1, min(page_size, 20))] if selected_trace_ids_for_llm else []
 
         xray_detail_start = time.perf_counter()
@@ -3397,6 +3432,8 @@ def _handle_fleet_insights(question: str, lookback_hours: int, lookback_mode: st
         merged_for_llm["xray_trace_details"] = [
             {
                 "trace_id": trace_id,
+                "trace_id_normalized": trace_id,
+                "xray_trace_id": str((detail or {}).get("trace_id", "")),
                 **detail,
             }
             for trace_id, detail in detailed_xray_by_trace.items()
@@ -3412,10 +3449,22 @@ def _handle_fleet_insights(question: str, lookback_hours: int, lookback_mode: st
 
     # ── Build LLM context (mode already detected at the top of this section) ───
     # DISCOVERY: per-session stats only — tiny context, fast LLM response.
+    # TRACE LOOKUP: focused trace diagnostics + xray details for requested IDs.
     # DEEP DIVE: full trace + XRay detail for ONE named session.
     context_build_start = time.perf_counter()
     if _is_deep_dive:
         llm_context = _build_deep_dive_context(merged, query_intent["session_id"])
+    elif _is_trace_lookup:
+        llm_context = {
+            "analysis_mode": "trace_lookup",
+            "window": merged.get("window", {}),
+            "trace_lookup": trace_lookup_context,
+            "trace_index": merged_for_llm.get("trace_index", []),
+            "trace_diagnostics": merged_for_llm.get("trace_diagnostics", []),
+            "xray_trace_details": merged_for_llm.get("xray_trace_details", []),
+            "quality_indicators": merged.get("quality_indicators", {}),
+            "fleet_metrics": merged.get("fleet_metrics", {}),
+        }
     else:
         llm_context = _build_discovery_context(merged, query_intent=query_intent)
     context_build_elapsed = round(time.perf_counter() - context_build_start, 3)
@@ -3441,13 +3490,15 @@ def _handle_fleet_insights(question: str, lookback_hours: int, lookback_mode: st
     # No fallback answer: timeout raises TimeoutError and returns 504 upstream.
     llm_start = time.perf_counter()
     elapsed_before_llm = time.perf_counter() - handler_start
+    # Use the full remaining safe budget for the LLM call (no fixed 14s/22s cap).
+    # This keeps us under API Gateway timeout while allowing deep trace/session
+    # questions enough time to complete.
     remaining_llm_budget = max(0.0, 27.0 - elapsed_before_llm)
     if remaining_llm_budget < 4.0:
         raise TimeoutError(
             f"Fleet analysis aborted before LLM call because only {round(remaining_llm_budget, 2)}s remained in the response budget."
         )
-    llm_timeout_cap = 14.0 if _is_deep_dive else 22.0
-    llm_timeout_seconds = min(llm_timeout_cap, remaining_llm_budget)
+    llm_timeout_seconds = remaining_llm_budget
     _emit_analyzer_trace({
         "phase": "llm_call_start",
         "analysis_id": analysis_id,
@@ -3456,7 +3507,12 @@ def _handle_fleet_insights(question: str, lookback_hours: int, lookback_mode: st
         "context_size_kb": llm_context_kb,
     })
 
-    llm_builder = _build_fleet_diagnosis if _is_deep_dive else _build_discovery_diagnosis
+    if _is_trace_lookup:
+        llm_builder = _build_trace_lookup_diagnosis
+    elif _is_deep_dive:
+        llm_builder = _build_fleet_diagnosis
+    else:
+        llm_builder = _build_discovery_diagnosis
 
     _llm_executor = ThreadPoolExecutor(max_workers=1)
     try:
