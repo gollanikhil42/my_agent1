@@ -555,11 +555,11 @@ function App({ signOut, user }) {
     try {
       const controller = new AbortController();
       analystAbortRef.current = controller;
-      const session = await fetchAuthSession();
-      const jwtToken = session.tokens?.idToken?.toString() || "";
       setAutoPageProgress(null);
 
       async function fetchAnalysisPage(targetPage) {
+        const session = await fetchAuthSession();
+        const jwtToken = session.tokens?.idToken?.toString() || "";
         const response = await postWithRetry(`${API_BASE_URL}/session-insights`, {
           method: "POST",
           headers: {
@@ -609,8 +609,13 @@ function App({ signOut, user }) {
 
       const firstResult = await fetchAnalysisPage(page);
       const firstPagination = firstResult.data?.pagination || null;
-      const firstPrefix = isFleetMode && Number(firstPagination?.page || page) > 1 && Number(firstPagination?.total_pages || 1) > 1
-        ? `Page ${firstPagination.page} of ${firstPagination.total_pages}`
+      const firstSessionsPagination = firstResult.data?.sessions_pagination || null;
+      const firstMergedSessionsPagination = firstResult.data?.merged?.sessions_pagination_context || null;
+      const firstMergedPagination = firstResult.data?.merged?.pagination_context || null;
+      const firstPageInfo = firstSessionsPagination || firstPagination || firstMergedSessionsPagination || firstMergedPagination;
+      const autoPaginateRecommended = Boolean(firstResult.data?.auto_paginate_recommended);
+      const firstPrefix = isFleetMode && Number(firstPageInfo?.page || page) > 1 && Number(firstPageInfo?.total_pages || 1) > 1
+        ? `Page ${firstPageInfo.page} of ${firstPageInfo.total_pages}`
         : "";
 
       setLogMessages((prev) => [
@@ -640,16 +645,21 @@ function App({ signOut, user }) {
 
       const shouldAutoLoadRemainingPages =
         firstResult.response.ok
-        && analystMode !== "single_trace"
+        && autoPaginateRecommended
         && autoPaginate
-        && Number(firstPagination?.total_pages || 1) > 1;
+        && (Number(firstPageInfo?.total_pages || 1) > 1 || Boolean(firstPageInfo?.has_next_page));
 
       if (shouldAutoLoadRemainingPages) {
-        const totalPages = Number(firstPagination?.total_pages || 1);
-        let loadedPages = Number(firstPagination?.page || 1);
+        const totalPages = Number(firstPageInfo?.total_pages || 1);
+        let hasNextPage = Boolean(firstPageInfo?.has_next_page) || totalPages > 1;
+        let loadedPages = Number(firstPageInfo?.page || 1);
         setAutoPageProgress({ loadedPages, totalPages });
 
-        for (let nextPage = loadedPages + 1; nextPage <= totalPages; nextPage += 1) {
+        const hardPageCap = Math.max(totalPages, loadedPages + 20);
+        for (let nextPage = loadedPages + 1; nextPage <= hardPageCap; nextPage += 1) {
+          if (!hasNextPage && nextPage > totalPages) {
+            break;
+          }
           const nextResult = await fetchAnalysisPage(nextPage);
 
           if (!nextResult.response.ok) {
@@ -664,16 +674,28 @@ function App({ signOut, user }) {
             break;
           }
 
-          loadedPages = Number(nextResult.data?.pagination?.page || nextPage);
+          const nextPagination = nextResult.data?.pagination || null;
+          const nextSessionsPagination = nextResult.data?.sessions_pagination || null;
+          const nextMergedSessionsPagination = nextResult.data?.merged?.sessions_pagination_context || null;
+          const nextMergedPagination = nextResult.data?.merged?.pagination_context || null;
+          const nextPageInfo = nextSessionsPagination || nextPagination || nextMergedSessionsPagination || nextMergedPagination;
+
+          loadedPages = Number(nextPageInfo?.page || nextPage);
+          const nextTotalPages = Number(nextPageInfo?.total_pages || totalPages || loadedPages);
+          hasNextPage = Boolean(nextPageInfo?.has_next_page) || loadedPages < nextTotalPages;
           setFleetPage(loadedPages);
-          setLatestPagination(nextResult.data?.pagination || null);
-          setLatestSessionsPagination(nextResult.data?.sessions_pagination || null);
+          setLatestPagination(nextPagination);
+          setLatestSessionsPagination(nextSessionsPagination);
           setLatestMerged(nextResult.data?.merged || null);
-          setAutoPageProgress({ loadedPages, totalPages });
+          setAutoPageProgress({ loadedPages, totalPages: nextTotalPages });
           setLogMessages((prev) => [
             ...prev,
-            makeMessage("assistant", `Page ${loadedPages} of ${totalPages}\n\n${nextResult.answer}`),
+            makeMessage("assistant", `Page ${loadedPages} of ${nextTotalPages}\n\n${nextResult.answer}`),
           ]);
+
+          if (!hasNextPage && loadedPages >= nextTotalPages) {
+            break;
+          }
         }
       }
     } catch (error) {
