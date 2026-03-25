@@ -1464,6 +1464,69 @@ def _collect_evaluator_metrics_by_trace_ids(
     return out
 
 
+def _fetch_evaluator_metrics_for_trace_ids(
+    trace_ids: List[str],
+    lookback_hours: int = 48,
+    max_groups: int = 40,
+    per_group_limit: int = 200,
+) -> Dict[str, Dict[str, Any]]:
+    requested: List[str] = []
+    seen = set()
+    for trace_id in (trace_ids or []):
+        normalized = _normalize_trace_id(trace_id)
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            requested.append(normalized)
+
+    if not requested:
+        return {}
+
+    groups = _resolve_evaluator_log_groups()[:max_groups]
+    out: Dict[str, Dict[str, Any]] = {}
+
+    for trace_id in requested[:5]:  # explicit trace lookup is usually 1 trace; cap to keep cost bounded
+        if trace_id in out and out[trace_id]:
+            continue
+        trace_xray = _denormalize_trace_id(trace_id)
+        for group in groups:
+            events = _fetch_log_events(
+                group,
+                {"xray_trace_id": trace_id},
+                lookback_hours=lookback_hours,
+                limit=per_group_limit,
+            )
+            if not events:
+                continue
+
+            metrics: Dict[str, Dict[str, Any]] = {}
+            for event_row in events:
+                message = str(event_row.get("message", ""))
+                message_l = message.lower()
+                message_norm = _normalize_trace_id(message)
+                if trace_id not in message_norm and trace_xray not in message_l:
+                    continue
+
+                payload = _json_from_log_message(message)
+                if not payload:
+                    continue
+                _collect_evaluations(payload, metrics)
+
+            if metrics:
+                bucket = out.setdefault(trace_id, {})
+                for name, details in metrics.items():
+                    if not isinstance(details, dict):
+                        continue
+                    bucket[str(name)] = {
+                        "score": details.get("score"),
+                        "label": details.get("label", ""),
+                        "explanation": details.get("explanation", ""),
+                        "severity_number": details.get("severity_number"),
+                    }
+                break
+
+    return out
+
+
 def _is_runtime_trace_payload(payload: Dict[str, Any]) -> bool:
     if not isinstance(payload, dict):
         return False
@@ -3378,11 +3441,24 @@ def _handle_fleet_insights(question: str, lookback_hours: int, lookback_mode: st
     traces_for_llm = all_traces
     selected_trace_ids_for_llm: List[str] = [str(t.get("trace_id", "")) for t in all_traces]
 
+    trace_lookup_evaluator_metrics: Dict[str, Dict[str, Any]] = {}
     if requested_trace_ids:
-        evaluator_fallback = _collect_evaluator_metrics_by_trace_ids(evaluator_records, missing_trace_ids)
+        trace_lookup_evaluator_metrics = _collect_evaluator_metrics_by_trace_ids(evaluator_records, requested_trace_ids)
+        direct_fetch_targets = [trace_id for trace_id in requested_trace_ids if not trace_lookup_evaluator_metrics.get(trace_id)]
+        if direct_fetch_targets:
+            direct_fetched = _fetch_evaluator_metrics_for_trace_ids(
+                direct_fetch_targets,
+                lookback_hours=max(int(lookback_hours), 48),
+                max_groups=40,
+                per_group_limit=200,
+            )
+            for trace_id, metrics in direct_fetched.items():
+                if metrics:
+                    trace_lookup_evaluator_metrics[trace_id] = metrics
+
         promoted_trace_ids: List[str] = []
         for trace_id in missing_trace_ids:
-            metrics = evaluator_fallback.get(trace_id)
+            metrics = trace_lookup_evaluator_metrics.get(trace_id)
             if not metrics:
                 continue
             promoted_trace_ids.append(trace_id)
@@ -3530,12 +3606,41 @@ def _handle_fleet_insights(question: str, lookback_hours: int, lookback_mode: st
     # and inject any scores found directly into the trace_diagnostics entries.
     if _is_trace_lookup and requested_trace_ids:
         requested_ids_set = set(requested_trace_ids)
+        trace_index_by_id = {
+            _normalize_trace_id(str(row.get("trace_id", ""))): row
+            for row in merged_for_llm.get("trace_index", [])
+            if isinstance(row, dict)
+        }
         for diag in merged_for_llm.get("trace_diagnostics", []):
-            if diag.get("evaluator_scores"):
-                continue  # already has scores
             trace_id = _normalize_trace_id(str(diag.get("trace_id", "")))
             if trace_id not in requested_ids_set:
                 continue
+
+            if trace_lookup_evaluator_metrics.get(trace_id):
+                slim = {
+                    str(name): {
+                        "score": details.get("score"),
+                        "label": details.get("label", ""),
+                    }
+                    for name, details in trace_lookup_evaluator_metrics.get(trace_id, {}).items()
+                    if isinstance(details, dict)
+                }
+                if slim:
+                    diag["evaluator_scores"] = slim
+                    if trace_index_by_id.get(trace_id):
+                        trace_index_by_id[trace_id]["evaluator_scores"] = slim
+                    _emit_analyzer_trace({
+                        "phase": "evaluator_scores_attached",
+                        "analysis_id": analysis_id,
+                        "trace_id": trace_id,
+                        "metrics_found": list(slim.keys()),
+                        "source": "trace_lookup_direct_fetch",
+                    })
+                    continue
+
+            if diag.get("evaluator_scores"):
+                continue  # already has scores
+
             xray_form = _denormalize_trace_id(trace_id)
             backfill: Dict[str, Any] = {}
             for rec in evaluator_records:
@@ -3553,6 +3658,8 @@ def _handle_fleet_insights(question: str, lookback_hours: int, lookback_mode: st
                     else:
                         slim[str(name)] = {"score": val, "label": ""}
                 diag["evaluator_scores"] = slim
+                if trace_index_by_id.get(trace_id):
+                    trace_index_by_id[trace_id]["evaluator_scores"] = slim
                 _emit_analyzer_trace({
                     "phase": "evaluator_scores_backfilled",
                     "analysis_id": analysis_id,
