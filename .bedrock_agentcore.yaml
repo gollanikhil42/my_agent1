@@ -32,7 +32,7 @@ agents:
     bedrock_agentcore:
       agent_id: my_agent1-EuvQcG3t0u
       agent_arn: arn:aws:bedrock-agentcore:us-east-1:636052469006:runtime/my_agent1-EuvQcG3t0u
-      agent_session_id: 749983d9-0fd4-400f-86f0-7393d87c63af
+      agent_session_id: null
     codebuild:
       project_name: bedrock-agentcore-my_agent1-builder
       execution_role: arn:aws:iam::636052469006:role/AmazonBedrockAgentCoreSDKCodeBuild-us-east-1-74fa9e7c17

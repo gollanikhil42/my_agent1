@@ -146,6 +146,7 @@ Resources:
         AllowHeaders:
           - Content-Type
           - Authorization
+          - x-session-id
         AllowOrigins:
           - '*'
       Auth:
@@ -254,6 +255,12 @@ Resources:
                 - logs:DescribeLogStreams
                 - logs:CreateLogStream
                 - logs:PutLogEvents
+                - logs:StartQuery
+                - logs:GetQueryResults
+                - logs:StopQuery
+                - logs:StartQuery
+                - logs:GetQueryResults
+                - logs:StopQuery
               Resource: '*'
             - Effect: Allow
               Action:

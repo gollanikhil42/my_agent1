@@ -315,6 +315,39 @@ h1 {
   transform: none;
 }
 
+.prompt-suggestions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 12px 16px 8px;
+  border-bottom: 1px solid var(--line);
+  background: rgba(0, 50, 110, 0.6);
+}
+
+.suggestion-chip {
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 20px;
+  color: #c8deff;
+  font-size: 0.78rem;
+  padding: 5px 12px;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+  text-align: left;
+  line-height: 1.4;
+}
+
+.suggestion-chip:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.16);
+  border-color: rgba(255, 255, 255, 0.35);
+  color: #fff;
+}
+
+.suggestion-chip:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
 .messages {
   min-height: 0;
   overflow-y: auto;

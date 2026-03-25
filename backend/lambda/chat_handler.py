@@ -5,13 +5,14 @@ import copy
 import re
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FutureTimeoutError
 from datetime import datetime, timezone
 from typing import Any, Dict, List
 from collections import defaultdict
 
 import boto3
 import urllib3
+from botocore.config import Config
 from botocore.auth import SigV4Auth
 from botocore.awsrequest import AWSRequest
 from botocore.session import Session
@@ -22,16 +23,28 @@ RUNTIME_URL = os.environ.get("AGENTCORE_RUNTIME_URL", "")
 CORS_HEADERS = {
     "Content-Type": "application/json",
     "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Headers": "Content-Type,Authorization",
+    "Access-Control-Allow-Headers": "Content-Type,Authorization,x-session-id",
     "Access-Control-Allow-Methods": "OPTIONS,POST",
 }
 LOGS_CLIENT = boto3.client("logs", region_name=REGION)
 XRAY_CLIENT = boto3.client("xray", region_name=REGION)
-BEDROCK_CLIENT = boto3.client("bedrock-runtime", region_name=REGION)
+BEDROCK_CONNECT_TIMEOUT_SECONDS = float(os.environ.get("BEDROCK_CONNECT_TIMEOUT_SECONDS", "2.0"))
+BEDROCK_READ_TIMEOUT_SECONDS = float(os.environ.get("BEDROCK_READ_TIMEOUT_SECONDS", "14.0"))
+BEDROCK_MAX_ATTEMPTS = int(os.environ.get("BEDROCK_MAX_ATTEMPTS", "1"))
+BEDROCK_CLIENT = boto3.client(
+    "bedrock-runtime",
+    region_name=REGION,
+    config=Config(
+        connect_timeout=BEDROCK_CONNECT_TIMEOUT_SECONDS,
+        read_timeout=BEDROCK_READ_TIMEOUT_SECONDS,
+        retries={"max_attempts": BEDROCK_MAX_ATTEMPTS, "mode": "standard"},
+    ),
+)
 DIAGNOSIS_MODEL_ID = os.environ.get("DIAGNOSIS_MODEL_ID", "")
 DIAGNOSIS_SESSION_MAX_TOKENS = int(os.environ.get("DIAGNOSIS_SESSION_MAX_TOKENS", "1150"))
 DIAGNOSIS_PROMPT_UPGRADE_MAX_TOKENS = int(os.environ.get("DIAGNOSIS_PROMPT_UPGRADE_MAX_TOKENS", "920"))
 DIAGNOSIS_FLEET_SUMMARY_MAX_TOKENS = int(os.environ.get("DIAGNOSIS_FLEET_SUMMARY_MAX_TOKENS", "2000"))
+DIAGNOSIS_FLEET_DISCOVERY_MAX_TOKENS = int(os.environ.get("DIAGNOSIS_FLEET_DISCOVERY_MAX_TOKENS", "450"))
 DIAGNOSIS_FLEET_DEEP_DIVE_MAX_TOKENS = int(os.environ.get("DIAGNOSIS_FLEET_DEEP_DIVE_MAX_TOKENS", "2000"))
 RUNTIME_SERVICE_NAME = os.environ.get("RUNTIME_SERVICE_NAME", "")
 
@@ -119,9 +132,23 @@ OTEL_LOOKUP_BUDGET_SECONDS = float(os.environ.get("OTEL_LOOKUP_BUDGET_SECONDS", 
 RUNTIME_STREAM_PAGES_PER_PREFIX = int(os.environ.get("RUNTIME_STREAM_PAGES_PER_PREFIX", "4"))
 RUNTIME_STREAMS_PER_PREFIX = int(os.environ.get("RUNTIME_STREAMS_PER_PREFIX", "200"))
 RUNTIME_LOG_SCAN_MULTIPLIER = int(os.environ.get("RUNTIME_LOG_SCAN_MULTIPLIER", "8"))
+# If false, fleet mode uses only the fixed stream (agent-traces) and skips all
+# whole-group and per-stream backfill scans.
+RUNTIME_BACKFILL_ENABLED = str(os.environ.get("RUNTIME_BACKFILL_ENABLED", "false")).strip().lower() in {
+    "1", "true", "yes", "on"
+}
 XRAY_QUERY_CHUNK_HOURS = int(os.environ.get("XRAY_QUERY_CHUNK_HOURS", "24"))
 # X-Ray retains traces for 30 days; querying beyond that returns nothing.
 XRAY_MAX_LOOKBACK_HOURS = int(os.environ.get("XRAY_MAX_LOOKBACK_HOURS", "720"))
+# Max hours of CloudWatch logs to scan in a single filter_log_events call.
+# A single CloudWatch API page over a 14-day window can take 20-30s; capping at
+# 4 days means the scan finishes in <3s and the hard thread timeout never fires.
+# Identity data from older logs is absent, but sessions still appear via X-Ray.
+BACKFILL_MAX_SCAN_HOURS = int(os.environ.get("BACKFILL_MAX_SCAN_HOURS", str(4 * 24)))
+# Max sessions to include in the LLM discovery context.  Sending 200 sessions
+# at ~500 bytes each = 100KB = ~75K input tokens → Bedrock TTFT of 8-20s → 503.
+# Keeping this at 20 keeps context < 12KB, TTFT < 1s, total LLM time < 5s.
+LLM_DISCOVERY_MAX_SESSIONS = int(os.environ.get("LLM_DISCOVERY_MAX_SESSIONS", "8"))
 
 def _build_user_claims(event: Dict[str, Any]) -> Dict[str, str]:
     claims = (
@@ -147,6 +174,21 @@ def _extract_bearer_token(event: Dict[str, Any]) -> str:
     if not auth_header.lower().startswith("bearer "):
         return ""
     return auth_header.split(" ", 1)[1].strip()
+
+
+def _extract_header_case_insensitive(event: Dict[str, Any], header_name: str) -> str:
+    headers = event.get("headers") or {}
+    if not isinstance(headers, dict):
+        return ""
+    target = str(header_name or "").strip().lower()
+    for key, value in headers.items():
+        if str(key).strip().lower() == target:
+            return str(value or "").strip()
+    return ""
+
+
+def _extract_session_id_header(event: Dict[str, Any]) -> str:
+    return _extract_header_case_insensitive(event, "x-session-id")
 
 
 def _decode_jwt_claims(token: str) -> Dict[str, str]:
@@ -251,15 +293,38 @@ def _extract_runtime_answer(result: Dict[str, Any]) -> str:
 def _json_from_log_message(message: str) -> Dict[str, Any]:
     if not message:
         return {}
-    first = message.find("{")
-    last = message.rfind("}")
-    if first == -1 or last == -1 or last <= first:
+
+    # Some runtime streams emit multiple JSON blobs in one line (e.g. OTEL payload
+    # + INFO:my_agent1:{agent_request_trace...} + duplicated JSON object).
+    # Parse all JSON objects present and pick the runtime payload we care about.
+    decoder = json.JSONDecoder()
+    objects: List[Dict[str, Any]] = []
+    idx = 0
+    length = len(message)
+    while idx < length:
+        brace_pos = message.find("{", idx)
+        if brace_pos < 0:
+            break
+        try:
+            parsed, consumed = decoder.raw_decode(message[brace_pos:])
+            if isinstance(parsed, dict):
+                objects.append(parsed)
+            idx = brace_pos + consumed
+        except Exception:
+            idx = brace_pos + 1
+
+    if not objects:
         return {}
-    try:
-        parsed = json.loads(message[first : last + 1])
-        return parsed if isinstance(parsed, dict) else {}
-    except Exception:
-        return {}
+
+    for obj in objects:
+        if str(obj.get("event", "")).strip().lower() == "agent_request_trace":
+            return obj
+
+    for obj in objects:
+        if _is_runtime_trace_payload(obj):
+            return obj
+
+    return objects[0]
 
 
 def _sanitize_user_answer(text: str) -> str:
@@ -449,6 +514,73 @@ def _apply_pagination_to_traces(
     page_traces = traces[start_idx:end_idx]
     has_next = page < total_pages
     return page_traces, total_pages, has_next
+
+
+def _is_bulk_session_listing_question(question: str) -> bool:
+    """Detect requests that list/enumerate sessions rather than analyze a single one."""
+    text = str(question or "").strip().lower()
+    if not text:
+        return False
+    patterns = [
+        r"\b(list|show|enumerate|print|retrieve|get|return)\b.*\b(all|every)\b.*\bsessions?\b",
+        r"\b(list|show|enumerate|print|retrieve|get|return)\b.*\bsessions?\b",
+        r"\bwhat are\b.*\bsessions?\b",
+        r"\ball\b.*\bsessions?\b",
+        r"\bsession\b.*\b(list|listing|summary|overview)\b",
+    ]
+    return any(re.search(pattern, text) for pattern in patterns)
+
+
+def _is_bulk_user_listing_question(question: str) -> bool:
+    text = str(question or "").strip().lower()
+    if not text:
+        return False
+    patterns = [
+        r"\b(list|show|enumerate|get|return)\b.*\b(all|every)\b.*\busers\b",
+        r"\busers\b.*\btheir\b.*\bsessions\b",
+        r"\ball\b.*\busers\b.*\bsessions\b",
+        r"\buser\b.*\bsession\b.*\bissues\b",
+    ]
+    return any(re.search(pattern, text) for pattern in patterns)
+
+
+def _should_paginate_sessions(
+    question: str,
+    sessions_total: int,
+    page_size: int,
+    pre_llm_elapsed: float,
+    remaining_budget_seconds: float,
+) -> bool:
+    if sessions_total <= page_size:
+        return False
+    if _is_bulk_session_listing_question(question):
+        return True
+    if remaining_budget_seconds < 12.0 and sessions_total > page_size:
+        return True
+    if pre_llm_elapsed > 14.0 and sessions_total > page_size:
+        return True
+    if sessions_total > page_size * 2:
+        return True
+    return False
+
+
+def _apply_pagination_to_sessions(
+    sessions: Dict[str, Any], page: int = 1, page_size: int = 10
+) -> tuple[Dict[str, Any], int, bool]:
+    """Paginate sessions dict and return (sessions_page, total_pages, has_next)."""
+    page = max(1, int(page))
+    page_size = max(1, int(page_size))
+
+    session_items = list(sessions.items())
+    total_count = len(session_items)
+    total_pages = max(1, (total_count + page_size - 1) // page_size)
+    page = min(page, total_pages)
+
+    start_idx = (page - 1) * page_size
+    end_idx = start_idx + page_size
+    page_sessions = dict(session_items[start_idx:end_idx])
+    has_next = page < total_pages
+    return page_sessions, total_pages, has_next
 
 
 def _is_uuid(value: str) -> bool:
@@ -658,17 +790,18 @@ def _record_matches_terms(record: Dict[str, Any], message: str, terms: Dict[str,
     return False
 
 
-def _fetch_log_events(log_group: str, terms: Dict[str, str], lookback_hours: int = 24, limit: int = 200) -> list:
+def _fetch_log_events(log_group: str, terms: Dict[str, str], lookback_hours: int = 24, limit: int = 200, max_seconds: float = 0.0) -> list:
     if not log_group:
         return []
 
     filter_term = _primary_filter_term(terms)
     start_time_ms = int((time.time() - lookback_hours * 3600) * 1000)
+    fetch_started = time.perf_counter()
 
     base_kwargs: Dict[str, Any] = {
         "logGroupName": log_group,
         "startTime": start_time_ms,
-        "limit": limit,
+        "limit": min(limit, 10000),  # CloudWatch API hard cap
     }
 
     def _run_query(with_filter: bool) -> list:
@@ -680,6 +813,9 @@ def _fetch_log_events(log_group: str, terms: Dict[str, str], lookback_hours: int
         next_token = None
         pages = 0
         while pages < 5:
+            # Respect caller-supplied time budget between pages
+            if max_seconds > 0 and (time.perf_counter() - fetch_started) >= max_seconds:
+                break
             try:
                 page_kwargs = dict(kwargs)
                 if next_token:
@@ -700,6 +836,8 @@ def _fetch_log_events(log_group: str, terms: Dict[str, str], lookback_hours: int
         return events
 
     # Fallback: some AgentCore log lines are visible in tail but missed by text filter patterns.
+    if max_seconds > 0 and (time.perf_counter() - fetch_started) >= max_seconds:
+        return []
     events = _run_query(with_filter=False)
     if events:
         return events
@@ -830,7 +968,7 @@ def _fetch_recent_stream_events(
                 logGroupName=log_group,
                 logStreamName=stream_name,
                 startTime=start_time_ms,
-                startFromHead=False,
+                startFromHead=True,
                 limit=min(max(200, limit), 1000),
             )
         except Exception:
@@ -1318,7 +1456,7 @@ def _fetch_runtime_records_window(
                     "logGroupName": RUNTIME_LOG_GROUP,
                     "logStreamName": RUNTIME_LOG_STREAM,
                     "startTime": start_ms,
-                    "startFromHead": False,
+                    "startFromHead": True,
                     "limit": min(1000, max(100, limit)),
                 }
                 if next_token:
@@ -1336,20 +1474,44 @@ def _fetch_runtime_records_window(
         except Exception:
             pass
 
-    # Always backfill from per-invocation streams so "overall" can include historical traces
-    # that predate fixed-stream writes.
+    # Primary backfill: CloudWatch Log Insights (server-side, any window in 2-5 s).
+    # Queries the entire log group at once — no per-stream page scanning.
     stream_scan_limit = min(max(limit * max(2, RUNTIME_LOG_SCAN_MULTIPLIER), 2500), 20000)
-    stream_budget_seconds = 0.0
-    if max_seconds > 0:
-        stream_budget_seconds = max(0.0, max_seconds - (time.perf_counter() - started))
-    for row in _fetch_recent_stream_events(
-        RUNTIME_LOG_GROUP,
-        start_ms,
-        limit=stream_scan_limit,
-        max_seconds=stream_budget_seconds,
-        max_candidate_streams_override=max_candidate_streams,
-    ):
-        _append_runtime_event(row, "backfill")
+    backfill_budget = max(0.0, max_seconds - (time.perf_counter() - started)) if max_seconds > 0 else 0.0
+
+    if RUNTIME_BACKFILL_ENABLED and len(records) < limit and (max_seconds <= 0 or backfill_budget > 1.0):
+        for row in _fetch_runtime_backfill_insights(
+            lookback_hours=lookback_hours,
+            limit=stream_scan_limit,
+            max_seconds=backfill_budget,
+        ):
+            _append_runtime_event(row, "backfill")
+
+    # Secondary fallback: filter_log_events (capped window) if Insights returned nothing.
+    if RUNTIME_BACKFILL_ENABLED and not records:
+        filter_budget = max(0.0, max_seconds - (time.perf_counter() - started)) if max_seconds > 0 else 0.0
+        backfill_lookback = min(lookback_hours, max(48, BACKFILL_MAX_SCAN_HOURS))
+        if filter_budget > 0.5 or max_seconds <= 0:
+            for row in _fetch_log_events(
+                RUNTIME_LOG_GROUP,
+                {"filter_term": "agent_request_trace"},
+                lookback_hours=backfill_lookback,
+                limit=stream_scan_limit,
+                max_seconds=filter_budget,
+            ):
+                _append_runtime_event(row, "backfill")
+
+    # Last resort: stream-level scan if everything above returned nothing.
+    if RUNTIME_BACKFILL_ENABLED and not records:
+        stream_budget_seconds = max(0.0, max_seconds - (time.perf_counter() - started)) if max_seconds > 0 else 0.0
+        for row in _fetch_recent_stream_events(
+            RUNTIME_LOG_GROUP,
+            start_ms,
+            limit=stream_scan_limit,
+            max_seconds=stream_budget_seconds,
+            max_candidate_streams_override=max_candidate_streams,
+        ):
+            _append_runtime_event(row, "backfill")
 
     records.sort(key=lambda item: item.get("_cloudwatch_timestamp", 0), reverse=True)
     return {
@@ -1361,6 +1523,108 @@ def _fetch_runtime_records_window(
             "backfill_streams": sorted(source_stats["backfill_streams"]),
         },
     }
+
+
+def _insights_ts_to_ms(ts_str: str) -> int:
+    """Convert a CloudWatch Log Insights timestamp to epoch milliseconds.
+
+    Log Insights timestamps look like '2026-03-25 14:30:00.000' (UTC).
+    """
+    try:
+        dt = datetime.strptime(str(ts_str or "")[:23], "%Y-%m-%d %H:%M:%S.%f")
+        return int(dt.replace(tzinfo=timezone.utc).timestamp() * 1000)
+    except Exception:
+        return 0
+
+
+def _fetch_runtime_backfill_insights(
+    lookback_hours: int,
+    limit: int,
+    max_seconds: float,
+) -> List[Dict[str, Any]]:
+    """Fetch runtime records using CloudWatch Log Insights.
+
+    Log Insights runs the query server-side across every log stream in the group
+    simultaneously — no page-by-page Lambda scanning.  For a 14-day window it
+    typically finishes in 2-5 s vs the 20-30 s that filter_log_events takes.
+
+    Returns a list of raw event dicts (message, timestamp, _log_stream_name)
+    ready for _append_runtime_event.
+    """
+    if not RUNTIME_LOG_GROUP:
+        return []
+
+    started = time.perf_counter()
+    start_epoch = int(time.time() - lookback_hours * 3600)
+    end_epoch = int(time.time())
+    insights_limit = min(max(limit, 100), 10000)  # Log Insights hard cap is 10 000
+
+    query_string = (
+        "fields @timestamp, @message, @logStream "
+        "| filter @message like /agent_request_trace/ "
+        "| sort @timestamp desc "
+        f"| limit {insights_limit}"
+    )
+
+    try:
+        start_resp = LOGS_CLIENT.start_query(
+            logGroupName=RUNTIME_LOG_GROUP,
+            startTime=start_epoch,
+            endTime=end_epoch,
+            queryString=query_string,
+        )
+        query_id = start_resp["queryId"]
+    except Exception:
+        return []
+
+    # Poll until the query completes or the time budget is exhausted.
+    poll_sleep = 0.4
+    while True:
+        remaining = (max_seconds - (time.perf_counter() - started)) if max_seconds > 0 else 999.0
+        if remaining <= 0.1:
+            try:
+                LOGS_CLIENT.stop_query(queryId=query_id)
+            except Exception:
+                pass
+            return []
+
+        time.sleep(min(poll_sleep, max(0.1, remaining - 0.1)))
+        poll_sleep = min(poll_sleep * 1.5, 2.0)
+
+        try:
+            result = LOGS_CLIENT.get_query_results(queryId=query_id)
+        except Exception:
+            return []
+
+        status = result.get("status", "")
+        if status == "Complete":
+            rows: List[Dict[str, Any]] = []
+            for row in result.get("results", []):
+                if not isinstance(row, list):
+                    continue
+                msg = next(
+                    (f["value"] for f in row if isinstance(f, dict) and f.get("field") == "@message"),
+                    None,
+                )
+                ts_str = next(
+                    (f["value"] for f in row if isinstance(f, dict) and f.get("field") == "@timestamp"),
+                    None,
+                )
+                stream = next(
+                    (f["value"] for f in row if isinstance(f, dict) and f.get("field") == "@logStream"),
+                    None,
+                )
+                if msg:
+                    rows.append({
+                        "message": str(msg),
+                        "timestamp": _insights_ts_to_ms(ts_str or ""),
+                        "_log_stream_name": str(stream or ""),
+                    })
+            return rows
+
+        if status in ("Failed", "Cancelled", "Timeout"):
+            return []
+        # status == "Running" or "Scheduled" — loop back to poll
 
 
 def _fetch_evaluator_records_window(
@@ -1378,7 +1642,11 @@ def _fetch_evaluator_records_window(
         if max_seconds > 0 and (time.perf_counter() - started) >= max_seconds:
             break
         groups_used.append(group)
-        events = _fetch_log_events(group, {}, lookback_hours=lookback_hours, limit=per_group_limit)
+        # Pass the remaining budget and a capped window to _fetch_log_events so a
+        # single slow CloudWatch page cannot block this thread past its budget.
+        group_budget = max(0.0, max_seconds - (time.perf_counter() - started)) if max_seconds > 0 else 0.0
+        eval_lookback = min(lookback_hours, max(48, BACKFILL_MAX_SCAN_HOURS))
+        events = _fetch_log_events(group, {}, lookback_hours=eval_lookback, limit=per_group_limit, max_seconds=group_budget)
         for row in events:
             payload = _json_from_log_message(row.get("message", ""))
             if not payload:
@@ -1670,11 +1938,12 @@ def _build_fleet_diagnosis(question: str, merged: Dict[str, Any]) -> str:
         "Do not fabricate values."
     )
 
-    context_json = json.dumps(merged, indent=2, default=str)
+    context_json = json.dumps(merged, default=str)
     user_question = question.strip() if question and question.strip() else "Analyze this fleet window and rank bottlenecks."
     user_content = (
         f"Window size: {window_minutes} minutes.\n"
-        "Here is the merged diagnostics payload:\n\n"
+        "Here is the diagnostics data for multiple user sessions within the selected time window. "
+        "Each session represents a single user visit and contains multiple traces.\n\n"
         f"```json\n{context_json}\n```\n\n"
         f"Question: {user_question}"
     )
@@ -1689,6 +1958,41 @@ def _build_fleet_diagnosis(question: str, merged: Dict[str, Any]) -> str:
         return response["output"]["message"]["content"][0]["text"]
     except Exception as exc:
         return f"Fleet diagnosis unavailable: {exc}"
+
+
+def _build_discovery_diagnosis(question: str, merged: Dict[str, Any]) -> str:
+    window_minutes = int((merged.get("window") or {}).get("duration_minutes", 0) or 0)
+    system_prompt = (
+        "You are a session log analyst for an AWS Bedrock AgentCore system. "
+        "You are answering a fleet discovery question over multiple sessions. "
+        "Use only the provided session summaries, user summaries, bottleneck ranking, and top anomalies. "
+        "Return a concise executive summary first, then the top slow/problem sessions with short causes. "
+        "Do not restate the full dataset. Do not explain methodology. "
+        "Plain text only. No markdown, no tables, no emojis. "
+        "Prefer 6-10 short paragraphs or lines total. "
+        "If sessions are truncated, say that conclusions are based on the highest-risk sessions shown. "
+        "Do not fabricate values."
+    )
+
+    context_json = json.dumps(merged, default=str)
+    user_question = question.strip() if question and question.strip() else "Summarize the slowest and most problematic sessions in this window."
+    user_content = (
+        f"Window size: {window_minutes} minutes.\n"
+        "Here is the compact discovery context for the highest-risk sessions in the selected window.\n"
+        f"Context: {context_json}\n"
+        f"Question: {user_question}"
+    )
+
+    try:
+        response = BEDROCK_CLIENT.converse(
+            modelId=DIAGNOSIS_MODEL_ID,
+            system=[{"text": system_prompt}],
+            messages=[{"role": "user", "content": [{"text": user_content}]}],
+            inferenceConfig={"maxTokens": DIAGNOSIS_FLEET_DISCOVERY_MAX_TOKENS, "temperature": 0.1},
+        )
+        return response["output"]["message"]["content"][0]["text"]
+    except Exception as exc:
+        return f"Fleet discovery unavailable: {exc}"
 
 
 def _compute_response_relevance(trace_diagnostics: List[Dict[str, Any]]) -> float:
@@ -1725,11 +2029,250 @@ def _compute_response_relevance_from_traces(all_traces: List[Dict[str, Any]]) ->
     return None
 
 
+def _is_known_user_id(value: str) -> bool:
+    text = str(value or "").strip().lower()
+    return bool(text and text not in {"unknown", "unknown-user", "anonymous", "none"})
+
+
+def _normalize_session_id(value: str) -> str:
+    text = str(value or "").strip()
+    return text if text else "unknown-session"
+
+
+def _derive_session_user(traces: List[Dict[str, Any]]) -> Dict[str, str]:
+    if not traces:
+        return {
+            "user_id": "unknown-user",
+            "user_name": "unknown",
+            "department": "unknown",
+            "user_role": "unknown",
+        }
+
+    frequency: Dict[str, int] = {}
+    profile_by_user_id: Dict[str, Dict[str, str]] = {}
+
+    for trace in traces:
+        user = trace.get("user", {}) if isinstance(trace.get("user", {}), dict) else {}
+        user_id = str(user.get("user_id", "")).strip()
+        if not _is_known_user_id(user_id):
+            continue
+        frequency[user_id] = frequency.get(user_id, 0) + 1
+        if user_id not in profile_by_user_id:
+            profile_by_user_id[user_id] = {
+                "user_id": user_id,
+                "user_name": str(user.get("user_name", "unknown") or "unknown"),
+                "department": str(user.get("department", "unknown") or "unknown"),
+                "user_role": str(user.get("user_role", "unknown") or "unknown"),
+            }
+
+    if frequency:
+        winner = sorted(frequency.items(), key=lambda item: (-item[1], item[0]))[0][0]
+        return profile_by_user_id.get(winner, {
+            "user_id": winner,
+            "user_name": "unknown",
+            "department": "unknown",
+            "user_role": "unknown",
+        })
+
+    for trace in traces:
+        user = trace.get("user", {}) if isinstance(trace.get("user", {}), dict) else {}
+        if user:
+            user_id = str(user.get("user_id", "")).strip() or "unknown-user"
+            return {
+                "user_id": user_id,
+                "user_name": str(user.get("user_name", "unknown") or "unknown"),
+                "department": str(user.get("department", "unknown") or "unknown"),
+                "user_role": str(user.get("user_role", "unknown") or "unknown"),
+            }
+
+    return {
+        "user_id": "unknown-user",
+        "user_name": "unknown",
+        "department": "unknown",
+        "user_role": "unknown",
+    }
+
+
+def _build_session_and_user_layers(
+    runtime_records: List[Dict[str, Any]],
+    evaluator_records: List[Dict[str, Any]],
+    all_traces: List[Dict[str, Any]],
+    trace_diagnostics: List[Dict[str, Any]],
+    runtime_details_by_trace: Dict[str, Dict[str, Any]],
+    xray_summaries: Dict[str, Dict[str, Any]],
+    max_sessions: int = 20,
+    max_traces_per_session: int = 20,
+) -> Dict[str, Any]:
+    sessions_map: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    trace_primary_session: Dict[str, str] = {}
+    trace_session_votes: Dict[str, Dict[str, int]] = {}
+
+    def _ensure_slot(session_id: str, trace_id: str) -> Dict[str, Any]:
+        session_bucket = sessions_map.setdefault(session_id, {})
+        return session_bucket.setdefault(
+            trace_id,
+            {
+                "runtime_logs": [],
+                "evaluator_logs": [],
+                "otel_logs": [],
+                "xray_data": [],
+            },
+        )
+
+    for rec in runtime_records:
+        trace_id = _normalize_trace_id(str(rec.get("xray_trace_id", "")))
+        if not trace_id:
+            continue
+        session_id = _normalize_session_id(str(rec.get("session_id", "")))
+        _ensure_slot(session_id, trace_id)["runtime_logs"].append(rec)
+        votes = trace_session_votes.setdefault(trace_id, {})
+        votes[session_id] = votes.get(session_id, 0) + 1
+
+    for rec in evaluator_records:
+        message = str(rec.get("_cloudwatch_message", ""))
+        trace_id = _extract_trace_id_from_payload(rec, message)
+        if not trace_id:
+            continue
+        anchors = _extract_record_anchors(rec)
+        session_id = _normalize_session_id(str(anchors.get("session_id", "")))
+        slot = _ensure_slot(session_id, trace_id)
+        slot["evaluator_logs"].append(rec)
+        if isinstance(rec, dict) and (rec.get("attributes") or rec.get("traceId") or rec.get("trace_id")):
+            slot["otel_logs"].append(rec)
+        votes = trace_session_votes.setdefault(trace_id, {})
+        votes[session_id] = votes.get(session_id, 0) + 1
+
+    for trace_id, vote_map in trace_session_votes.items():
+        if not vote_map:
+            continue
+        ranked = sorted(vote_map.items(), key=lambda item: (-item[1], item[0] == "unknown-session", item[0]))
+        trace_primary_session[trace_id] = ranked[0][0]
+
+    trace_by_id = {str(row.get("trace_id", "")): row for row in trace_diagnostics}
+    for trace in all_traces:
+        trace_id = str(trace.get("trace_id", ""))
+        if not trace_id:
+            continue
+        session_id = _normalize_session_id(trace_primary_session.get(trace_id, ""))
+        _ensure_slot(session_id, trace_id)
+        if trace_id in xray_summaries:
+            sessions_map[session_id][trace_id]["xray_data"].append(xray_summaries[trace_id])
+
+    session_rows: List[Dict[str, Any]] = []
+    for session_id, trace_slots in sessions_map.items():
+        traces_for_session: List[Dict[str, Any]] = []
+        latest_ts = 0.0
+        for trace_id, _slot in trace_slots.items():
+            base_trace = trace_by_id.get(trace_id)
+            if not base_trace:
+                continue
+            traces_for_session.append(base_trace)
+            latest_ts = max(latest_ts, _to_float((runtime_details_by_trace.get(trace_id, {}) or {}).get("_ts")))
+
+        traces_for_session.sort(
+            key=lambda row: _to_float((runtime_details_by_trace.get(str(row.get("trace_id", "")), {}) or {}).get("_ts")),
+            reverse=True,
+        )
+        traces_for_session = traces_for_session[:max_traces_per_session]
+
+        e2e_values = [
+            _to_float((row.get("stage_latency_ms") or {}).get("e2e"))
+            for row in traces_for_session
+            if _to_float((row.get("stage_latency_ms") or {}).get("e2e")) > 0
+        ]
+        trace_count = len(traces_for_session)
+        errors = sum(1 for row in traces_for_session if str(row.get("status", "success")).lower() != "success")
+        delayed = sum(1 for row in traces_for_session if bool(row.get("is_delayed")))
+
+        session_rows.append(
+            {
+                "session_id": session_id,
+                "latest_trace_ts": latest_ts,
+                "user": _derive_session_user(traces_for_session),
+                "trace_count": trace_count,
+                "traces": traces_for_session,
+                "session_metrics": {
+                    "avg_e2e_ms": round(sum(e2e_values) / len(e2e_values), 2) if e2e_values else 0.0,
+                    "max_e2e_ms": round(max(e2e_values), 2) if e2e_values else 0.0,
+                    "error_rate": round(errors / trace_count, 4) if trace_count else 0.0,
+                    "delayed_rate": round(delayed / trace_count, 4) if trace_count else 0.0,
+                },
+            }
+        )
+
+    session_rows.sort(key=lambda row: _to_float(row.get("latest_trace_ts")), reverse=True)
+    session_rows = session_rows[:max_sessions]
+
+    sessions_output: Dict[str, Dict[str, Any]] = {
+        row["session_id"]: {
+            "session_id": row["session_id"],
+            "user": row.get("user", {}),
+            "trace_count": row.get("trace_count", 0),
+            "traces": row.get("traces", []),
+            "session_metrics": row.get("session_metrics", {}),
+        }
+        for row in session_rows
+    }
+
+    users_map: Dict[str, Dict[str, Any]] = {}
+    for row in session_rows:
+        user = row.get("user", {}) if isinstance(row.get("user", {}), dict) else {}
+        user_id = str(user.get("user_id", "")).strip() or "unknown-user"
+        user_bucket = users_map.setdefault(
+            user_id,
+            {
+                "user_id": user_id,
+                "user_name": str(user.get("user_name", "unknown") or "unknown"),
+                "sessions": [],
+                "total_traces": 0,
+            },
+        )
+        user_bucket["sessions"].append(row["session_id"])
+        user_bucket["total_traces"] += int(row.get("trace_count", 0) or 0)
+
+    for user_bucket in users_map.values():
+        user_bucket["sessions"] = sorted(set(user_bucket.get("sessions", [])))
+        user_bucket["session_count"] = len(user_bucket["sessions"])
+
+    total_sessions = len(sessions_output)
+    total_traces = sum(int(row.get("trace_count", 0) or 0) for row in session_rows)
+    fleet_summary = {
+        "total_sessions": total_sessions,
+        "total_traces": total_traces,
+        "avg_traces_per_session": round(total_traces / total_sessions, 2) if total_sessions else 0.0,
+    }
+
+    return {
+        "sessions": sessions_output,
+        "users": users_map,
+        "fleet_summary": fleet_summary,
+        "session_debug": {
+            "total_sessions_created": total_sessions,
+            "traces_per_session": {row["session_id"]: int(row.get("trace_count", 0) or 0) for row in session_rows},
+            "users_detected": len(users_map),
+            "sessions_per_user": {uid: len(data.get("sessions", [])) for uid, data in users_map.items()},
+        },
+    }
+
+
 def _compact_fleet_merged(merged: Dict[str, Any]) -> Dict[str, Any]:
     delayed = merged.get("delayed_traces", [])
+    sessions = merged.get("sessions", {}) if isinstance(merged.get("sessions", {}), dict) else {}
+    users = merged.get("users", {}) if isinstance(merged.get("users", {}), dict) else {}
+    session_items = list(sessions.items())[:200]  # return all collected sessions to client
+    compact_sessions = {
+        sid: {
+            **(session_obj if isinstance(session_obj, dict) else {}),
+            "traces": (session_obj.get("traces", []) if isinstance(session_obj, dict) else [])[:50],
+        }
+        for sid, session_obj in session_items
+    }
     return {
         "analysis_mode": merged.get("analysis_mode"),
         "window": merged.get("window", {}),
+        "sessions": compact_sessions,
+        "users": users,
+        "fleet_summary": merged.get("fleet_summary", {}),
         "trace_lookup": merged.get("trace_lookup", {}),
         "quality_indicators": merged.get("quality_indicators", {}),
         "sources": merged.get("sources", {}),
@@ -1738,14 +2281,344 @@ def _compact_fleet_merged(merged: Dict[str, Any]) -> Dict[str, Any]:
         "delay_threshold_ms": merged.get("delay_threshold_ms", 0),
         "delayed_traces_count": merged.get("delayed_traces_count", len(delayed)),
         "user_metadata_summary": merged.get("user_metadata_summary", {}),
-        "top_anomalies": merged.get("top_anomalies", [])[:10],
-        "delayed_traces": delayed[:10],
-        "trace_index": merged.get("trace_index", [])[:150],
-        "trace_diagnostics": merged.get("trace_diagnostics", [])[:150],
+        "top_anomalies": merged.get("top_anomalies", [])[:20],
+        "delayed_traces": delayed[:20],
+        "trace_index": merged.get("trace_index", [])[:200],
+        "trace_diagnostics": merged.get("trace_diagnostics", [])[:200],
         "trace_samples": merged.get("trace_samples", [])[:5],
         "xray_trace_details": merged.get("xray_trace_details", [])[:40],
         "pagination_context": merged.get("pagination_context", {}),
         "evaluator_groups_used": merged.get("evaluator_groups_used", [])[:10],
+        "sessions_pagination_context": merged.get("sessions_pagination_context", {}),
+    }
+
+
+def _extract_requested_user_text(question: str) -> str:
+    text = (question or "").strip()
+    if not text:
+        return ""
+    patterns = [
+        r"(?:sessions?|traces?)\s+for\s+(?:user\s+)?([a-zA-Z0-9._@-]{3,64})",
+        r"(?:for|of)\s+user\s+([a-zA-Z0-9._@-]{3,64})",
+        r"user\s+([a-zA-Z0-9._@-]{3,64})",
+    ]
+    lowered = text.lower()
+    for pattern in patterns:
+        match = re.search(pattern, lowered)
+        if match:
+            return str(match.group(1) or "").strip()
+    return ""
+
+
+def _resolve_user_from_question(question: str, users: Dict[str, Any]) -> Dict[str, str]:
+    """Find a user referenced in the question by user_id or user_name.
+
+    Returns {"user_id": ..., "user_name": ...} when matched; otherwise {}.
+    """
+    q = (question or "").strip().lower()
+    if not q or not isinstance(users, dict):
+        return {}
+
+    candidates: List[Dict[str, str]] = []
+    for user_id, user_data in users.items():
+        bucket = user_data if isinstance(user_data, dict) else {}
+        uid = str(user_id or bucket.get("user_id", "")).strip()
+        uname = str(bucket.get("user_name", "")).strip()
+        aliases = {uid.lower(), uname.lower()}
+        for alias in aliases:
+            if not alias or alias in {"unknown", "unknown-user", "anonymous", "none"}:
+                continue
+            if re.search(rf"\b{re.escape(alias)}\b", q):
+                candidates.append(
+                    {
+                        "user_id": uid,
+                        "user_name": uname or "unknown",
+                        "matched_alias": alias,
+                    }
+                )
+
+    if not candidates:
+        return {}
+
+    # Prefer the most specific match (longest alias), then stable user_id order.
+    candidates.sort(key=lambda item: (-len(item.get("matched_alias", "")), item.get("user_id", "")))
+    winner = candidates[0]
+    return {"user_id": winner.get("user_id", ""), "user_name": winner.get("user_name", "unknown")}
+
+
+def _detect_query_mode(question: str, sessions: Dict[str, Any], users: Dict[str, Any]) -> Dict[str, Any]:
+    """Detect deep-dive session asks and user-focused discovery asks.
+
+    - deep_dive: question explicitly references a known session_id
+    - discovery (+ user filter): question references a known user by id/name
+    - discovery (unfiltered): default
+    """
+    q = (question or "").lower()
+    for sid in sessions.keys():
+        if sid.lower() in q:
+            return {"mode": "deep_dive", "session_id": sid}
+
+    matched_user = _resolve_user_from_question(question, users)
+    if matched_user:
+        return {
+            "mode": "discovery",
+            "user_id": matched_user.get("user_id", ""),
+            "user_name": matched_user.get("user_name", "unknown"),
+        }
+
+    requested_user = _extract_requested_user_text(question)
+    if requested_user:
+        return {"mode": "discovery", "requested_user": requested_user}
+
+    return {"mode": "discovery"}
+
+
+def _build_discovery_context(merged: Dict[str, Any], query_intent: Dict[str, Any] = None) -> Dict[str, Any]:
+    """Build a lightweight fleet discovery context for the LLM.
+
+    Sends per-session summary stats and the user index only — NO individual trace
+    rows.  Token count stays small regardless of window size (3-day, 1-week, etc.)
+    and Bedrock should respond in <5 s for any fleet size.
+    """
+    sessions = merged.get("sessions") or {}
+    users = merged.get("users") or {}
+    intent = query_intent or {}
+    filter_user_id = str(intent.get("user_id", "")).strip()
+    requested_user = str(intent.get("requested_user", "")).strip()
+
+    filtered_sessions = sessions
+    filtered_users = users
+    user_filter_meta = {}
+    sessions_pagination_context = merged.get("sessions_pagination_context", {}) if isinstance(merged.get("sessions_pagination_context", {}), dict) else {}
+
+    if filter_user_id:
+        filtered_sessions = {
+            sid: sess
+            for sid, sess in sessions.items()
+            if str(((sess or {}).get("user") or {}).get("user_id", "")).strip() == filter_user_id
+        }
+        filtered_users = {filter_user_id: users.get(filter_user_id, {})} if filter_user_id in users else {}
+        user_filter_meta = {
+            "requested_user": intent.get("user_name") or filter_user_id,
+            "resolved_user_id": filter_user_id,
+            "matched": bool(filtered_sessions),
+            "sessions_found": len(filtered_sessions),
+        }
+    elif requested_user:
+        user_filter_meta = {
+            "requested_user": requested_user,
+            "matched": False,
+            "sessions_found": 0,
+        }
+
+    paged_sessions = filtered_sessions
+    if sessions_pagination_context:
+        page = int(sessions_pagination_context.get("page", 1) or 1)
+        page_size = int(sessions_pagination_context.get("page_size", LLM_DISCOVERY_MAX_SESSIONS) or LLM_DISCOVERY_MAX_SESSIONS)
+        paged_sessions, _, _ = _apply_pagination_to_sessions(filtered_sessions, page=page, page_size=page_size)
+        if paged_sessions:
+            paged_user_ids = {
+                str((((sess or {}).get("user") or {}).get("user_id", "")).strip())
+                for sess in paged_sessions.values()
+                if isinstance(sess, dict)
+            }
+            filtered_users = {
+                user_id: user_obj
+                for user_id, user_obj in filtered_users.items()
+                if str(user_id).strip() in paged_user_ids
+            }
+
+    # Build the per-session summary rows for all filtered sessions (used in
+    # the response body / pagination).  For the LLM we only include the top
+    # LLM_DISCOVERY_MAX_SESSIONS entries sorted by error-rate then max-latency
+    # so Bedrock never sees more than ~12KB of input regardless of window size.
+    all_session_rows = [
+        (
+            sid,
+            {
+                "session_id": sid,
+                "user": sess.get("user", {}),
+                "trace_count": sess.get("trace_count", 0),
+                "avg_latency_ms": (sess.get("session_metrics") or {}).get("avg_e2e_ms"),
+                "max_latency_ms": (sess.get("session_metrics") or {}).get("max_e2e_ms"),
+                "error_rate": (sess.get("session_metrics") or {}).get("error_rate"),
+                "delayed_rate": (sess.get("session_metrics") or {}).get("delayed_rate"),
+            },
+        )
+        for sid, sess in paged_sessions.items()
+        if isinstance(sess, dict)
+    ]
+    # Sort: highest error_rate first, then highest max_latency, so the LLM
+    # cap keeps the most problematic sessions visible.
+    all_session_rows.sort(
+        key=lambda item: (
+            -_to_float((item[1] or {}).get("error_rate")),
+            -_to_float((item[1] or {}).get("max_latency_ms")),
+        )
+    )
+    total_sessions_count = len(filtered_sessions)
+    sessions_on_page_count = len(all_session_rows)
+    llm_session_rows = all_session_rows[:LLM_DISCOVERY_MAX_SESSIONS]
+    sessions_truncated = sessions_on_page_count > LLM_DISCOVERY_MAX_SESSIONS
+
+    return {
+        "analysis_mode": "discovery",
+        "window": merged.get("window", {}),
+        "fleet_summary": {
+            "total_sessions": total_sessions_count,
+            "total_traces": sum(int((sess or {}).get("trace_count", 0) or 0) for sess in paged_sessions.values()),
+            "sessions_on_page": sessions_on_page_count,
+            "sessions_shown_to_llm": len(llm_session_rows),
+            "sessions_truncated": sessions_truncated,
+        },
+        "fleet_metrics": merged.get("fleet_metrics", {}),
+        "quality_indicators": merged.get("quality_indicators", {}),
+        "users": filtered_users,
+        "sessions": dict(llm_session_rows),
+        "bottleneck_ranking": merged.get("bottleneck_ranking", [])[:10],
+        "top_anomalies": [
+            {
+                "trace_id": t.get("trace_id", ""),
+                "e2e_ms": t.get("e2e_ms"),
+                "status": t.get("status", "success"),
+                "user": t.get("user", {}),
+            }
+            for t in (merged.get("top_anomalies") or [])[:10]
+        ],
+        "trace_lookup": merged.get("trace_lookup", {}),
+        "pagination_context": merged.get("pagination_context", {}),
+        "sessions_pagination_context": merged.get("sessions_pagination_context", {}),
+        "user_filter": user_filter_meta,
+    }
+
+
+
+def _build_deep_dive_context(merged: Dict[str, Any], session_id: str) -> Dict[str, Any]:
+    """Build full-data context for a single-session deep dive.
+
+    Includes every trace with evaluator scores, xray timing / slowest-step, token
+    usage, model invocation excerpt, and user identity.  Because only ONE session is
+    sent to the LLM the token count stays well within Bedrock limits even for
+    sessions with 100+ traces.
+    """
+    sessions = merged.get("sessions") or {}
+    session = sessions.get(session_id)
+
+    if not session:
+        return {
+            "analysis_mode": "deep_dive",
+            "error": f"Session {session_id} not found in this time window.",
+            "available_sessions": list(sessions.keys())[:20],
+        }
+
+    # Pull enriched xray details scoped to this session's traces
+    session_trace_ids = {
+        str(tr.get("trace_id", ""))
+        for tr in session.get("traces", [])
+        if isinstance(tr, dict)
+    }
+    xray_details_for_session = [
+        d for d in (merged.get("xray_trace_details") or [])
+        if str((d or {}).get("trace_id", "")) in session_trace_ids
+    ]
+
+    return {
+        "analysis_mode": "deep_dive",
+        "window": merged.get("window", {}),
+        "session": {
+            "session_id": session_id,
+            "user": session.get("user", {}),
+            "trace_count": session.get("trace_count", 0),
+            "traces": session.get("traces", []),
+            "session_metrics": session.get("session_metrics", {}),
+        },
+        "xray_trace_details": xray_details_for_session,
+        "fleet_context": {
+            "total_sessions": (merged.get("fleet_summary") or {}).get("total_sessions", 0),
+            "fleet_avg_e2e_ms": ((merged.get("fleet_metrics") or {}).get("e2e_ms") or {}).get("avg", 0),
+        },
+    }
+
+
+def _build_llm_analysis_context(merged: Dict[str, Any], max_diag_traces: int = 25) -> Dict[str, Any]:
+    """Build an ultra-compact dict for the LLM call only.
+
+    Strips token-heavy fields the LLM does not need (prompt/answer excerpts,
+    token usage, raw tool call lists, reasoning steps, full X-Ray segment trees)
+    while preserving every session ID, every trace ID, user identity, latency
+    metrics, evaluator scores (score+label only), and slim X-Ray timing/error flags.
+
+    The full detail is kept in the original ``merged`` dict returned to the client.
+    """
+    def _slim_xray(raw: Any) -> Dict[str, Any]:
+        if not isinstance(raw, dict):
+            return {}
+        return {k: raw[k] for k in ("duration_ms", "has_error", "has_fault", "has_throttle", "slowest_step") if k in raw}
+
+    def _slim_eval(scores: Any) -> Any:
+        if not isinstance(scores, dict):
+            return {}
+        return {
+            k: {"score": v.get("score"), "label": v.get("label")}
+            if isinstance(v, dict) else v
+            for k, v in scores.items()
+        }
+
+    def _slim_trace_diag(tr: Dict[str, Any]) -> Dict[str, Any]:
+        e2e = tr.get("e2e_ms") or (tr.get("stage_latency_ms") or {}).get("e2e") or 0
+        return {
+            "trace_id": str(tr.get("trace_id", "")),
+            "status": str(tr.get("status", "success")),
+            "is_delayed": bool(tr.get("is_delayed", False)),
+            "e2e_ms": round(_to_float(e2e), 2),
+            "stage_ms": tr.get("stage_latency_ms") or {
+                "runtime": tr.get("runtime_latency_ms"),
+                "evaluator": tr.get("evaluator_latency_ms"),
+                "e2e": tr.get("e2e_ms"),
+            },
+            "user": tr.get("user", {}),
+            "evaluator_scores": _slim_eval(tr.get("evaluator_scores") or tr.get("evaluator_metrics") or {}),
+            "xray": _slim_xray(tr.get("xray") or {}),
+        }
+
+    # Sessions: keep ALL session IDs + ALL trace IDs, lightweight per-trace refs
+    slim_sessions: Dict[str, Any] = {}
+    for sid, sess in (merged.get("sessions") or {}).items():
+        if not isinstance(sess, dict):
+            continue
+        slim_traces = []
+        for tr in sess.get("traces", []):
+            if isinstance(tr, dict):
+                e2e = tr.get("e2e_ms") or (tr.get("stage_latency_ms") or {}).get("e2e") or 0
+                slim_traces.append({
+                    "trace_id": str(tr.get("trace_id", "")),
+                    "status": str(tr.get("status", "success")),
+                    "e2e_ms": round(_to_float(e2e), 2),
+                    "is_delayed": bool(tr.get("is_delayed", False)),
+                })
+        slim_sessions[sid] = {
+            "session_id": sid,
+            "user": sess.get("user", {}),
+            "trace_count": sess.get("trace_count", len(slim_traces)),
+            "traces": slim_traces,
+            "session_metrics": sess.get("session_metrics", {}),
+        }
+
+    return {
+        "analysis_mode": merged.get("analysis_mode"),
+        "window": merged.get("window", {}),
+        "fleet_summary": merged.get("fleet_summary", {}),
+        "fleet_metrics": merged.get("fleet_metrics", {}),
+        "quality_indicators": merged.get("quality_indicators", {}),
+        "users": merged.get("users", {}),
+        "bottleneck_ranking": merged.get("bottleneck_ranking", []),
+        "sessions": slim_sessions,
+        "trace_diagnostics": [_slim_trace_diag(t) for t in (merged.get("trace_diagnostics") or [])[:max_diag_traces]],
+        "top_anomalies": [_slim_trace_diag(t) for t in (merged.get("top_anomalies") or [])[:10]],
+        "delayed_traces": [_slim_trace_diag(t) for t in (merged.get("delayed_traces") or [])[:10]],
+        "trace_lookup": merged.get("trace_lookup", {}),
+        "pagination_context": merged.get("pagination_context", {}),
+        "sessions_pagination_context": merged.get("sessions_pagination_context", {}),
     }
 
 
@@ -1788,6 +2661,19 @@ def _handle_fleet_insights(question: str, lookback_hours: int, lookback_mode: st
         xray_max_segments = max(1, FLEET_FAST_XRAY_MAX_SEGMENTS)
         xray_pages_per_segment = max(1, FLEET_FAST_XRAY_MAX_PAGES_PER_SEGMENT)
 
+    # Medium-mode: windows > 2 days (but not fast_mode). Tighter budgets AND record caps
+    # to prevent session-building + LLM from exceeding the 29s API Gateway timeout.
+    medium_mode = (window_minutes >= 2 * 24 * 60) and (not fast_mode) and (not is_analytical_overall)
+    if medium_mode:
+        runtime_limit = min(runtime_limit, 600)
+        runtime_max_candidate_streams = min(runtime_max_candidate_streams, 1200)
+        runtime_budget_seconds = min(runtime_budget_seconds, 5.0)
+        evaluator_max_groups = min(evaluator_max_groups, 3)
+        evaluator_per_group_limit = min(evaluator_per_group_limit, 100)
+        evaluator_budget_seconds = min(evaluator_budget_seconds, 3.0)
+        xray_max_traces = min(xray_max_traces, 120)
+        xray_budget_seconds = min(xray_budget_seconds, 3.0)
+
     # ── Emit start trace (Strands-style structured logging) ────────────────────
     _emit_analyzer_trace({
         "phase": "data_collection_start",
@@ -1803,25 +2689,30 @@ def _handle_fleet_insights(question: str, lookback_hours: int, lookback_mode: st
         "question_excerpt": question[:120] if question else "",
     })
 
-    # ── Run all three data sources IN PARALLEL to stay within API Gateway 29s timeout ──
-    # Sequential was: runtime(≤15s) + evaluator(≤8s) + xray(≤8s) = ≤31s → timeout
-    # Parallel wall time ≈ max(runtime, evaluator, xray) + LLM ≈ 10s + 8s = 18s ✓
-    with ThreadPoolExecutor(max_workers=3) as executor:
-        runtime_future = executor.submit(
+    # ── Run all three data sources IN PARALLEL ───────────────────────────────────
+    # IMPORTANT: Do NOT use `with ThreadPoolExecutor() as executor:` here.
+    # Python's context-manager __exit__ calls shutdown(wait=True), which blocks
+    # until ALL threads finish — even after future.result(timeout=X) raises
+    # FutureTimeoutError.  That made every hard timeout completely ineffective and
+    # was the root cause of all the 503 errors on large time windows.
+    # Using shutdown(wait=False) lets us return as soon as results are collected.
+    _data_executor = ThreadPoolExecutor(max_workers=3)
+    try:
+        runtime_future = _data_executor.submit(
             _fetch_runtime_records_window,
             lookback_hours=lookback_hours,
             limit=runtime_limit,
             max_seconds=runtime_budget_seconds,
             max_candidate_streams=runtime_max_candidate_streams,
         )
-        evaluator_future = executor.submit(
+        evaluator_future = _data_executor.submit(
             _fetch_evaluator_records_window,
             lookback_hours=lookback_hours,
             max_groups=evaluator_max_groups,
             per_group_limit=evaluator_per_group_limit,
             max_seconds=evaluator_budget_seconds,
         )
-        xray_future = executor.submit(
+        xray_future = _data_executor.submit(
             _fetch_xray_trace_summaries_window,
             lookback_hours=lookback_hours,
             max_traces=xray_max_traces,
@@ -1829,9 +2720,31 @@ def _handle_fleet_insights(question: str, lookback_hours: int, lookback_mode: st
             max_segments_limit=xray_max_segments,
             max_pages_per_segment=xray_pages_per_segment,
         )
-        runtime_fetch = runtime_future.result()
-        evaluator_fetch = evaluator_future.result()
-        xray_summaries = xray_future.result()
+        try:
+            runtime_fetch = runtime_future.result(timeout=runtime_budget_seconds + 2.0)
+        except FutureTimeoutError:
+            runtime_fetch = {
+                "records": [],
+                "source_stats": {
+                    "fixed_stream_name": RUNTIME_LOG_STREAM,
+                    "fixed_stream_records": 0,
+                    "backfill_records": 0,
+                    "backfill_streams": [],
+                },
+            }
+        try:
+            evaluator_fetch = evaluator_future.result(timeout=evaluator_budget_seconds + 2.0)
+        except FutureTimeoutError:
+            evaluator_fetch = {"records": [], "groups_used": []}
+        try:
+            xray_summaries = xray_future.result(timeout=xray_budget_seconds + 2.0)
+        except FutureTimeoutError:
+            xray_summaries = {}
+    finally:
+        # Detach threads immediately — any stalled CloudWatch API call finishes in
+        # the background while Lambda proceeds to build and return the response.
+        # cancel_futures=True (Python 3.9+) discards queued-but-not-started futures.
+        _data_executor.shutdown(wait=False, cancel_futures=True)
 
     data_elapsed = round(time.perf_counter() - handler_start, 2)
     runtime_records = runtime_fetch["records"]
@@ -2117,13 +3030,40 @@ def _handle_fleet_insights(question: str, lookback_hours: int, lookback_mode: st
     if response_relevance is None:
         response_relevance = _compute_response_relevance_from_traces(all_traces)
     
+    session_build_max_sessions = 200  # collect ALL sessions; response cap is in _compact_fleet_merged
+    session_build_max_traces = 100    # collect ALL traces per session; response cap applied there
+    
+    session_build_start = time.perf_counter()
+    session_layers = _build_session_and_user_layers(
+        runtime_records=runtime_records,
+        evaluator_records=evaluator_records,
+        all_traces=all_traces,
+        trace_diagnostics=trace_diagnostics,
+        runtime_details_by_trace=runtime_details_by_trace,
+        xray_summaries=xray_summaries,
+        max_sessions=session_build_max_sessions,
+        max_traces_per_session=session_build_max_traces,
+    )
+    session_build_elapsed = round(time.perf_counter() - session_build_start, 3)
+    
+    _emit_analyzer_trace({
+        "phase": "session_building_complete",
+        "analysis_id": analysis_id,
+        "session_build_seconds": session_build_elapsed,
+        "sessions_created": len(session_layers.get("sessions", {})),
+        "users_created": len(session_layers.get("users", {})),
+    })
+
     merged = {
-        "analysis_mode": "fleet_window",
+        "analysis_mode": "multi_session_window",
         "window": {
             "start_epoch_ms": int((now_ts - lookback_hours * 3600) * 1000),
             "end_epoch_ms": int(now_ts * 1000),
             "duration_minutes": int(lookback_hours * 60),
         },
+        "sessions": session_layers.get("sessions", {}),
+        "users": session_layers.get("users", {}),
+        "fleet_summary": session_layers.get("fleet_summary", {}),
         "quality_indicators": {
             "response_relevance": response_relevance,
             "response_relevance_status": (
@@ -2173,7 +3113,30 @@ def _handle_fleet_insights(question: str, lookback_hours: int, lookback_mode: st
         "evaluator_groups_used": evaluator_groups_used,
         "trace_samples": top_anomalies[:5],
     }
-    
+
+    session_debug = session_layers.get("session_debug", {}) if isinstance(session_layers.get("session_debug", {}), dict) else {}
+    _emit_analyzer_trace({
+        "phase": "session_user_index_built",
+        "analysis_id": analysis_id,
+        "total_sessions": int((merged.get("fleet_summary", {}) or {}).get("total_sessions", 0) or 0),
+        "total_traces": int((merged.get("fleet_summary", {}) or {}).get("total_traces", 0) or 0),
+        "users_detected": int(session_debug.get("users_detected", 0) or 0),
+        "traces_per_session": session_debug.get("traces_per_session", {}),
+        "sessions_per_user": session_debug.get("sessions_per_user", {}),
+    })
+
+    # ── EARLY QUERY INTENT DETECTION ─────────────────────────────────────────────
+    # Detect mode NOW — before copy.deepcopy, XRay detail fetch, and enrichment loops.
+    # DISCOVERY mode (session summaries / user queries / fleet overview) only needs
+    # the per-session stats already in `merged` — skip all expensive pre-LLM work.
+    # DEEP DIVE mode (question names a specific session ID) needs full XRay detail.
+    query_intent = _detect_query_mode(
+        question,
+        merged.get("sessions", {}),
+        merged.get("users", {}),
+    )
+    _is_deep_dive = (query_intent["mode"] == "deep_dive")
+
     # ── Check elapsed time before invoking LLM ──────────────────────────────────
     pre_llm_elapsed = round(time.perf_counter() - handler_start, 2)
     remaining_budget = 29.0 - pre_llm_elapsed  # API Gateway timeout ~29s
@@ -2192,6 +3155,7 @@ def _handle_fleet_insights(question: str, lookback_hours: int, lookback_mode: st
     )
 
     pagination_info = {}
+    sessions_pagination_info: Dict[str, Any] = {}
     trace_lookup_context: Dict[str, Any] = {}
     traces_for_llm = all_traces
     selected_trace_ids_for_llm: List[str] = [str(t.get("trace_id", "")) for t in all_traces]
@@ -2246,7 +3210,10 @@ def _handle_fleet_insights(question: str, lookback_hours: int, lookback_mode: st
             "traces_for_llm": len(traces_for_llm),
         })
 
-    merged_for_llm = copy.deepcopy(merged)
+    # For DISCOVERY mode `merged` is used directly, so an expensive deep-copy is
+    # unnecessary.  An empty stub lets all subsequent `merged_for_llm[x] = …`
+    # assignments succeed harmlessly and the copy-back loop becomes a no-op.
+    merged_for_llm = copy.deepcopy(merged) if _is_deep_dive else {}
     apply_trace_filter = bool(requested_trace_ids) or should_paginate
     selected_trace_ids_set = set(selected_trace_ids_for_llm)
     if apply_trace_filter:
@@ -2273,23 +3240,108 @@ def _handle_fleet_insights(question: str, lookback_hours: int, lookback_mode: st
 
     if trace_lookup_context:
         merged_for_llm["trace_lookup"] = trace_lookup_context
+        merged["trace_lookup"] = trace_lookup_context
 
     if pagination_info:
-        merged_for_llm["pagination_context"] = {
+        _pc = {
             "page": pagination_info.get("page", 1),
             "page_size": pagination_info.get("page_size", page_size),
             "total_traces": len(all_traces),
             "total_pages": pagination_info.get("total_pages", 1),
             "traces_on_this_page": len(traces_for_llm),
         }
+        merged_for_llm["pagination_context"] = _pc
+        merged["pagination_context"] = _pc
 
-    detailed_xray_budget = min(6.0, max(1.0, remaining_budget - 7.0))
-    detailed_xray_ids = selected_trace_ids_for_llm[:max(1, min(page_size, 20))] if selected_trace_ids_for_llm else []
-    detailed_xray_by_trace = _fetch_detailed_xray_for_trace_ids(
-        detailed_xray_ids,
-        max_seconds=detailed_xray_budget,
-        max_workers=6,
+    # ── Session pagination ────────────────────────────────────────────────────
+    total_sessions = len((merged if not _is_deep_dive else merged_for_llm).get("sessions", {}))
+    should_paginate_sessions_flag = _should_paginate_sessions(
+        question=question,
+        sessions_total=total_sessions,
+        page_size=page_size,
+        pre_llm_elapsed=pre_llm_elapsed,
+        remaining_budget_seconds=remaining_budget,
     )
+    if should_paginate_sessions_flag:
+        effective_session_page_size = page_size
+        if not _is_deep_dive:
+            if _is_bulk_user_listing_question(question):
+                effective_session_page_size = min(effective_session_page_size, 4)
+            elif _is_bulk_session_listing_question(question):
+                effective_session_page_size = min(effective_session_page_size, 6)
+            else:
+                effective_session_page_size = min(effective_session_page_size, LLM_DISCOVERY_MAX_SESSIONS)
+
+        paged_sessions, sess_total_pages, sess_has_next = _apply_pagination_to_sessions(
+            (merged if not _is_deep_dive else merged_for_llm).get("sessions", {}), page, effective_session_page_size
+        )
+        effective_sess_page = min(max(1, page), sess_total_pages)
+        merged_for_llm["sessions"] = paged_sessions
+        # Filter trace lists to only traces belonging to the paged sessions
+        # so the LLM isn't given thousands of trace rows for unrelated sessions.
+        paged_trace_ids: set = set()
+        for _sess_obj in paged_sessions.values():
+            if isinstance(_sess_obj, dict):
+                for _tr in _sess_obj.get("traces", []):
+                    _tid = str((_tr or {}).get("trace_id", ""))
+                    if _tid:
+                        paged_trace_ids.add(_tid)
+        if paged_trace_ids:
+            for _list_key in ("trace_index", "trace_diagnostics", "delayed_traces", "top_anomalies", "trace_samples"):
+                merged_for_llm[_list_key] = [
+                    t for t in merged_for_llm.get(_list_key, [])
+                    if str(t.get("trace_id", "")) in paged_trace_ids
+                ]
+        sessions_pagination_info = {
+            "page": effective_sess_page,
+            "page_size": effective_session_page_size,
+            "total_sessions": total_sessions,
+            "total_pages": sess_total_pages,
+            "has_next_page": sess_has_next,
+            "sessions_on_this_page": len(paged_sessions),
+        }
+        _spc = {
+            "page": effective_sess_page,
+            "page_size": effective_session_page_size,
+            "total_sessions": total_sessions,
+            "total_pages": sess_total_pages,
+            "sessions_on_this_page": len(paged_sessions),
+        }
+        merged_for_llm["sessions_pagination_context"] = _spc
+        merged["sessions_pagination_context"] = _spc
+        _emit_analyzer_trace({
+            "phase": "sessions_pagination_applied",
+            "analysis_id": analysis_id,
+            "page": effective_sess_page,
+            "page_size": effective_session_page_size,
+            "total_sessions": total_sessions,
+            "sessions_to_analyze": len(paged_sessions),
+            "trace_ids_in_page": len(paged_trace_ids),
+        })
+
+    # XRay detail is only needed for DEEP DIVE (one named session).
+    # For DISCOVERY mode skip this entirely — saves up to 6 s of network I/O.
+    xray_detail_elapsed = 0.0
+    detailed_xray_by_trace: Dict[str, Any] = {}
+    if _is_deep_dive:
+        detailed_xray_budget = min(6.0, max(1.0, remaining_budget - 7.0))
+        detailed_xray_ids = selected_trace_ids_for_llm[:max(1, min(page_size, 20))] if selected_trace_ids_for_llm else []
+
+        xray_detail_start = time.perf_counter()
+        detailed_xray_by_trace = _fetch_detailed_xray_for_trace_ids(
+            detailed_xray_ids,
+            max_seconds=detailed_xray_budget,
+            max_workers=6,
+        )
+        xray_detail_elapsed = round(time.perf_counter() - xray_detail_start, 3)
+
+        _emit_analyzer_trace({
+            "phase": "xray_detail_fetch_complete",
+            "analysis_id": analysis_id,
+            "xray_detail_seconds": xray_detail_elapsed,
+            "xray_traces_requested": len(detailed_xray_ids),
+            "xray_traces_fetched": len(detailed_xray_by_trace),
+        })
 
     if detailed_xray_by_trace:
         merged_for_llm["trace_index"] = [
@@ -2352,25 +3404,93 @@ def _handle_fleet_insights(question: str, lookback_hours: int, lookback_mode: st
     else:
         merged_for_llm["xray_trace_details"] = []
 
-    # ── Invoke LLM to generate analysis answer ──────────────────────────────────
+    # ── Copy xray-enriched trace lists back to merged (for the response body) ───
+    for _xr_key in ("trace_index", "trace_diagnostics", "delayed_traces",
+                    "top_anomalies", "trace_samples", "xray_trace_details"):
+        if _xr_key in merged_for_llm:
+            merged[_xr_key] = merged_for_llm[_xr_key]
+
+    # ── Build LLM context (mode already detected at the top of this section) ───
+    # DISCOVERY: per-session stats only — tiny context, fast LLM response.
+    # DEEP DIVE: full trace + XRay detail for ONE named session.
+    context_build_start = time.perf_counter()
+    if _is_deep_dive:
+        llm_context = _build_deep_dive_context(merged, query_intent["session_id"])
+    else:
+        llm_context = _build_discovery_context(merged, query_intent=query_intent)
+    context_build_elapsed = round(time.perf_counter() - context_build_start, 3)
+
+    # ── Measure size of context being sent to LLM ──────────────────────────────
+    llm_context_json = json.dumps(llm_context)
+    llm_context_bytes = len(llm_context_json.encode('utf-8'))
+    llm_context_kb = round(llm_context_bytes / 1024, 2)
+
+    _emit_analyzer_trace({
+        "phase": "llm_context_built",
+        "analysis_id": analysis_id,
+        "query_mode": query_intent["mode"],
+        "session_id": query_intent.get("session_id"),
+        "context_build_seconds": context_build_elapsed,
+        "context_size_bytes": llm_context_bytes,
+        "context_size_kb": llm_context_kb,
+        "sessions_in_context": len(llm_context.get("sessions", {})),
+        "traces_in_context": len((llm_context.get("session") or {}).get("traces", [])),
+    })
+
+    # ── Invoke LLM to generate analysis answer (hard wall-clock budget) ────────
+    # No fallback answer: timeout raises TimeoutError and returns 504 upstream.
     llm_start = time.perf_counter()
-    answer = _sanitize_analysis_answer(
-        _build_fleet_diagnosis(question, merged_for_llm),
-        traces_total=len(all_traces),
-    )
+    elapsed_before_llm = time.perf_counter() - handler_start
+    remaining_llm_budget = max(0.0, 27.0 - elapsed_before_llm)
+    if remaining_llm_budget < 4.0:
+        raise TimeoutError(
+            f"Fleet analysis aborted before LLM call because only {round(remaining_llm_budget, 2)}s remained in the response budget."
+        )
+    llm_timeout_cap = 14.0 if _is_deep_dive else 22.0
+    llm_timeout_seconds = min(llm_timeout_cap, remaining_llm_budget)
+    _emit_analyzer_trace({
+        "phase": "llm_call_start",
+        "analysis_id": analysis_id,
+        "llm_timeout_seconds": round(llm_timeout_seconds, 2),
+        "elapsed_before_llm": round(elapsed_before_llm, 2),
+        "context_size_kb": llm_context_kb,
+    })
+
+    llm_builder = _build_fleet_diagnosis if _is_deep_dive else _build_discovery_diagnosis
+
+    _llm_executor = ThreadPoolExecutor(max_workers=1)
+    try:
+        _llm_future = _llm_executor.submit(llm_builder, question, llm_context)
+        try:
+            raw_answer = _llm_future.result(timeout=llm_timeout_seconds)
+        except FutureTimeoutError as exc:
+            _llm_future.cancel()
+            raise TimeoutError(
+                f"Fleet analysis timed out in LLM phase after {round(time.perf_counter() - llm_start, 2)}s "
+                f"(budget={round(llm_timeout_seconds, 2)}s)."
+            ) from exc
+    finally:
+        _llm_executor.shutdown(wait=False, cancel_futures=True)
+
+    answer = _sanitize_analysis_answer(raw_answer, traces_total=len(all_traces))
     llm_elapsed = round(time.perf_counter() - llm_start, 2)
-    
+
     if llm_elapsed > 15:
-        # Warn: LLM generation took >15s
         _emit_analyzer_trace({
             "phase": "llm_timing_warning",
             "analysis_id": analysis_id,
             "llm_elapsed_seconds": llm_elapsed,
             "total_before_response": round(time.perf_counter() - handler_start, 2),
-            "warning": "LLM generation took longer than typical. This is a bottleneck for large trace lists.",
+            "warning": "LLM generation took longer than typical.",
             "traces_processed": len(traces_for_llm),
             "lookback_hours": lookback_hours,
         })
+    _emit_analyzer_trace({
+        "phase": "llm_call_complete",
+        "analysis_id": analysis_id,
+        "llm_elapsed_seconds": llm_elapsed,
+        "answer_size_chars": len(answer or ""),
+    })
     
     total_elapsed = round(time.perf_counter() - handler_start, 2)
     # ── Emit completion trace (Strands-style structured logging) ───────────────
@@ -2378,29 +3498,55 @@ def _handle_fleet_insights(question: str, lookback_hours: int, lookback_mode: st
         "phase": "analysis_complete",
         "analysis_id": analysis_id,
         "total_elapsed_seconds": total_elapsed,
-        "traces_total": len(all_traces),
+        "llm_elapsed_seconds": llm_elapsed,
+        "timing_breakdown": {
+            "data_collection": data_elapsed,
+            "session_building": session_build_elapsed,
+            "xray_detail_fetch": xray_detail_elapsed,
+            "context_building": context_build_elapsed,
+            "llm_call": llm_elapsed,
+            "remaining_for_serialization": round(total_elapsed - (data_elapsed + session_build_elapsed + xray_detail_elapsed + context_build_elapsed + llm_elapsed), 2),
+        },
+        "traced_total": len(all_traces),
         "delayed_traces": len(delayed_traces),
         "complete_3stage": len(complete_3stage),
+        "context_size_kb": llm_context_kb,
         "answer_excerpt": answer[:200] if answer else "",
     })
-    compact_merged = _compact_fleet_merged(merged_for_llm)
+    
+    compact_merged = _compact_fleet_merged(merged)
+    
+    response_start = time.perf_counter()
+    response_body = json.dumps(
+        {
+            "answer": answer,
+            "merged": compact_merged,
+            "pagination": pagination_info if pagination_info else None,
+            "sessions_pagination": sessions_pagination_info if sessions_pagination_info else None,
+            "anchors": {
+                "request_id": "",
+                "client_request_id": "",
+                "session_id": "",
+                "evaluator_session_id": "",
+                "xray_trace_id": "",
+            },
+        }
+    )
+    response_elapsed = round(time.perf_counter() - response_start, 3)
+    response_bytes = len(response_body.encode('utf-8'))
+    
+    _emit_analyzer_trace({
+        "phase": "response_serialization_complete",
+        "analysis_id": analysis_id,
+        "serialization_seconds": response_elapsed,
+        "response_size_bytes": response_bytes,
+        "response_size_kb": round(response_bytes / 1024, 2),
+    })
+    
     return {
         "statusCode": 200,
         "headers": CORS_HEADERS,
-        "body": json.dumps(
-            {
-                "answer": answer,
-                "merged": compact_merged,
-                "pagination": pagination_info if pagination_info else None,
-                "anchors": {
-                    "request_id": "",
-                    "client_request_id": "",
-                    "session_id": "",
-                    "evaluator_session_id": "",
-                    "xray_trace_id": "",
-                },
-            }
-        ),
+        "body": response_body,
     }
 
 
@@ -2436,7 +3582,8 @@ def _handle_session_insights(event: Dict[str, Any]) -> Dict[str, Any]:
 
     question = str(body.get("question", "")).strip()
     request_id = str(body.get("request_id", "")).strip()
-    session_id = str(body.get("session_id", "")).strip()
+    header_session_id = _extract_session_id_header(event)
+    session_id = header_session_id or str(body.get("session_id", "")).strip()
     evaluator_session_id = str(body.get("evaluator_session_id", "")).strip()
     xray_trace_id = str(body.get("xray_trace_id", "")).strip()
     client_request_id = str(body.get("client_request_id", "")).strip()
@@ -2456,7 +3603,7 @@ def _handle_session_insights(event: Dict[str, Any]) -> Dict[str, Any]:
     # Clamp page_size between 5 and 50
     pagination_page_size = max(5, min(50, pagination_page_size))
 
-    if analysis_mode in {"fleet_1h", "all_traces_1h", "fleet", "fleet_window"}:
+    if analysis_mode in {"fleet_1h", "all_traces_1h", "fleet", "fleet_window", "multi_session_window"}:
         # Fleet mode ignores anchors and aggregates all traces in the requested timeframe.
         fleet_hours = _resolve_lookback_hours(body, default_hours=1)
         try:
@@ -2472,16 +3619,18 @@ def _handle_session_insights(event: Dict[str, Any]) -> Dict[str, Any]:
             _emit_analyzer_trace({
                 "phase": "request_complete",
                 "analysis_id": analysis_id,
+                "session_id": session_id,
                 "total_elapsed_seconds": elapsed,
                 "status": "success",
             })
             return result
         except TimeoutError as exc:
             elapsed = round(time.perf_counter() - request_start, 2)
-            error_msg = f"Fleet analysis timed out after {elapsed}s. LLM generation phase is taking too long for large trace-list queries."
+            error_msg = f"Fleet analysis timed out after {elapsed}s. LLM generation phase exceeded the internal response budget."
             _emit_analyzer_trace({
                 "phase": "request_timeout",
                 "analysis_id": analysis_id,
+                "session_id": session_id,
                 "elapsed_seconds": elapsed,
                 "error": error_msg,
                 "question_excerpt": question[:120] if question else "",
@@ -2506,6 +3655,7 @@ def _handle_session_insights(event: Dict[str, Any]) -> Dict[str, Any]:
             _emit_analyzer_trace({
                 "phase": "request_error",
                 "analysis_id": analysis_id,
+                "session_id": session_id,
                 "elapsed_seconds": elapsed,
                 "error": error_msg,
                 "error_type": type(exc).__name__,
@@ -2877,10 +4027,17 @@ def handle_chat_request(event: Dict[str, Any], context: Any = None) -> Dict[str,
             user_context = decoded_claims
 
     client_request_id = str(body.get("client_request_id", "")).strip() or str(uuid.uuid4())
+    header_session_id = _extract_session_id_header(event)
     # Accept session_id from caller; generate a new one if absent so every request
     # belongs to a traceable session. The same session_id is forwarded to the
     # AgentCore runtime and returned to the client so it can be reused next turn.
-    client_session_id = str(body.get("session_id", "")).strip() or str(uuid.uuid4())
+    client_session_id = header_session_id or str(body.get("session_id", "")).strip() or str(uuid.uuid4())
+    _emit_analyzer_trace({
+        "phase": "chat_request_received",
+        "session_id": client_session_id,
+        "client_request_id": client_request_id,
+        "question_excerpt": prompt[:120],
+    })
     payload = {
         "prompt": prompt,
         "client_request_id": client_request_id,
@@ -2910,6 +4067,13 @@ def handle_chat_request(event: Dict[str, Any], context: Any = None) -> Dict[str,
             "answer": answer,
             "trace": _build_trace_payload(result if isinstance(result, dict) else {}, otel_session_id=otel_session_id),
         }
+        _emit_analyzer_trace({
+            "phase": "chat_request_complete",
+            "session_id": client_session_id,
+            "client_request_id": client_request_id,
+            "xray_trace_id": result_trace_id,
+            "status": str((result or {}).get("status", "success")) if isinstance(result, dict) else "success",
+        })
 
         return {
             "statusCode": 200,
@@ -2917,6 +4081,12 @@ def handle_chat_request(event: Dict[str, Any], context: Any = None) -> Dict[str,
             "body": json.dumps(response_body),
         }
     except Exception as exc:
+        _emit_analyzer_trace({
+            "phase": "chat_request_error",
+            "session_id": client_session_id,
+            "client_request_id": client_request_id,
+            "error": str(exc),
+        })
         return {
             "statusCode": 502,
             "headers": CORS_HEADERS,

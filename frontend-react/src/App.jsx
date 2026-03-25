@@ -1,9 +1,11 @@
 import { useEffect, useMemo, useState } from "react";
 import { fetchAuthSession, fetchUserAttributes } from "aws-amplify/auth";
 
+const SESSION_STORAGE_KEY = "session_id";
+
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL;
 const ANALYSIS_MAX_RETRIES = 2;
-const RETRYABLE_STATUS = new Set([429, 502, 503, 504]);
+const RETRYABLE_STATUS = new Set([429, 502, 503]);
 const DEFAULT_FLEET_PAGE_SIZE = 20;
 const LOOKBACK_OPTIONS = [
   { value: "1", label: "1 hour" },
@@ -49,6 +51,16 @@ async function postWithRetry(url, options, maxRetries = ANALYSIS_MAX_RETRIES) {
 
 function stamp() {
   return new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+function getOrCreateSessionId() {
+  const existing = sessionStorage.getItem(SESSION_STORAGE_KEY);
+  if (existing) {
+    return existing;
+  }
+  const created = crypto.randomUUID();
+  sessionStorage.setItem(SESSION_STORAGE_KEY, created);
+  return created;
 }
 
 function isTraceListingQuestion(question) {
@@ -132,7 +144,7 @@ function TypingIndicator() {
 }
 
 function App({ signOut, user }) {
-  const [chatSessionId] = useState(() => crypto.randomUUID());
+  const [chatSessionId] = useState(() => getOrCreateSessionId());
   const [mode, setMode] = useState("assistant");
   const [prompt, setPrompt] = useState("");
   const [messages, setMessages] = useState([
@@ -169,6 +181,7 @@ function App({ signOut, user }) {
   const [fleetPage, setFleetPage] = useState(1);
   const [lastFleetQuestion, setLastFleetQuestion] = useState("");
   const [latestPagination, setLatestPagination] = useState(null);
+  const [latestSessionsPagination, setLatestSessionsPagination] = useState(null);
   const [autoPageProgress, setAutoPageProgress] = useState(null);
   const [controlsOpen, setControlsOpen] = useState(true);
   const [copiedId, setCopiedId] = useState("");
@@ -258,8 +271,18 @@ function App({ signOut, user }) {
         headers: {
           "Content-Type": "application/json",
           Authorization: jwtToken ? `Bearer ${jwtToken}` : "",
+          "x-session-id": chatSessionId,
         },
-        body: JSON.stringify({ prompt: trimmed, session_id: chatSessionId }),
+        body: JSON.stringify({
+          prompt: trimmed,
+          session_id: chatSessionId,
+          user_context: {
+            user_id: user?.username || "anonymous",
+            user_name: profile.name || user?.username || "anonymous",
+            department: profile.department || "",
+            user_role: profile.role || "",
+          },
+        }),
       });
 
       const data = await response.json().catch(() => ({}));
@@ -350,6 +373,7 @@ function App({ signOut, user }) {
           headers: {
             "Content-Type": "application/json",
             Authorization: jwtToken ? `Bearer ${jwtToken}` : "",
+            "x-session-id": chatSessionId,
           },
           body: JSON.stringify({
             question: questionText,
@@ -373,6 +397,12 @@ function App({ signOut, user }) {
                 : logLookbackHours === "overall"
                   ? "overall"
                   : "window",
+            user_context: {
+              user_id: user?.username || "anonymous",
+              user_name: profile.name || user?.username || "anonymous",
+              department: profile.department || "",
+              user_role: profile.role || "",
+            },
           }),
         });
 
@@ -398,8 +428,10 @@ function App({ signOut, user }) {
       if (firstResult.response.ok && analystMode !== "single_trace") {
         setFleetPage(Number(firstPagination?.page || page || 1));
         setLatestPagination(firstPagination);
+        setLatestSessionsPagination(firstResult.data?.sessions_pagination || null);
       } else {
         setLatestPagination(null);
+        setLatestSessionsPagination(null);
       }
 
       if (firstResult.response.ok && firstResult.data?.anchors && analystMode === "single_trace") {
@@ -442,6 +474,7 @@ function App({ signOut, user }) {
           loadedPages = Number(nextResult.data?.pagination?.page || nextPage);
           setFleetPage(loadedPages);
           setLatestPagination(nextResult.data?.pagination || null);
+          setLatestSessionsPagination(nextResult.data?.sessions_pagination || null);
           setLatestMerged(nextResult.data?.merged || null);
           setAutoPageProgress({ loadedPages, totalPages });
           setLogMessages((prev) => [
@@ -539,16 +572,6 @@ function App({ signOut, user }) {
             Analyser logs
           </button>
 
-          {mode === "session" && (
-            <div className="identity-pill">
-              <span className="avatar">{profile.name.slice(0, 1).toUpperCase()}</span>
-              <span className="online-dot" />
-              <span className="identity-text">
-                <strong>{profile.name}</strong>
-                <small>{[profile.role, profile.department].filter(Boolean).join(" | ") || "Active"}</small>
-              </span>
-            </div>
-          )}
           <button className="signout" onClick={signOut}>Sign out</button>
         </nav>
       </header>
@@ -576,52 +599,12 @@ function App({ signOut, user }) {
 
               <div className="control-stack">
                 <label className="control-field">
-                  <span>Session ID</span>
-                  <div className="anchor-input-wrap">
-                    <input
-                      value={chatSessionId}
-                      readOnly
-                      placeholder="Session ID"
-                    />
-                    <button
-                      type="button"
-                      className="copy-icon"
-                      onClick={() => copyToClipboard(chatSessionId, "chat-session")}
-                      title="Copy Session ID"
-                    >
-                      {copiedId === "chat-session" ? "Copied" : "Copy"}
-                    </button>
-                  </div>
-                </label>
-
-                <label className="control-field">
                   <span>User</span>
                   <input
                     value={[profile.role, profile.department].filter(Boolean).join(" | ") || "Active"}
                     readOnly
                   />
                 </label>
-
-                {autoAnchors.xray_trace_id && (
-                  <label className="control-field">
-                    <span>Latest Trace ID</span>
-                    <div className="anchor-input-wrap">
-                      <input
-                        value={autoAnchors.xray_trace_id || ""}
-                        readOnly
-                        placeholder="No trace captured yet"
-                      />
-                      <button
-                        type="button"
-                        className="copy-icon"
-                        onClick={() => copyToClipboard(autoAnchors.xray_trace_id, "chat-xray")}
-                        title="Copy Trace ID"
-                      >
-                        {copiedId === "chat-xray" ? "Copied" : "Copy"}
-                      </button>
-                    </div>
-                  </label>
-                )}
               </div>
             </div>
           </aside>
@@ -812,7 +795,65 @@ function App({ signOut, user }) {
               </div>
             )}
 
+            {isFleetMode && latestSessionsPagination && (
+              <div className="pagination-strip">
+                <p>
+                  {autoPageProgress?.totalPages > 1 ? (
+                    <>
+                      Loaded <strong>{autoPageProgress.loadedPages}</strong> of <strong>{autoPageProgress.totalPages}</strong> session pages automatically
+                    </>
+                  ) : (
+                    <>
+                      Sessions page <strong>{latestSessionsPagination.page}</strong> of <strong>{latestSessionsPagination.total_pages}</strong>
+                    </>
+                  )}
+                  {" "}
+                  (<strong>{latestSessionsPagination.total_sessions}</strong> total sessions, {latestSessionsPagination.sessions_on_this_page} on this page)
+                </p>
+                <div className="pagination-actions">
+                  <button
+                    type="button"
+                    className="mode-btn"
+                    onClick={() => goToFleetPage(Math.max(1, fleetPage - 1))}
+                    disabled={isBusy || latestSessionsPagination.page <= 1}
+                  >
+                    Previous
+                  </button>
+                  <button
+                    type="button"
+                    className="mode-btn"
+                    onClick={() => goToFleetPage(fleetPage + 1)}
+                    disabled={isBusy || !latestSessionsPagination.has_next_page}
+                  >
+                    Next
+                  </button>
+                </div>
+              </div>
+            )}
+
             {renderMessages(logMessages, busyLog)}
+
+            {isFleetMode && (
+              <div className="prompt-suggestions">
+                {[
+                  "Give me a summary of all sessions in this time window and highlight any issues.",
+                  "Which sessions are the slowest and what is causing the latency?",
+                  "Which sessions had the most errors and what patterns do you see?",
+                  "List all users and show their sessions along with any issues they faced.",
+                  "Analyze the most problematic session in detail and explain what went wrong.",
+                ].map((suggestion) => (
+                  <button
+                    key={suggestion}
+                    type="button"
+                    className="suggestion-chip"
+                    onClick={() => setLogQuestion(suggestion)}
+                    disabled={isBusy}
+                  >
+                    {suggestion}
+                  </button>
+                ))}
+              </div>
+            )}
 
             <form className="composer composer--expanded" onSubmit={sendLogQuestion}>
               <textarea

@@ -401,6 +401,13 @@ def handler(payload, context):
     client_session_id  = str(payload.get("session_id", "")).strip()
     context_session_id = getattr(context, "session_id", None) or ""
     session_id = client_session_id or context_session_id or str(uuid.uuid4())
+    # Stamp the active span immediately so downstream OTEL records inherit the client session.
+    try:
+        current_span = otel_trace.get_current_span()
+        current_span.set_attribute("session.id", session_id)
+        current_span.set_attribute("session_id", session_id)
+    except Exception:
+        pass
     tools_used    = []
     error_msg     = ""
     answer        = ""
