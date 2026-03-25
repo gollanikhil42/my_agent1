@@ -1,12 +1,20 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { fetchAuthSession, fetchUserAttributes } from "aws-amplify/auth";
 
 const SESSION_STORAGE_KEY = "session_id";
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL;
 const ANALYSIS_MAX_RETRIES = 2;
+const ANALYST_MEMORY_LIMIT = 6;
 const RETRYABLE_STATUS = new Set([429, 502, 503]);
 const DEFAULT_FLEET_PAGE_SIZE = 20;
+const ANALYSER_SUGGESTIONS = [
+  "Give me a summary of all sessions in this time window and highlight any issues.",
+  "Which sessions are the slowest and what is causing the latency?",
+  "Which sessions had the most errors and what patterns do you see?",
+  "List all users and show their sessions along with any issues they faced.",
+  "Analyze the most problematic session in detail and explain what went wrong.",
+];
 const LOOKBACK_OPTIONS = [
   { value: "1", label: "1 hour" },
   { value: "6", label: "6 hours" },
@@ -22,24 +30,34 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function postWithRetry(url, options, maxRetries = ANALYSIS_MAX_RETRIES) {
+async function postWithRetry(url, options, maxRetries = ANALYSIS_MAX_RETRIES, signal = null) {
   let lastResponse = null;
   let lastError = null;
 
   for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
+    if (signal?.aborted) {
+      throw new DOMException("Request aborted", "AbortError");
+    }
+
     try {
-      const response = await fetch(url, options);
+      const response = await fetch(url, { ...options, signal });
       lastResponse = response;
       if (!RETRYABLE_STATUS.has(response.status) || attempt === maxRetries) {
         return response;
       }
     } catch (error) {
+      if (signal?.aborted || error?.name === "AbortError") {
+        throw error;
+      }
       lastError = error;
       if (attempt === maxRetries) {
         throw error;
       }
     }
 
+    if (signal?.aborted) {
+      throw new DOMException("Request aborted", "AbortError");
+    }
     await sleep(900 * (attempt + 1));
   }
 
@@ -133,6 +151,52 @@ function normalizeMessageText(input) {
   return text;
 }
 
+function compactMessageForMemory(text, limit = 420) {
+  const normalized = normalizeMessageText(text).replace(/\s+/g, " ").trim();
+  if (normalized.length <= limit) {
+    return normalized;
+  }
+  return `${normalized.slice(0, limit).trim()}...`;
+}
+
+function buildAnalystMemory(logMessages, latestMerged, analystMode, anchors, totalFleetTraces) {
+  const recentTurns = logMessages
+    .filter((msg) => msg.role === "user" || msg.role === "assistant")
+    .slice(-(ANALYST_MEMORY_LIMIT - 1))
+    .map((msg) => ({
+      role: msg.role,
+      text: compactMessageForMemory(msg.text),
+    }));
+
+  const contextLines = [];
+  if (analystMode === "single_trace") {
+    const sessionId = anchors.session_id || latestMerged?.request?.session_id || "";
+    const traceId = anchors.xray_trace_id || latestMerged?.request?.trace_id || "";
+    const slowestStep = latestMerged?.xray?.slowest_step?.name || "";
+    if (sessionId) {
+      contextLines.push(`Current session anchor: ${sessionId}.`);
+    }
+    if (traceId) {
+      contextLines.push(`Current trace anchor: ${traceId}.`);
+    }
+    if (slowestStep) {
+      contextLines.push(`Latest slowest X-Ray step: ${slowestStep}.`);
+    }
+  } else if (latestMerged) {
+    const bottleneck = latestMerged?.bottleneck_ranking?.[0]?.component || "n/a";
+    const avgLatency = latestMerged?.fleet_metrics?.e2e_ms?.avg || 0;
+    contextLines.push(`Current window covers ${totalFleetTraces || 0} traces.`);
+    contextLines.push(`Top bottleneck: ${bottleneck}.`);
+    contextLines.push(`Average end-to-end latency: ${avgLatency} ms.`);
+  }
+
+  const contextEntry = contextLines.length
+    ? [{ role: "context", text: contextLines.join(" ") }]
+    : [];
+
+  return [...contextEntry, ...recentTurns];
+}
+
 function TypingIndicator() {
   return (
     <div className="typing" aria-live="polite" aria-label="Assistant is typing">
@@ -144,7 +208,7 @@ function TypingIndicator() {
 }
 
 function App({ signOut, user }) {
-  const [chatSessionId] = useState(() => getOrCreateSessionId());
+  const [chatSessionId, setChatSessionId] = useState(() => getOrCreateSessionId());
   const [mode, setMode] = useState("assistant");
   const [prompt, setPrompt] = useState("");
   const [messages, setMessages] = useState([
@@ -186,8 +250,10 @@ function App({ signOut, user }) {
   const [controlsOpen, setControlsOpen] = useState(true);
   const [copiedId, setCopiedId] = useState("");
   const [profile, setProfile] = useState({ name: user?.username || "User", department: "", role: "" });
-  const [textareaExpanded, setTextareaExpanded] = useState(true);
-  const [chatDrawerOpen, setChatDrawerOpen] = useState(true);
+  const chatAbortRef = useRef(null);
+  const analystAbortRef = useRef(null);
+  const messagesViewportRef = useRef(null);
+  const shouldStickToBottomRef = useRef(true);
 
   const effectiveAnchors = useMemo(
     () => ({
@@ -209,6 +275,47 @@ function App({ signOut, user }) {
 
   const isFleetMode = analystMode !== "single_trace";
   const totalFleetTraces = latestPagination?.total_traces || latestMerged?.fleet_metrics?.traces_total || 0;
+  const analystMemory = useMemo(
+    () => buildAnalystMemory(logMessages, latestMerged, analystMode, effectiveAnchors, totalFleetTraces),
+    [logMessages, latestMerged, analystMode, effectiveAnchors, totalFleetTraces],
+  );
+  const analystMetricCards = useMemo(() => {
+    if (!latestMerged) {
+      return [];
+    }
+
+    if (isFleetMode) {
+      return [
+        { label: "Traces in view", value: String(totalFleetTraces || 0), hint: selectedLookbackLabel },
+        { label: "Average latency", value: `${latestMerged?.fleet_metrics?.e2e_ms?.avg || 0} ms`, hint: "End-to-end" },
+        { label: "Top bottleneck", value: latestMerged?.bottleneck_ranking?.[0]?.component || "n/a", hint: "Primary delay source" },
+      ];
+    }
+
+    return [
+      { label: "Runtime records", value: String(latestMerged.runtime_records_found || 0), hint: "Logs matched" },
+      { label: "Evaluator records", value: String(latestMerged.evaluator_records_found || 0), hint: "Metrics matched" },
+      { label: "Slowest X-Ray step", value: latestMerged?.xray?.slowest_step?.name || "n/a", hint: `${latestMerged?.xray?.slowest_step?.duration_ms || 0} ms` },
+    ];
+  }, [isFleetMode, latestMerged, selectedLookbackLabel, totalFleetTraces]);
+  const assistantContextRows = useMemo(
+    () => [
+      { label: "Chat session ID", value: chatSessionId, copyKey: "chat-session" },
+      { label: "Latest session ID", value: autoAnchors.session_id, copyKey: "assistant-session" },
+      { label: "Latest trace ID", value: autoAnchors.xray_trace_id, copyKey: "assistant-trace" },
+    ].filter((item) => item.value),
+    [autoAnchors.session_id, autoAnchors.xray_trace_id, chatSessionId],
+  );
+  const analystContextRows = useMemo(
+    () => [
+      { label: "Session ID", value: effectiveAnchors.session_id, copyKey: "analyst-session" },
+      { label: "X-Ray trace ID", value: effectiveAnchors.xray_trace_id, copyKey: "analyst-trace" },
+      { label: "Request ID", value: effectiveAnchors.request_id, copyKey: "analyst-request" },
+      { label: "Client request ID", value: effectiveAnchors.client_request_id, copyKey: "analyst-client-request" },
+      { label: "Evaluator session ID", value: effectiveAnchors.evaluator_session_id, copyKey: "analyst-evaluator-session" },
+    ].filter((item) => item.value),
+    [effectiveAnchors],
+  );
 
   useEffect(() => {
     async function loadProfile() {
@@ -247,6 +354,83 @@ function App({ signOut, user }) {
     };
   }
 
+  function handleComposerKeyDown(event) {
+    if (event.key === "Enter" && !event.shiftKey) {
+      event.preventDefault();
+      if (mode === "assistant") {
+        sendPrompt(event);
+      } else {
+        sendLogQuestion(event);
+      }
+    }
+  }
+
+  function resetToNewSession() {
+    const nextSessionId = crypto.randomUUID();
+    sessionStorage.setItem(SESSION_STORAGE_KEY, nextSessionId);
+
+    if (chatAbortRef.current) {
+      chatAbortRef.current.abort();
+      chatAbortRef.current = null;
+    }
+    if (analystAbortRef.current) {
+      analystAbortRef.current.abort();
+      analystAbortRef.current = null;
+    }
+
+    setBusyChat(false);
+    setBusyLog(false);
+    setChatSessionId(nextSessionId);
+    setPrompt("");
+    setLogQuestion("");
+    setMessages([
+      {
+        id: crypto.randomUUID(),
+        role: "system",
+        text: "Started a new session. Ask anything to continue.",
+        variant: "status",
+        timestamp: stamp(),
+      },
+    ]);
+    setLogMessages([]);
+    setLatestMerged(null);
+    setLastFleetQuestion("");
+    setFleetPage(1);
+    setLatestPagination(null);
+    setLatestSessionsPagination(null);
+    setAutoPageProgress(null);
+    setAnalystAnchors({
+      request_id: "",
+      client_request_id: "",
+      session_id: "",
+      evaluator_session_id: "",
+      xray_trace_id: "",
+    });
+    setAutoAnchors({
+      request_id: "",
+      client_request_id: "",
+      session_id: nextSessionId,
+      evaluator_session_id: "",
+      xray_trace_id: "",
+    });
+  }
+
+  function stopCurrentGeneration() {
+    if (busyChat && chatAbortRef.current) {
+      chatAbortRef.current.abort();
+      chatAbortRef.current = null;
+      setBusyChat(false);
+      setMessages((prev) => [...prev, makeMessage("system", "Response stopped.", "status")]);
+    }
+    if (busyLog && analystAbortRef.current) {
+      analystAbortRef.current.abort();
+      analystAbortRef.current = null;
+      setBusyLog(false);
+      setAutoPageProgress(null);
+      setLogMessages((prev) => [...prev, makeMessage("system", "Analysis stopped.", "metric")]);
+    }
+  }
+
   async function sendPrompt(event) {
     event.preventDefault();
     const trimmed = prompt.trim();
@@ -256,18 +440,20 @@ function App({ signOut, user }) {
 
     setPrompt("");
     setBusyChat(true);
-       setTextareaExpanded(false);
     setMessages((prev) => [
       ...prev,
       makeMessage("user", trimmed),
     ]);
 
     try {
+      const controller = new AbortController();
+      chatAbortRef.current = controller;
       const session = await fetchAuthSession();
       const jwtToken = session.tokens?.idToken?.toString() || "";
 
       const response = await fetch(`${API_BASE_URL}/chat`, {
         method: "POST",
+        signal: controller.signal,
         headers: {
           "Content-Type": "application/json",
           Authorization: jwtToken ? `Bearer ${jwtToken}` : "",
@@ -309,8 +495,12 @@ function App({ signOut, user }) {
         }));
       }
     } catch (error) {
+      if (error?.name === "AbortError") {
+        return;
+      }
       setMessages((prev) => [...prev, makeMessage("assistant", `Unable to fetch response. ${error?.message || ""}`.trim())]);
     } finally {
+      chatAbortRef.current = null;
       setBusyChat(false);
     }
   }
@@ -363,6 +553,8 @@ function App({ signOut, user }) {
     }
 
     try {
+      const controller = new AbortController();
+      analystAbortRef.current = controller;
       const session = await fetchAuthSession();
       const jwtToken = session.tokens?.idToken?.toString() || "";
       setAutoPageProgress(null);
@@ -378,6 +570,7 @@ function App({ signOut, user }) {
           body: JSON.stringify({
             question: questionText,
             analysis_mode: analystMode,
+            analyst_memory: analystMemory,
             request_id: analystMode === "single_trace" ? effectiveAnchors.request_id : "",
             client_request_id: analystMode === "single_trace" ? effectiveAnchors.client_request_id : "",
             session_id: analystMode === "single_trace" ? effectiveAnchors.session_id : "",
@@ -404,7 +597,7 @@ function App({ signOut, user }) {
               user_role: profile.role || "",
             },
           }),
-        });
+        }, ANALYSIS_MAX_RETRIES, controller.signal);
 
         const data = await response.json().catch(() => ({}));
         const answer = response.ok
@@ -484,10 +677,14 @@ function App({ signOut, user }) {
         }
       }
     } catch (error) {
+      if (error?.name === "AbortError") {
+        return;
+      }
       setAutoPageProgress(null);
       setLatestPagination(null);
       setLogMessages((prev) => [...prev, makeMessage("assistant", `Unable to fetch analysis. ${error?.message || ""}`.trim())]);
     } finally {
+      analystAbortRef.current = null;
       setBusyLog(false);
     }
   }
@@ -505,9 +702,27 @@ function App({ signOut, user }) {
     await requestLogAnalysis(lastFleetQuestion, { page: nextPage, addUserMessage: false, autoPaginate: false });
   }
 
-  function renderMessages(items, loading) {
+  function handleMessagesScroll(event) {
+    const node = event.currentTarget;
+    const distanceFromBottom = node.scrollHeight - node.scrollTop - node.clientHeight;
+    shouldStickToBottomRef.current = distanceFromBottom < 100;
+  }
+
+  useEffect(() => {
+    const node = messagesViewportRef.current;
+    if (!node || !shouldStickToBottomRef.current) {
+      return;
+    }
+
+    const raf = window.requestAnimationFrame(() => {
+      node.scrollTop = node.scrollHeight;
+    });
+    return () => window.cancelAnimationFrame(raf);
+  }, [messages, logMessages, busyChat, busyLog, mode]);
+
+  function renderMessages(items, loading, viewportRef, onScroll) {
     return (
-      <div className="messages">
+      <div className="messages" ref={viewportRef} onScroll={onScroll}>
         {items.map((msg) => (
           <article key={msg.id} className={`message ${msg.role} ${msg.variant || ""}`}>
             <div className="bubble-wrap">
@@ -546,139 +761,68 @@ function App({ signOut, user }) {
     );
   }
 
+  const isAssistantMode = mode === "assistant";
+  const activeMessages = isAssistantMode ? messages : logMessages;
+  const activeBusy = isAssistantMode ? busyChat : busyLog;
+  const activeQuestion = isAssistantMode ? prompt : logQuestion;
+  const activeCharCount = isAssistantMode ? prompt.length : logQuestion.length;
+
   return (
-    <main className="shell">
-      <header className="topbar glass">
-        <div>
-          <h1>
-            <span className="title-gradient">Observability & Evaluations</span> Dashboard
-          </h1>
-          <p className="subtitle">AI operations cockpit for live chat intelligence and session diagnostics.</p>
+    <main className="sensei-shell">
+      <header className="sensei-topbar">
+        <div className="sensei-brand">
+          <strong>PHILIPS</strong>
+          <span>SENSEI</span>
         </div>
 
-        <nav className={`mode-switch ${mode === "assistant" ? "mode-switch--assistant" : "mode-switch--session"}`} role="tablist" aria-label="Console mode">
+        <nav className="sensei-nav" role="tablist" aria-label="Console mode">
           <button
-            className={`mode-btn ${mode === "assistant" ? "active" : ""}`}
+            type="button"
+            className={`nav-tab ${isAssistantMode ? "active" : ""}`}
             onClick={() => setMode("assistant")}
-            type="button"
           >
-            Assistant Chat
+            Assistant chat
           </button>
           <button
-            className={`mode-btn ${mode === "session" ? "active" : ""}`}
-            onClick={() => setMode("session")}
             type="button"
+            className={`nav-tab ${!isAssistantMode ? "active" : ""}`}
+            onClick={() => setMode("session")}
           >
-            Analyser logs
+            Analyser chat
           </button>
-
-          <button className="signout" onClick={signOut}>Sign out</button>
         </nav>
+
+        <div className="sensei-user">
+          <span>{(profile.name || user?.username || "JD").slice(0, 2).toUpperCase()}</span>
+          <button className="new-session" onClick={resetToNewSession} type="button">New session</button>
+          <button className="signout" onClick={signOut} type="button">Sign out</button>
+        </div>
       </header>
 
-      {mode === "assistant" ? (
-        <section className="workspace-layout workspace-layout--assistant">
-          <aside className={`control-drawer glass ${chatDrawerOpen ? "open" : "collapsed"}`}>
-            <div className="drawer-header">
-              <div>
-                <p className="drawer-eyebrow">Chat Profile</p>
-                <h2>Quick Info</h2>
-                <p>Your chat session, account details, and latest trace context.</p>
-              </div>
-              <button type="button" className="drawer-toggle" onClick={() => setChatDrawerOpen(false)}>
-                Hide
-              </button>
-            </div>
+      <section className={`chat-shell ${isAssistantMode ? "assistant-only" : ""} ${!isAssistantMode && !controlsOpen ? "menu-collapsed" : ""}`}>
+        {!isAssistantMode && (
+          <>
+            <button
+              type="button"
+              className="menu-toggle"
+              onClick={() => setControlsOpen((prev) => !prev)}
+              aria-expanded={controlsOpen}
+            >
+              {controlsOpen ? "Hide menu" : "Show menu"}
+            </button>
 
-            <div className="drawer-scroll">
-              <div className="profile-card">
-                <span className="profile-label">Signed in</span>
-                <strong>{profile.name}</strong>
-                <p>{[profile.role, profile.department].filter(Boolean).join(" | ") || "Chat session active"}</p>
-              </div>
-
-              <div className="control-stack">
-                <label className="control-field">
-                  <span>User</span>
-                  <input
-                    value={[profile.role, profile.department].filter(Boolean).join(" | ") || "Active"}
-                    readOnly
-                  />
-                </label>
-              </div>
-            </div>
-          </aside>
-
-          <section className="chat-stage glass chat-stage--assistant">
-            <div className="stage-header">
-              <div className="stage-heading">
-                <button type="button" className="drawer-toggle drawer-toggle--inline" onClick={() => setChatDrawerOpen((prev) => !prev)}>
-                  {chatDrawerOpen ? "−" : "+"}
-                </button>
-                <h2>Assistant Chat</h2>
-              </div>
-            </div>
-
-            {renderMessages(messages, busyChat)}
-
-            <form className={`composer ${textareaExpanded ? "composer--expanded" : "composer--collapsed"}`} onSubmit={sendPrompt}>
-              <textarea
-                value={prompt}
-                onChange={(e) => setPrompt(e.target.value)}
-                onFocus={() => setTextareaExpanded(true)}
-                onBlur={(e) => {
-                  if (!e.currentTarget.value.trim()) {
-                    setTextareaExpanded(false);
-                  }
-                }}
-                placeholder={textareaExpanded ? "Ask anything..." : "Click to ask..."}
-                maxLength={4000}
-                disabled={isBusy}
-              />
-              <div className="composer-row">
-                <p className="char-count">{prompt.length}/4000</p>
-                <button className="send" type="submit" disabled={isBusy} title="Send message" aria-label="Send message">
-                  <span className="plane" aria-hidden="true">&#10148;</span>
-                </button>
-              </div>
-            </form>
-          </section>
-        </section>
-      ) : (
-        <section className="workspace-layout">
-          <aside className={`control-drawer glass ${controlsOpen ? "open" : "collapsed"}`}>
-            <div className="drawer-header">
-              <div>
-                <p className="drawer-eyebrow">Diagnostics controls</p>
-                <h2>Session Anchors</h2>
-                <p>{analystMode !== "single_trace" ? `Fleet mode analyzes ${logLookbackHours === "overall" ? "all available traces from start to now" : `all traces in the last ${selectedLookbackLabel}`} across X-Ray, runtime, and evaluator logs.` : "Trace ID is auto-captured from your last chat message. You can paste an older trace ID to query historical sessions."}</p>
-              </div>
-              <button type="button" className="drawer-toggle" onClick={() => setControlsOpen(false)}>
-                Hide
-              </button>
-            </div>
-
-            <div className="drawer-scroll">
-              <div className="profile-card">
-                <span className="profile-label">Signed in</span>
-                <strong>{profile.name}</strong>
-                <p>{[profile.role, profile.department].filter(Boolean).join(" | ") || "Analyst session active"}</p>
-              </div>
-
-              <div className="control-stack">
-                <label className="control-field">
-                  <span>Analyzer Mode</span>
-                  <select
-                    value={analystMode}
-                    onChange={(e) => setAnalystMode(e.target.value)}
-                  >
-                    <option value="fleet_window">All traces (fleet window)</option>
-                    <option value="single_trace">Single trace deep-dive</option>
+            <aside className={`left-menu ${controlsOpen ? "open" : "collapsed"}`}>
+              <div className="left-menu-scroll">
+              <div className="analysis-toolbar">
+                <label>
+                  <span>Mode</span>
+                  <select value={analystMode} onChange={(e) => setAnalystMode(e.target.value)}>
+                    <option value="fleet_window">Fleet window</option>
+                    <option value="single_trace">Single trace</option>
                   </select>
                 </label>
-
-                <label className="control-field">
-                  <span>Timeframe</span>
+                <label>
+                  <span>Time</span>
                   <select
                     value={logLookbackHours}
                     onChange={(e) => setLogLookbackHours(e.target.value || "1")}
@@ -689,159 +833,26 @@ function App({ signOut, user }) {
                     ))}
                   </select>
                 </label>
-
                 {analystMode === "single_trace" && (
-                  <label className="control-field">
+                  <label className="trace-id-field">
                     <span>X-Ray Trace ID</span>
-                    <div className="anchor-input-wrap">
-                      <input
-                        value={analystAnchors.xray_trace_id || ""}
-                        onChange={(e) =>
-                          setAnalystAnchors((prev) => ({
-                            ...prev,
-                            xray_trace_id: e.target.value.trim(),
-                          }))
-                        }
-                        placeholder={autoAnchors.xray_trace_id || "send a chat message to capture trace ID"}
-                      />
-                      <button
-                        type="button"
-                        className="copy-icon"
-                        onClick={() => copyToClipboard(effectiveAnchors.xray_trace_id, "anchor-xray")}
-                        title="Copy X-Ray Trace ID"
-                      >
-                        {copiedId === "anchor-xray" ? "Copied" : "Copy"}
-                      </button>
-                    </div>
+                    <input
+                      value={analystAnchors.xray_trace_id || ""}
+                      onChange={(e) =>
+                        setAnalystAnchors((prev) => ({
+                          ...prev,
+                          xray_trace_id: e.target.value.trim(),
+                        }))
+                      }
+                      placeholder={autoAnchors.xray_trace_id || "send a chat message to capture trace ID"}
+                    />
                   </label>
                 )}
               </div>
-            </div>
-          </aside>
 
-          <section className="chat-stage glass">
-            <div className="stage-header">
-              <div className="stage-heading">
-                <button type="button" className="drawer-toggle drawer-toggle--inline" onClick={() => setControlsOpen((prev) => !prev)}>
-                  {controlsOpen ? "−" : "+"}
-                </button>
-                <h2>{isFleetMode ? "Fleet Analysis" : "Trace Deep-Dive"}</h2>
-              </div>
-            </div>
-
-            {latestMerged && (
-              <div className="insight-strip">
-                {latestMerged?.analysis_mode === "fleet_window" || analystMode !== "single_trace" ? (
-                  <>
-                    <p>
-                      Traces: <strong>{totalFleetTraces}</strong>
-                    </p>
-                    <p>
-                      E2E avg: <strong>{latestMerged?.fleet_metrics?.e2e_ms?.avg || 0} ms</strong>
-                    </p>
-                    <p>
-                      Top bottleneck: <strong>{latestMerged?.bottleneck_ranking?.[0]?.component || "n/a"}</strong>
-                    </p>
-                  </>
-                ) : (
-                  <>
-                    <p>
-                      Runtime logs: <strong>{latestMerged.runtime_records_found || 0}</strong>
-                    </p>
-                    <p>
-                      Evaluator logs: <strong>{latestMerged.evaluator_records_found || 0}</strong>
-                    </p>
-                    <p>
-                      Slowest step: <strong>{latestMerged?.xray?.slowest_step?.name || "n/a"}</strong>
-                    </p>
-                  </>
-                )}
-              </div>
-            )}
-
-            {isFleetMode && latestPagination && (
-              <div className="pagination-strip">
-                <p>
-                  {autoPageProgress?.totalPages > 1 ? (
-                    <>
-                      Loaded <strong>{autoPageProgress.loadedPages}</strong> of <strong>{autoPageProgress.totalPages}</strong> pages automatically
-                    </>
-                  ) : (
-                    <>
-                      Page <strong>{latestPagination.page}</strong> of <strong>{latestPagination.total_pages}</strong>
-                    </>
-                  )}
-                  {" "}
-                  (<strong>{latestPagination.total_traces}</strong> total traces in this window, {latestPagination.traces_on_this_page} on this page)
-                </p>
-                <div className="pagination-actions">
-                  <button
-                    type="button"
-                    className="mode-btn"
-                    onClick={() => goToFleetPage(Math.max(1, fleetPage - 1))}
-                    disabled={isBusy || latestPagination.page <= 1}
-                  >
-                    Previous
-                  </button>
-                  <button
-                    type="button"
-                    className="mode-btn"
-                    onClick={() => goToFleetPage(fleetPage + 1)}
-                    disabled={isBusy || !latestPagination.has_next_page}
-                  >
-                    Next
-                  </button>
-                </div>
-              </div>
-            )}
-
-            {isFleetMode && latestSessionsPagination && (
-              <div className="pagination-strip">
-                <p>
-                  {autoPageProgress?.totalPages > 1 ? (
-                    <>
-                      Loaded <strong>{autoPageProgress.loadedPages}</strong> of <strong>{autoPageProgress.totalPages}</strong> session pages automatically
-                    </>
-                  ) : (
-                    <>
-                      Sessions page <strong>{latestSessionsPagination.page}</strong> of <strong>{latestSessionsPagination.total_pages}</strong>
-                    </>
-                  )}
-                  {" "}
-                  (<strong>{latestSessionsPagination.total_sessions}</strong> total sessions, {latestSessionsPagination.sessions_on_this_page} on this page)
-                </p>
-                <div className="pagination-actions">
-                  <button
-                    type="button"
-                    className="mode-btn"
-                    onClick={() => goToFleetPage(Math.max(1, fleetPage - 1))}
-                    disabled={isBusy || latestSessionsPagination.page <= 1}
-                  >
-                    Previous
-                  </button>
-                  <button
-                    type="button"
-                    className="mode-btn"
-                    onClick={() => goToFleetPage(fleetPage + 1)}
-                    disabled={isBusy || !latestSessionsPagination.has_next_page}
-                  >
-                    Next
-                  </button>
-                </div>
-              </div>
-            )}
-
-            {renderMessages(logMessages, busyLog)}
-
-            {isFleetMode && (
-              <div className="prompt-suggestions">
-                {[
-                  "Give me a summary of all sessions in this time window and highlight any issues.",
-                  "Which sessions are the slowest and what is causing the latency?",
-                  "Which sessions had the most errors and what patterns do you see?",
-                  "List all users and show their sessions along with any issues they faced.",
-                  "Analyze the most problematic session in detail and explain what went wrong.",
-                ].map((suggestion) => (
+              <div className="menu-suggestions">
+                <p>Suggestions</p>
+                {ANALYSER_SUGGESTIONS.map((suggestion, index) => (
                   <button
                     key={suggestion}
                     type="button"
@@ -849,31 +860,46 @@ function App({ signOut, user }) {
                     onClick={() => setLogQuestion(suggestion)}
                     disabled={isBusy}
                   >
-                    {suggestion}
+                    <span className="suggestion-index">0{index + 1}</span>
+                    <span className="suggestion-text">{suggestion}</span>
                   </button>
                 ))}
               </div>
-            )}
+            </div>
+            </aside>
+          </>
+        )}
 
-            <form className="composer composer--expanded" onSubmit={sendLogQuestion}>
-              <textarea
-                value={logQuestion}
-                onChange={(e) => setLogQuestion(e.target.value)}
-                placeholder="Ask diagnostics questions, e.g. get the evaluator metric scores for trace 69c27b2d13ded83308a2dbbe15a019df and tell me the slowest X-Ray step"
-                rows={6}
-                maxLength={4000}
-                disabled={isBusy}
-              />
-              <div className="composer-row">
-                <p className="char-count">{logQuestion.length}/4000</p>
-                <button className="send" type="submit" disabled={isBusy} title="Analyze session" aria-label="Analyze session">
+        <div className="chat-center">
+          <div className="chat-feed">
+            {renderMessages(activeMessages, activeBusy, messagesViewportRef, handleMessagesScroll)}
+          </div>
+
+          <form className="floating-composer" onSubmit={isAssistantMode ? sendPrompt : sendLogQuestion}>
+            <textarea
+              value={activeQuestion}
+              onChange={(e) => (isAssistantMode ? setPrompt(e.target.value) : setLogQuestion(e.target.value))}
+              onKeyDown={handleComposerKeyDown}
+              placeholder="Ask anything"
+              maxLength={4000}
+              disabled={isBusy}
+            />
+            <div className="composer-row">
+              <p className="char-count">{activeCharCount}/4000</p>
+              <div className="composer-actions">
+                {isBusy && (
+                  <button className="stop" type="button" onClick={stopCurrentGeneration}>
+                    Stop
+                  </button>
+                )}
+                <button className="send" type="submit" disabled={isBusy} title="Send" aria-label="Send">
                   <span className="plane" aria-hidden="true">&#10148;</span>
                 </button>
               </div>
-            </form>
-          </section>
-        </section>
-      )}
+            </div>
+          </form>
+        </div>
+      </section>
     </main>
   );
 }

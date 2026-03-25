@@ -29,7 +29,7 @@ CORS_HEADERS = {
 LOGS_CLIENT = boto3.client("logs", region_name=REGION)
 XRAY_CLIENT = boto3.client("xray", region_name=REGION)
 BEDROCK_CONNECT_TIMEOUT_SECONDS = float(os.environ.get("BEDROCK_CONNECT_TIMEOUT_SECONDS", "2.0"))
-BEDROCK_READ_TIMEOUT_SECONDS = float(os.environ.get("BEDROCK_READ_TIMEOUT_SECONDS", "14.0"))
+BEDROCK_READ_TIMEOUT_SECONDS = float(os.environ.get("BEDROCK_READ_TIMEOUT_SECONDS", "24.0"))
 BEDROCK_MAX_ATTEMPTS = int(os.environ.get("BEDROCK_MAX_ATTEMPTS", "1"))
 BEDROCK_CLIENT = boto3.client(
     "bedrock-runtime",
@@ -44,9 +44,10 @@ DIAGNOSIS_MODEL_ID = os.environ.get("DIAGNOSIS_MODEL_ID", "")
 DIAGNOSIS_SESSION_MAX_TOKENS = int(os.environ.get("DIAGNOSIS_SESSION_MAX_TOKENS", "1150"))
 DIAGNOSIS_PROMPT_UPGRADE_MAX_TOKENS = int(os.environ.get("DIAGNOSIS_PROMPT_UPGRADE_MAX_TOKENS", "920"))
 DIAGNOSIS_FLEET_SUMMARY_MAX_TOKENS = int(os.environ.get("DIAGNOSIS_FLEET_SUMMARY_MAX_TOKENS", "2000"))
-DIAGNOSIS_FLEET_DISCOVERY_MAX_TOKENS = int(os.environ.get("DIAGNOSIS_FLEET_DISCOVERY_MAX_TOKENS", "450"))
-DIAGNOSIS_TRACE_LOOKUP_MAX_TOKENS = int(os.environ.get("DIAGNOSIS_TRACE_LOOKUP_MAX_TOKENS", "500"))
-DIAGNOSIS_FLEET_DEEP_DIVE_MAX_TOKENS = int(os.environ.get("DIAGNOSIS_FLEET_DEEP_DIVE_MAX_TOKENS", "2000"))
+DIAGNOSIS_FLEET_DISCOVERY_MAX_TOKENS = int(os.environ.get("DIAGNOSIS_FLEET_DISCOVERY_MAX_TOKENS", "1200"))
+DIAGNOSIS_TRACE_LOOKUP_MAX_TOKENS = int(os.environ.get("DIAGNOSIS_TRACE_LOOKUP_MAX_TOKENS", "650"))
+DIAGNOSIS_FLEET_DEEP_DIVE_MAX_TOKENS = int(os.environ.get("DIAGNOSIS_FLEET_DEEP_DIVE_MAX_TOKENS", "800"))
+DIAGNOSIS_SESSION_DEEP_DIVE_MAX_TOKENS = int(os.environ.get("DIAGNOSIS_SESSION_DEEP_DIVE_MAX_TOKENS", "650"))
 RUNTIME_SERVICE_NAME = os.environ.get("RUNTIME_SERVICE_NAME", "")
 
 # ── Analyzer structured logging (mirrors my_agent1.py trace format) ─────────────
@@ -109,7 +110,6 @@ EVALUATOR_LOG_GROUP = os.environ.get(
     "EVALUATOR_LOG_GROUP",
     "",
 )
-DEFAULT_EVALUATOR_LOG_GROUP = "/aws/bedrock-agentcore/evaluations/results/evaluation_quick_start_1773400924069-RMD3JBHdQM"
 EVALUATOR_LOG_PREFIX = os.environ.get("EVALUATOR_LOG_PREFIX", "")
 FLEET_RUNTIME_LIMIT = int(os.environ.get("FLEET_RUNTIME_LIMIT", "1800"))
 FLEET_EVALUATOR_MAX_GROUPS = int(os.environ.get("FLEET_EVALUATOR_MAX_GROUPS", "10"))
@@ -374,6 +374,43 @@ def _sanitize_analysis_answer(text: str, traces_total: int = 0) -> str:
     cleaned = "\n".join(cleaned_lines)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     return cleaned.strip()
+
+
+def _normalize_analyst_memory(history: Any, max_items: int = 6) -> List[Dict[str, str]]:
+    if not isinstance(history, list):
+        return []
+
+    normalized: List[Dict[str, str]] = []
+    for item in history:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role", "")).strip().lower()
+        text = str(item.get("text", "")).strip()
+        if not text:
+            continue
+        if role not in {"user", "assistant", "system", "context"}:
+            role = "context"
+        text = re.sub(r"\s+", " ", text)
+        if len(text) > 320:
+            text = text[:320].rstrip() + "..."
+        normalized.append({"role": role, "text": text})
+
+    return normalized[-max_items:]
+
+
+def _format_analyst_memory(history: Any) -> str:
+    items = _normalize_analyst_memory(history)
+    if not items:
+        return ""
+
+    label_map = {
+        "user": "User",
+        "assistant": "Assistant",
+        "system": "System",
+        "context": "Context",
+    }
+    lines = [f"{label_map.get(item['role'], 'Context')}: {item['text']}" for item in items]
+    return "\n".join(lines)
 
 
 def _normalize_trace_id(value: str) -> str:
@@ -1016,12 +1053,11 @@ def _discover_log_groups(prefix: str, limit: int = 25) -> list:
 
 def _resolve_evaluator_log_groups() -> list:
     if EVALUATOR_LOG_GROUP:
-        return [EVALUATOR_LOG_GROUP]
-    # Safety default: keep analyzer scoped to the configured quick-start group unless explicitly overridden.
-    if DEFAULT_EVALUATOR_LOG_GROUP:
-        return [DEFAULT_EVALUATOR_LOG_GROUP]
+        pinned = [EVALUATOR_LOG_GROUP]
+    else:
+        pinned = []
 
-    groups = []
+    groups = list(pinned)
     discovered = _discover_log_groups(EVALUATOR_LOG_PREFIX, limit=40)
     # Keep only result streams to reduce scan cost/noise.
     filtered = [g for g in discovered if "/results/" in g]
@@ -1314,27 +1350,34 @@ def _build_diagnosis_fallback(merged: Dict[str, Any], error: str) -> str:
     return "\n".join(lines)
 
 
-def _build_diagnosis(question: str, merged: Dict[str, Any]) -> str:
+def _build_diagnosis(question: str, merged: Dict[str, Any], analyst_memory: Any = None) -> str:
     system_prompt = (
         "You are a session log analyst for an AWS Bedrock AgentCore application. "
         "You have access to structured diagnostics data for a single agent session, "
         "including runtime metadata (latency, token counts), X-Ray trace step timings, "
         "and evaluator quality metric scores. "
         "Answer the user's question concisely and accurately using only the data provided. "
+        "Explain findings in plain language for a non-technical reader. "
         "FORMATTING RULES: Plain text only. No emojis, no markdown, no tables, no bullet points. "
-        "Short paragraphs and professional tone. "
+        "Short paragraphs and professional tone. Prefer 3-5 short paragraphs. "
         "Format numbers readably (e.g. '8.1 seconds' or '3.4 seconds'). "
         "Do not mention request IDs, session IDs, trace IDs, or internal anchor values unless user explicitly asks. "
+        "If you mention any identifier, always print the full value exactly as provided. Never shorten or abbreviate it. "
         "If tools_used is empty or zero, do not report it or mention it - S3 price retrieval is pre-injected as context before the model call, not a Bedrock tool call. "
         "Do not fabricate values."
     )
 
-    context_json = json.dumps(merged, indent=2, default=str)
+    llm_context = _build_llm_analysis_context(merged, max_diag_traces=12)
+    context_json = json.dumps(llm_context, default=str)
     user_question = question.strip() if question and question.strip() else "Give me a full summary of this session."
-    user_content = (
-        f"Here is the diagnostics data for this session:\n\n"
-        f"```json\n{context_json}\n```\n\n"
-        f"Question: {user_question}"
+    memory_block = _format_analyst_memory(analyst_memory)
+    user_content = "".join(
+        [
+            "Here is the diagnostics data for this session:\n\n",
+            f"Diagnostics: {context_json}\n\n",
+            f"Recent analyst conversation:\n{memory_block}\n\n" if memory_block else "",
+            f"Question: {user_question}",
+        ]
     )
 
     try:
@@ -1379,6 +1422,46 @@ def _extract_trace_id_from_payload(payload: Dict[str, Any], message: str = "") -
     message_norm = _normalize_trace_id(message)
     trace_match = re.search(r"\b[0-9a-f]{32}\b", message_norm)
     return trace_match.group(0) if trace_match else ""
+
+
+def _collect_evaluator_metrics_by_trace_ids(
+    evaluator_records: List[Dict[str, Any]],
+    trace_ids: List[str],
+) -> Dict[str, Dict[str, Any]]:
+    requested = {
+        _normalize_trace_id(trace_id)
+        for trace_id in (trace_ids or [])
+        if _normalize_trace_id(trace_id)
+    }
+    if not requested:
+        return {}
+
+    out: Dict[str, Dict[str, Any]] = {}
+    for rec in evaluator_records:
+        if not isinstance(rec, dict):
+            continue
+        message = str(rec.get("_cloudwatch_message", ""))
+        trace_id = _extract_trace_id_from_payload(rec, message)
+        if trace_id not in requested:
+            continue
+
+        metrics: Dict[str, Dict[str, Any]] = {}
+        _collect_evaluations(rec, metrics)
+        if not metrics:
+            continue
+
+        bucket = out.setdefault(trace_id, {})
+        for name, details in metrics.items():
+            if not isinstance(details, dict):
+                continue
+            bucket[str(name)] = {
+                "score": details.get("score"),
+                "label": details.get("label", ""),
+                "explanation": details.get("explanation", ""),
+                "severity_number": details.get("severity_number"),
+            }
+
+    return out
 
 
 def _is_runtime_trace_payload(payload: Dict[str, Any]) -> bool:
@@ -1923,30 +2006,25 @@ def _build_fleet_summary_with_llm(question: str, merged: Dict[str, Any]) -> str:
         return f"Analysis unavailable: {exc}"
 
 
-def _build_fleet_diagnosis(question: str, merged: Dict[str, Any]) -> str:
+def _build_fleet_diagnosis(question: str, merged: Dict[str, Any], analyst_memory: Any = None) -> str:
     window_minutes = int(merged.get("window", {}).get("duration_minutes", 0) or 0)
     system_prompt = (
-        "You are a session log analyst for an AWS Bedrock AgentCore system. "
-        f"You receive merged diagnostics from X-Ray, runtime logs, and evaluator logs for a {window_minutes}-minute window. "
-        "Identify latency bottlenecks, delay points between stages, and likely causes based only on provided data. "
-        "If a metric is inferred/approximate, state that explicitly. "
-        "If trace_lookup.requested_trace_ids is present, treat the request as a focused trace lookup and answer only for the matched traces. "
-        "Do not say a trace is missing just because it is absent from another pagination page; rely on trace_lookup and the filtered payload. "
-        "When xray details are present under trace_diagnostics[].xray or xray_trace_details, use the step timeline and slowest_step fields directly. "
-        "FORMATTING: Use plain text only, no emojis, no tables, no markdown. Keep it professional and concise. "
-        "Default behavior: provide a clean, human-readable executive summary first, then include requested details. "
-        "Use short sections, plain language, and professional formatting. "
-        "Do not fabricate values."
+        "Analyze fleet diagnostics. Answer in 2-3 sentences only. "
+        "Identify the #1 bottleneck. Plain text. Print full IDs."
     )
 
-    context_json = json.dumps(merged, default=str)
+    llm_context = _build_llm_analysis_context(merged, max_diag_traces=12)
+    context_json = json.dumps(llm_context, default=str)
     user_question = question.strip() if question and question.strip() else "Analyze this fleet window and rank bottlenecks."
-    user_content = (
-        f"Window size: {window_minutes} minutes.\n"
-        "Here is the diagnostics data for multiple user sessions within the selected time window. "
-        "Each session represents a single user visit and contains multiple traces.\n\n"
-        f"```json\n{context_json}\n```\n\n"
-        f"Question: {user_question}"
+    memory_block = _format_analyst_memory(analyst_memory)
+    user_content = "".join(
+        [
+            f"Window size: {window_minutes} minutes.\n",
+            "Here is the diagnostics data for multiple user sessions within the selected time window. Each session represents a single user visit and contains multiple traces.\n\n",
+            f"Diagnostics: {context_json}\n\n",
+            f"Recent analyst conversation:\n{memory_block}\n\n" if memory_block else "",
+            f"Question: {user_question}",
+        ]
     )
 
     try:
@@ -1961,27 +2039,25 @@ def _build_fleet_diagnosis(question: str, merged: Dict[str, Any]) -> str:
         return f"Fleet diagnosis unavailable: {exc}"
 
 
-def _build_discovery_diagnosis(question: str, merged: Dict[str, Any]) -> str:
+def _build_discovery_diagnosis(question: str, merged: Dict[str, Any], analyst_memory: Any = None) -> str:
     window_minutes = int((merged.get("window") or {}).get("duration_minutes", 0) or 0)
     system_prompt = (
-        "You are a session log analyst for an AWS Bedrock AgentCore system. "
-        "You are answering a fleet discovery question over multiple sessions. "
-        "Use only the provided session summaries, user summaries, bottleneck ranking, and top anomalies. "
-        "Return a concise executive summary first, then the top slow/problem sessions with short causes. "
-        "Do not restate the full dataset. Do not explain methodology. "
-        "Plain text only. No markdown, no tables, no emojis. "
-        "Prefer 6-10 short paragraphs or lines total. "
-        "If sessions are truncated, say that conclusions are based on the highest-risk sessions shown. "
-        "Do not fabricate values."
+        "Summarize the highest-risk sessions in concise plain language. "
+        "If the user asks for lists, include complete lists with full IDs and latency values. "
+        "No markdown. No filler."
     )
 
     context_json = json.dumps(merged, default=str)
     user_question = question.strip() if question and question.strip() else "Summarize the slowest and most problematic sessions in this window."
-    user_content = (
-        f"Window size: {window_minutes} minutes.\n"
-        "Here is the compact discovery context for the highest-risk sessions in the selected window.\n"
-        f"Context: {context_json}\n"
-        f"Question: {user_question}"
+    memory_block = _format_analyst_memory(analyst_memory)
+    user_content = "".join(
+        [
+            f"Window size: {window_minutes} minutes.\n",
+            "Here is the compact discovery context for the highest-risk sessions in the selected window.\n",
+            f"Context: {context_json}\n",
+            f"Recent analyst conversation:\n{memory_block}\n" if memory_block else "",
+            f"Question: {user_question}",
+        ]
     )
 
     try:
@@ -1996,25 +2072,25 @@ def _build_discovery_diagnosis(question: str, merged: Dict[str, Any]) -> str:
         return f"Fleet discovery unavailable: {exc}"
 
 
-def _build_trace_lookup_diagnosis(question: str, merged: Dict[str, Any]) -> str:
+def _build_trace_lookup_diagnosis(question: str, merged: Dict[str, Any], analyst_memory: Any = None) -> str:
     system_prompt = (
-        "You are a trace diagnostics analyst for AWS AgentCore. "
-        "You are answering a focused trace lookup query, not a fleet summary. "
-        "Use trace_lookup, trace_diagnostics, and xray_trace_details as the primary sources. "
-        "For each matched trace, provide a compact segment delay breakdown and identify the dominant bottleneck. "
-        "If xray_trace_details contains steps or totals_by_name, use them directly. "
-        "If xray_trace_details is present but sparse, say exactly what fields are available. "
-        "Do not output generic discovery/fleet commentary. "
-        "Plain text only, no markdown, no tables, no emojis. "
-        "Keep the answer concise and bounded to the requested trace(s)."
+        "Analyze matched traces. Answer in 2-3 sentences only. "
+        "Name the slowest step and dominant delay source. "
+        "If evaluator_scores exist for a matched trace, report those scores and do not claim they are missing. "
+        "Plain text. Full IDs."
     )
 
     user_question = question.strip() if question and question.strip() else "Analyze the requested trace IDs with X-Ray segment delays."
-    context_json = json.dumps(merged, default=str)
-    user_content = (
-        "Focused trace lookup context:\n"
-        f"{context_json}\n\n"
-        f"Question: {user_question}"
+    llm_context = _build_llm_analysis_context(merged, max_diag_traces=12)
+    context_json = json.dumps(llm_context, default=str)
+    memory_block = _format_analyst_memory(analyst_memory)
+    user_content = "".join(
+        [
+            "Focused trace lookup context:\n",
+            f"{context_json}\n\n",
+            f"Recent analyst conversation:\n{memory_block}\n\n" if memory_block else "",
+            f"Question: {user_question}",
+        ]
     )
 
     try:
@@ -2392,6 +2468,14 @@ def _detect_query_mode(question: str, sessions: Dict[str, Any], users: Dict[str,
         if sid.lower() in q:
             return {"mode": "deep_dive", "session_id": sid}
 
+    explicit_session_match = re.search(
+        r"\b[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}\b",
+        q,
+        flags=re.IGNORECASE,
+    )
+    if explicit_session_match:
+        return {"mode": "deep_dive", "session_id": explicit_session_match.group(0)}
+
     matched_user = _resolve_user_from_question(question, users)
     if matched_user:
         return {
@@ -2545,16 +2629,84 @@ def _build_deep_dive_context(merged: Dict[str, Any], session_id: str) -> Dict[st
             "available_sessions": list(sessions.keys())[:20],
         }
 
+    def _slim_eval(scores: Any) -> Dict[str, Any]:
+        if not isinstance(scores, dict):
+            return {}
+        slim: Dict[str, Any] = {}
+        for name, value in scores.items():
+            if isinstance(value, dict):
+                slim[str(name)] = {
+                    "score": value.get("score"),
+                    "label": value.get("label"),
+                }
+        return slim
+
     # Pull enriched xray details scoped to this session's traces
     session_trace_ids = {
         _normalize_trace_id(str(tr.get("trace_id", "")))
         for tr in session.get("traces", [])
         if isinstance(tr, dict)
     }
-    xray_details_for_session = [
-        d for d in (merged.get("xray_trace_details") or [])
+    xray_details_for_session = {
+        _normalize_trace_id(str((d or {}).get("trace_id", "") or (d or {}).get("trace_id_normalized", ""))): d
+        for d in (merged.get("xray_trace_details") or [])
         if _normalize_trace_id(str((d or {}).get("trace_id", "") or (d or {}).get("trace_id_normalized", ""))) in session_trace_ids
-    ]
+    }
+
+    prioritized_traces = sorted(
+        [tr for tr in (session.get("traces") or []) if isinstance(tr, dict)],
+        key=lambda tr: (
+            0 if str(tr.get("status", "success")).lower() != "success" else 1,
+            0 if bool(tr.get("is_delayed")) else 1,
+            -_to_float(tr.get("e2e_ms") or (tr.get("stage_latency_ms") or {}).get("e2e")),
+        ),
+    )
+
+    trace_samples: List[Dict[str, Any]] = []
+    slim_xray_details: List[Dict[str, Any]] = []
+    for tr in prioritized_traces[:8]:
+        trace_id = str(tr.get("trace_id", ""))
+        normalized_trace_id = _normalize_trace_id(trace_id)
+        stage_ms = tr.get("stage_latency_ms") or {
+            "runtime": tr.get("runtime_latency_ms"),
+            "evaluator": tr.get("evaluator_latency_ms"),
+            "e2e": tr.get("e2e_ms"),
+        }
+        trace_samples.append(
+            {
+                "trace_id": trace_id,
+                "status": str(tr.get("status", "success")),
+                "is_delayed": bool(tr.get("is_delayed", False)),
+                "e2e_ms": round(_to_float(tr.get("e2e_ms") or stage_ms.get("e2e")), 2),
+                "stage_ms": stage_ms,
+                "evaluator_scores": _slim_eval(tr.get("evaluator_scores") or tr.get("evaluator_metrics") or {}),
+                "user": tr.get("user", {}),
+                "xray": (tr.get("xray") or {}),
+            }
+        )
+        detail = xray_details_for_session.get(normalized_trace_id)
+        if isinstance(detail, dict):
+            slowest_step = detail.get("slowest_step") or {}
+            steps = [
+                {
+                    "name": step.get("name"),
+                    "duration_ms": step.get("duration_ms"),
+                }
+                for step in (detail.get("steps") or [])[:6]
+                if isinstance(step, dict)
+            ]
+            slim_xray_details.append(
+                {
+                    "trace_id": normalized_trace_id,
+                    "xray_trace_id": str(detail.get("xray_trace_id") or detail.get("trace_id") or ""),
+                    "total_latency_ms": detail.get("total_latency_ms"),
+                    "slowest_step": {
+                        "name": slowest_step.get("name"),
+                        "duration_ms": slowest_step.get("duration_ms"),
+                    } if isinstance(slowest_step, dict) else {},
+                    "steps": steps,
+                }
+            )
 
     return {
         "analysis_mode": "deep_dive",
@@ -2563,15 +2715,45 @@ def _build_deep_dive_context(merged: Dict[str, Any], session_id: str) -> Dict[st
             "session_id": session_id,
             "user": session.get("user", {}),
             "trace_count": session.get("trace_count", 0),
-            "traces": session.get("traces", []),
+            "trace_samples": trace_samples,
+            "trace_samples_truncated": len(prioritized_traces) > len(trace_samples),
             "session_metrics": session.get("session_metrics", {}),
         },
-        "xray_trace_details": xray_details_for_session,
+        "xray_trace_details": slim_xray_details,
         "fleet_context": {
             "total_sessions": (merged.get("fleet_summary") or {}).get("total_sessions", 0),
             "fleet_avg_e2e_ms": ((merged.get("fleet_metrics") or {}).get("e2e_ms") or {}).get("avg", 0),
         },
     }
+
+
+def _build_session_deep_dive_diagnosis(question: str, merged: Dict[str, Any], analyst_memory: Any = None) -> str:
+    system_prompt = (
+        "Analyze this session. Answer in 2-3 sentences. Plain text. Print full IDs."
+    )
+
+    user_question = question.strip() if question and question.strip() else "Explain what happened in this session."
+    context_json = json.dumps(merged, default=str)
+    memory_block = _format_analyst_memory(analyst_memory)
+    user_content = "".join(
+        [
+            "Focused session context:\n",
+            f"{context_json}\n\n",
+            f"Recent analyst conversation:\n{memory_block}\n\n" if memory_block else "",
+            f"Question: {user_question}",
+        ]
+    )
+
+    try:
+        response = BEDROCK_CLIENT.converse(
+            modelId=DIAGNOSIS_MODEL_ID,
+            system=[{"text": system_prompt}],
+            messages=[{"role": "user", "content": [{"text": user_content}]}],
+            inferenceConfig={"maxTokens": DIAGNOSIS_SESSION_DEEP_DIVE_MAX_TOKENS, "temperature": 0.1},
+        )
+        return response["output"]["message"]["content"][0]["text"]
+    except Exception as exc:
+        return f"Session deep-dive unavailable: {exc}"
 
 
 def _build_llm_analysis_context(merged: Dict[str, Any], max_diag_traces: int = 25) -> Dict[str, Any]:
@@ -2656,7 +2838,7 @@ def _build_llm_analysis_context(merged: Dict[str, Any], max_diag_traces: int = 2
     }
 
 
-def _handle_fleet_insights(question: str, lookback_hours: int, lookback_mode: str = "", page: int = 1, page_size: int = 15) -> Dict[str, Any]:
+def _handle_fleet_insights(question: str, lookback_hours: int, lookback_mode: str = "", page: int = 1, page_size: int = 15, analyst_memory: Any = None) -> Dict[str, Any]:
     handler_start = time.perf_counter()
     analysis_id = str(uuid.uuid4())[:8]
     window_minutes = int(lookback_hours * 60)
@@ -3179,6 +3361,7 @@ def _handle_fleet_insights(question: str, lookback_hours: int, lookback_mode: st
     traces_by_id = {str(t.get("trace_id", "")): t for t in all_traces}
     matched_trace_ids = [trace_id for trace_id in requested_trace_ids if trace_id in traces_by_id]
     missing_trace_ids = [trace_id for trace_id in requested_trace_ids if trace_id not in traces_by_id]
+    trace_lookup_supplemental: List[Dict[str, Any]] = []
     _is_trace_lookup = bool(requested_trace_ids)
     should_paginate = _should_paginate_trace_context(
         question=question,
@@ -3196,14 +3379,51 @@ def _handle_fleet_insights(question: str, lookback_hours: int, lookback_mode: st
     selected_trace_ids_for_llm: List[str] = [str(t.get("trace_id", "")) for t in all_traces]
 
     if requested_trace_ids:
-        traces_for_llm = [traces_by_id[trace_id] for trace_id in matched_trace_ids]
-        selected_trace_ids_for_llm = matched_trace_ids
+        evaluator_fallback = _collect_evaluator_metrics_by_trace_ids(evaluator_records, missing_trace_ids)
+        promoted_trace_ids: List[str] = []
+        for trace_id in missing_trace_ids:
+            metrics = evaluator_fallback.get(trace_id)
+            if not metrics:
+                continue
+            promoted_trace_ids.append(trace_id)
+            trace_lookup_supplemental.append(
+                {
+                    "trace_id": trace_id,
+                    "status": "partial_data",
+                    "is_delayed": False,
+                    "stage_latency_ms": {
+                        "runtime": 0.0,
+                        "model_or_handoff_gap": 0.0,
+                        "evaluator": 0.0,
+                        "e2e": 0.0,
+                    },
+                    "user": {},
+                    "evaluator_scores": metrics,
+                    "xray": {},
+                    "note": "Evaluator metrics found, but runtime/X-Ray trace row is outside the current merged window.",
+                }
+            )
+
+        if promoted_trace_ids:
+            matched_trace_ids = matched_trace_ids + [trace_id for trace_id in promoted_trace_ids if trace_id not in matched_trace_ids]
+            missing_trace_ids = [trace_id for trace_id in requested_trace_ids if trace_id not in matched_trace_ids]
+
+        traces_for_llm = [traces_by_id[trace_id] for trace_id in matched_trace_ids if trace_id in traces_by_id]
+        traces_for_llm.extend(
+            [
+                row
+                for row in trace_lookup_supplemental
+                if str(row.get("trace_id", "")) in matched_trace_ids
+            ]
+        )
+        selected_trace_ids_for_llm = [str(row.get("trace_id", "")) for row in traces_for_llm if str(row.get("trace_id", ""))]
         trace_lookup_context = {
             "requested_trace_ids": requested_trace_ids,
             "matched_trace_ids": matched_trace_ids,
             "missing_trace_ids": missing_trace_ids,
             "matched_count": len(matched_trace_ids),
             "window_traces_total": len(all_traces),
+            "supplemental_trace_ids": [str(row.get("trace_id", "")) for row in trace_lookup_supplemental],
         }
         _emit_analyzer_trace({
             "phase": "trace_lookup_applied",
@@ -3211,6 +3431,7 @@ def _handle_fleet_insights(question: str, lookback_hours: int, lookback_mode: st
             "requested_trace_ids": requested_trace_ids,
             "matched_trace_ids": matched_trace_ids,
             "missing_trace_ids": missing_trace_ids,
+            "supplemental_trace_ids": [str(row.get("trace_id", "")) for row in trace_lookup_supplemental],
         })
     elif should_paginate:
         paged_traces, total_pages, has_next = _apply_pagination_to_traces(all_traces, page, page_size)
@@ -3272,6 +3493,72 @@ def _handle_fleet_insights(question: str, lookback_hours: int, lookback_mode: st
             t for t in merged.get("trace_samples", [])
             if str(t.get("trace_id", "")) in selected_trace_ids_set
         ]
+
+    if trace_lookup_supplemental:
+        existing_diag_ids = {str(t.get("trace_id", "")) for t in merged_for_llm.get("trace_diagnostics", [])}
+        existing_index_ids = {str(t.get("trace_id", "")) for t in merged_for_llm.get("trace_index", [])}
+        for row in trace_lookup_supplemental:
+            trace_id = str(row.get("trace_id", ""))
+            if not trace_id:
+                continue
+            if trace_id not in existing_diag_ids:
+                merged_for_llm.setdefault("trace_diagnostics", []).append(row)
+                existing_diag_ids.add(trace_id)
+            if trace_id not in existing_index_ids:
+                merged_for_llm.setdefault("trace_index", []).append(
+                    {
+                        "trace_id": trace_id,
+                        "e2e_ms": 0.0,
+                        "runtime_latency_ms": 0.0,
+                        "evaluator_latency_ms": 0.0,
+                        "inferred_model_or_gap_ms": 0.0,
+                        "status": "partial_data",
+                        "is_delayed": False,
+                        "user": {},
+                        "evaluator_scores": row.get("evaluator_scores", {}),
+                        "xray": {},
+                    }
+                )
+                existing_index_ids.add(trace_id)
+
+    # ── Targeted evaluator back-fill for matched traces with empty scores ─────
+    # The standard merge loop extracts trace IDs from structured OTEL fields.
+    # When evaluator records omit those fields (e.g. X-Ray trace ID only in the
+    # raw log line) the merged evaluator_scores dict stays empty even though the
+    # scores ARE in the log group.  For explicit trace ID requests we do a second
+    # pass: search raw log message text for both compact and X-Ray-formatted IDs
+    # and inject any scores found directly into the trace_diagnostics entries.
+    if _is_trace_lookup and requested_trace_ids:
+        requested_ids_set = set(requested_trace_ids)
+        for diag in merged_for_llm.get("trace_diagnostics", []):
+            if diag.get("evaluator_scores"):
+                continue  # already has scores
+            trace_id = _normalize_trace_id(str(diag.get("trace_id", "")))
+            if trace_id not in requested_ids_set:
+                continue
+            xray_form = _denormalize_trace_id(trace_id)
+            backfill: Dict[str, Any] = {}
+            for rec in evaluator_records:
+                if not isinstance(rec, dict):
+                    continue
+                message = str(rec.get("_cloudwatch_message", "")).lower()
+                if trace_id not in message and xray_form not in message:
+                    continue
+                _collect_evaluations(rec, backfill)
+            if backfill:
+                slim: Dict[str, Any] = {}
+                for name, val in backfill.items():
+                    if isinstance(val, dict):
+                        slim[str(name)] = {"score": val.get("score"), "label": val.get("label", "")}
+                    else:
+                        slim[str(name)] = {"score": val, "label": ""}
+                diag["evaluator_scores"] = slim
+                _emit_analyzer_trace({
+                    "phase": "evaluator_scores_backfilled",
+                    "analysis_id": analysis_id,
+                    "trace_id": trace_id,
+                    "metrics_found": list(slim.keys()),
+                })
 
     if trace_lookup_context:
         merged_for_llm["trace_lookup"] = trace_lookup_context
@@ -3493,7 +3780,7 @@ def _handle_fleet_insights(question: str, lookback_hours: int, lookback_mode: st
     # Use the full remaining safe budget for the LLM call (no fixed 14s/22s cap).
     # This keeps us under API Gateway timeout while allowing deep trace/session
     # questions enough time to complete.
-    remaining_llm_budget = max(0.0, 27.0 - elapsed_before_llm)
+    remaining_llm_budget = max(0.0, 28.2 - elapsed_before_llm)
     if remaining_llm_budget < 4.0:
         raise TimeoutError(
             f"Fleet analysis aborted before LLM call because only {round(remaining_llm_budget, 2)}s remained in the response budget."
@@ -3510,13 +3797,13 @@ def _handle_fleet_insights(question: str, lookback_hours: int, lookback_mode: st
     if _is_trace_lookup:
         llm_builder = _build_trace_lookup_diagnosis
     elif _is_deep_dive:
-        llm_builder = _build_fleet_diagnosis
+        llm_builder = _build_session_deep_dive_diagnosis
     else:
         llm_builder = _build_discovery_diagnosis
 
     _llm_executor = ThreadPoolExecutor(max_workers=1)
     try:
-        _llm_future = _llm_executor.submit(llm_builder, question, llm_context)
+        _llm_future = _llm_executor.submit(llm_builder, question, llm_context, analyst_memory)
         try:
             raw_answer = _llm_future.result(timeout=llm_timeout_seconds)
         except FutureTimeoutError as exc:
@@ -3646,6 +3933,7 @@ def _handle_session_insights(event: Dict[str, Any]) -> Dict[str, Any]:
     lookback_hours = _resolve_lookback_hours(body, default_hours=24)
     lookback_mode = str(body.get("lookback_mode", "")).strip().lower()
     analysis_mode = str(body.get("analysis_mode", "single_trace")).strip().lower()
+    analyst_memory = _normalize_analyst_memory(body.get("analyst_memory", []))
 
     # Extract pagination parameters for trace listing queries
     try:
@@ -3669,6 +3957,7 @@ def _handle_session_insights(event: Dict[str, Any]) -> Dict[str, Any]:
                 lookback_mode=lookback_mode,
                 page=pagination_page,
                 page_size=pagination_page_size,
+                analyst_memory=analyst_memory,
             )
             elapsed = round(time.perf_counter() - request_start, 2)
             # Log successful completion
@@ -3983,7 +4272,7 @@ def _handle_session_insights(event: Dict[str, Any]) -> Dict[str, Any]:
         # Invoke LLM to generate analysis
         llm_start = time.perf_counter()
         answer = _sanitize_analysis_answer(
-            _build_diagnosis(question, merged),
+            _build_diagnosis(question, merged, analyst_memory),
             traces_total=0,
         )
         llm_elapsed = round(time.perf_counter() - llm_start, 2)
