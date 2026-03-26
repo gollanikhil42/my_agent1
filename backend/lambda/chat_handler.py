@@ -490,6 +490,50 @@ def _classify_question_intent_llm(question: str, analyst_memory: Any = None) -> 
     return "telemetry_analysis"
 
 
+def _classify_collection_strategy_llm(question: str, analyst_memory: Any = None) -> str:
+    """Choose data collection strategy for fleet analysis.
+
+    Returns one of:
+    - "completeness_first": prioritize superset-like consistency for listings
+    - "balanced": default bounded collection strategy
+    """
+    q = str(question or "").strip()
+    if not q:
+        return "balanced"
+
+    system_prompt = (
+        "Classify the data collection strategy for telemetry analysis. "
+        "Return ONLY JSON as {\"strategy\": \"completeness_first\"} or {\"strategy\": \"balanced\"}. "
+        "Use completeness_first when the user asks to enumerate/list all sessions/users/trace IDs, "
+        "asks for exact counts, or compares different time windows where superset consistency matters. "
+        "Use balanced for normal summaries or exploratory diagnostics where partial sampling is acceptable."
+    )
+    memory_block = _format_analyst_memory(analyst_memory)
+    user_content = "".join(
+        [
+            f"Recent conversation:\n{memory_block}\n\n" if memory_block else "",
+            f"Message: {q}",
+        ]
+    )
+
+    try:
+        response = BEDROCK_CLIENT.converse(
+            modelId=DIAGNOSIS_MODEL_ID,
+            system=[{"text": system_prompt}],
+            messages=[{"role": "user", "content": [{"text": user_content}]}],
+            inferenceConfig={"maxTokens": 80, "temperature": 0.0},
+        )
+        text = str(response["output"]["message"]["content"][0]["text"] or "").strip()
+        parsed = json.loads(text)
+        strategy = str((parsed or {}).get("strategy", "")).strip().lower()
+        if strategy in {"completeness_first", "balanced"}:
+            return strategy
+    except Exception:
+        pass
+
+    return "balanced"
+
+
 def _build_general_conversation_reply(question: str, analyst_memory: Any = None) -> str:
     system_prompt = (
         "You are a friendly assistant for an operations dashboard. "
@@ -1645,6 +1689,8 @@ def _fetch_runtime_records_window(
     limit: int = 1500,
     max_seconds: float = 0.0,
     max_candidate_streams: int = 0,
+    max_fixed_stream_pages: int = 25,
+    force_backfill_insights: bool = False,
 ) -> Dict[str, Any]:
     if not RUNTIME_LOG_GROUP:
         return {
@@ -1690,12 +1736,26 @@ def _fetch_runtime_records_window(
             if source_stream:
                 source_stats["backfill_streams"].add(source_stream)
 
-    # Primary path: fixed stream populated by runtime.
-    if RUNTIME_LOG_STREAM:
+    # Completeness-first mode seeds from Log Insights first. Insights scans the
+    # whole log group server-side in descending timestamp order, which prevents
+    # larger windows from being dominated by older high-volume users before newer
+    # low-volume users are seen.
+    backfill_budget = max(0.0, max_seconds - (time.perf_counter() - started)) if max_seconds > 0 else 0.0
+    if (force_backfill_insights or RUNTIME_BACKFILL_ENABLED) and (max_seconds <= 0 or backfill_budget > 1.0):
+        stream_scan_limit = min(max(limit * max(2, RUNTIME_LOG_SCAN_MULTIPLIER), 2500), 20000)
+        for row in _fetch_runtime_backfill_insights(
+            lookback_hours=lookback_hours,
+            limit=stream_scan_limit,
+            max_seconds=backfill_budget,
+        ):
+            _append_runtime_event(row, "backfill")
+
+    # Primary fixed-stream path populated by runtime.
+    if RUNTIME_LOG_STREAM and len(records) < limit:
         try:
             next_token = None
             pages = 0
-            while pages < 25 and len(records) < limit:
+            while pages < max(1, int(max_fixed_stream_pages)) and len(records) < limit:
                 if max_seconds > 0 and (time.perf_counter() - started) >= max_seconds:
                     break
                 kwargs: Dict[str, Any] = {
@@ -1720,12 +1780,11 @@ def _fetch_runtime_records_window(
         except Exception:
             pass
 
-    # Primary backfill: CloudWatch Log Insights (server-side, any window in 2-5 s).
-    # Queries the entire log group at once — no per-stream page scanning.
+    # Standard backfill path when not already forced above.
     stream_scan_limit = min(max(limit * max(2, RUNTIME_LOG_SCAN_MULTIPLIER), 2500), 20000)
     backfill_budget = max(0.0, max_seconds - (time.perf_counter() - started)) if max_seconds > 0 else 0.0
 
-    if RUNTIME_BACKFILL_ENABLED and len(records) < limit and (max_seconds <= 0 or backfill_budget > 1.0):
+    if (not force_backfill_insights) and RUNTIME_BACKFILL_ENABLED and len(records) < limit and (max_seconds <= 0 or backfill_budget > 1.0):
         for row in _fetch_runtime_backfill_insights(
             lookback_hours=lookback_hours,
             limit=stream_scan_limit,
@@ -2210,10 +2269,14 @@ def _build_discovery_diagnosis(
     window_minutes = int((merged.get("window") or {}).get("duration_minutes", 0) or 0)
     system_prompt = (
         "You are a telemetry analyst. Understand what the user is asking and respond naturally. "
+        "The context has two scopes: sessions/users for current page details, and all_pages_session_index/all_pages_user_index for whole-window awareness. "
         "For listing/enumeration requests ('list sessions', 'show all users', 'give me usernames', 'what sessions exist'): "
         "list every item from the users and sessions data — include session IDs, usernames, timestamps (UTC), and metrics. "
+        "For username-only requests, use all_pages_user_index as the source of truth for the whole window (not only current page users). "
+        "If the user asks for trace IDs for a session, use all_pages_session_index.trace_ids_preview when available; if more traces exist than preview, say this is a preview and suggest deep-dive for complete list. "
         "For summary/analysis requests: give a concise overview highlighting key issues. "
         "For user-specific requests: focus only on that user's sessions and metrics. "
+        "For questions about the whole timeframe, use all_pages_session_index/all_pages_user_index instead of only the current page. "
         "Always include timestamps in UTC when available in the data. "
         "Use 'average latency' and 'maximum latency' — never abbreviate as avg/max. "
         "If user_filter.matched is false and user_filter.suggested_user_names has entries, explicitly say: "
@@ -2336,6 +2399,34 @@ def _is_known_user_id(value: str) -> bool:
     return bool(text and text not in {"unknown", "unknown-user", "anonymous", "none"})
 
 
+def _normalize_user_identity(user: Dict[str, Any]) -> Dict[str, str]:
+    bucket = user if isinstance(user, dict) else {}
+    raw_user_id = str(bucket.get("user_id", "")).strip()
+    raw_user_name = str(bucket.get("user_name", "") or "").strip()
+    department = str(bucket.get("department", "unknown") or "unknown")
+    user_role = str(bucket.get("user_role", "unknown") or "unknown")
+
+    user_id_lower = raw_user_id.lower()
+    user_name_lower = raw_user_name.lower()
+    unknown_ids = {"", "unknown", "unknown-user", "none", "null", "n/a"}
+    unknown_names = {"", "unknown", "unknown-user", "none", "null", "n/a"}
+
+    if user_id_lower in unknown_ids and user_name_lower in unknown_names:
+        return {
+            "user_id": "unknown-user",
+            "user_name": "unknown",
+            "department": department,
+            "user_role": user_role,
+        }
+
+    return {
+        "user_id": raw_user_id or "unknown-user",
+        "user_name": raw_user_name or "unknown",
+        "department": department,
+        "user_role": user_role,
+    }
+
+
 def _normalize_session_id(value: str) -> str:
     text = str(value or "").strip()
     if not text or text.lower() in {"none", "null", "unknown", "n/a"}:
@@ -2381,13 +2472,7 @@ def _derive_session_user(traces: List[Dict[str, Any]]) -> Dict[str, str]:
     for trace in traces:
         user = trace.get("user", {}) if isinstance(trace.get("user", {}), dict) else {}
         if user:
-            user_id = str(user.get("user_id", "")).strip() or "unknown-user"
-            return {
-                "user_id": user_id,
-                "user_name": str(user.get("user_name", "unknown") or "unknown"),
-                "department": str(user.get("department", "unknown") or "unknown"),
-                "user_role": str(user.get("user_role", "unknown") or "unknown"),
-            }
+            return _normalize_user_identity(user)
 
     return {
         "user_id": "unknown-user",
@@ -2523,7 +2608,7 @@ def _build_session_and_user_layers(
 
     users_map: Dict[str, Dict[str, Any]] = {}
     for row in session_rows:
-        user = row.get("user", {}) if isinstance(row.get("user", {}), dict) else {}
+        user = _normalize_user_identity(row.get("user", {}) if isinstance(row.get("user", {}), dict) else {})
         user_id = str(user.get("user_id", "")).strip() or "unknown-user"
         user_bucket = users_map.setdefault(
             user_id,
@@ -2600,7 +2685,12 @@ def _compact_fleet_merged(merged: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _detect_query_mode(question: str, sessions: Dict[str, Any], users: Dict[str, Any]) -> Dict[str, Any]:
+def _detect_query_mode(
+    question: str,
+    sessions: Dict[str, Any],
+    users: Dict[str, Any],
+    analyst_memory: Any = None,
+) -> Dict[str, Any]:
     """Resolve query mode using an LLM classifier against known session/user candidates.
 
     Returns one of:
@@ -2638,14 +2728,18 @@ def _detect_query_mode(question: str, sessions: Dict[str, Any], users: Dict[str,
         "Return ONLY JSON with keys: mode, session_id, user_id, requested_user. "
         "mode must be deep_dive or discovery. "
         "Choose deep_dive only when the question targets one specific session ID from session_candidates. "
+        "If the message uses references like 'it', 'that session', 'this user', resolve them using recent_conversation. "
+        "When a prior turn discussed exactly one session and the user asks for details such as trace IDs, choose deep_dive with that session_id. "
         "Choose discovery for everything else: listing sessions, listing users, asking about a user, fleet summaries, general queries. "
         "For user-specific discovery: if the user mentions a person's name or username, match it against known_user_candidates (case-insensitive, partial match ok) and set user_id. "
         "If the name does not match any known candidate, set requested_user to that name and leave user_id empty. "
         "If the question asks for all users / all sessions / a fleet overview with no specific user, leave user_id and requested_user empty."
     )
+    memory_block = _format_analyst_memory(analyst_memory)
     user_content = json.dumps(
         {
             "question": q,
+            "recent_conversation": memory_block,
             "session_candidates": session_candidates,
             "known_user_candidates": known_user_candidates,
             "output_contract": {
@@ -2732,6 +2826,62 @@ def _build_discovery_context(merged: Dict[str, Any], query_intent: Dict[str, Any
             "sessions_found": 0,
             "suggested_user_names": suggestions,
         }
+
+    # Keep a lightweight whole-window index even when page-level pagination is active.
+    # This gives the model cross-page awareness while preserving compact per-page detail.
+    all_pages_session_rows = [
+        (
+            sid,
+            {
+                "session_id": sid,
+                "user": (sess.get("user", {}) if isinstance(sess, dict) else {}),
+                "trace_count": int((sess.get("trace_count", 0) if isinstance(sess, dict) else 0) or 0),
+                "avg_latency_ms": ((sess.get("session_metrics") or {}).get("avg_e2e_ms") if isinstance(sess, dict) else 0.0),
+                "max_latency_ms": ((sess.get("session_metrics") or {}).get("max_e2e_ms") if isinstance(sess, dict) else 0.0),
+                "latest_trace_epoch_ms": ((sess.get("latest_trace_ts") if isinstance(sess, dict) else 0) or 0),
+                "latest_trace_timestamp_utc": _format_epoch_ms_to_iso_utc((sess.get("latest_trace_ts") if isinstance(sess, dict) else 0) or 0),
+                "trace_ids_preview": [
+                    str((tr or {}).get("trace_id", ""))
+                    for tr in ((sess.get("traces", []) if isinstance(sess, dict) else [])[:5])
+                    if str((tr or {}).get("trace_id", "")).strip()
+                ],
+            },
+        )
+        for sid, sess in filtered_sessions.items()
+        if isinstance(sess, dict)
+    ]
+    all_pages_session_rows.sort(
+        key=lambda item: (
+            -_to_float((item[1] or {}).get("latest_trace_epoch_ms")),
+            -_to_float((item[1] or {}).get("error_rate")),
+            -_to_float((item[1] or {}).get("max_latency_ms")),
+        )
+    )
+    all_pages_session_index = dict(all_pages_session_rows[:80])
+
+    users_from_all_pages: Dict[str, Dict[str, Any]] = {}
+    for _sid, _sess in filtered_sessions.items():
+        if not isinstance(_sess, dict):
+            continue
+        _u = _sess.get("user", {}) if isinstance(_sess.get("user", {}), dict) else {}
+        _uid = str(_u.get("user_id", "")).strip() or "unknown-user"
+        _uname = str(_u.get("user_name", "unknown") or "unknown")
+        _bucket = users_from_all_pages.setdefault(
+            _uid,
+            {
+                "user_id": _uid,
+                "user_name": _uname,
+                "session_ids": [],
+                "session_count": 0,
+                "total_traces": 0,
+            },
+        )
+        _bucket["session_ids"].append(str(_sid))
+        _bucket["total_traces"] += int(_sess.get("trace_count", 0) or 0)
+    for _uid, _obj in users_from_all_pages.items():
+        _obj["session_ids"] = sorted(set(_obj.get("session_ids", [])))[:40]
+        _obj["session_count"] = len(_obj["session_ids"])
+    all_pages_user_index = dict(list(users_from_all_pages.items())[:120])
 
     paged_sessions = filtered_sessions
     if sessions_pagination_context:
@@ -2863,6 +3013,8 @@ def _build_discovery_context(merged: Dict[str, Any], query_intent: Dict[str, Any
         "trace_lookup": merged.get("trace_lookup", {}),
         "pagination_context": merged.get("pagination_context", {}),
         "sessions_pagination_context": merged.get("sessions_pagination_context", {}),
+        "all_pages_session_index": all_pages_session_index,
+        "all_pages_user_index": all_pages_user_index,
         "user_filter": user_filter_meta,
         "completeness_note": completeness_note,
     }
@@ -3110,10 +3262,12 @@ def _handle_fleet_insights(
     page: int = 1,
     page_size: int = 15,
     analyst_memory: Any = None,
+    query_profile: str = "balanced",
 ) -> Dict[str, Any]:
     handler_start = time.perf_counter()
     analysis_id = str(uuid.uuid4())[:8]
     window_minutes = int(lookback_hours * 60)
+    completeness_first = str(query_profile or "balanced").strip().lower() == "completeness_first"
     # Disable fast-mode for 'overall' analytical queries; they require completeness over speed.
     is_analytical_overall = lookback_mode == "overall"
     # Apply fast-mode only beyond 30 days. For normal UI ranges (<=30 days), always
@@ -3121,6 +3275,7 @@ def _handle_fleet_insights(
     fast_mode = (
         (window_minutes > 30 * 24 * 60)
         and (not is_analytical_overall)
+        and (not completeness_first)
     )
 
     runtime_limit = max(200, FLEET_RUNTIME_LIMIT)
@@ -3128,6 +3283,7 @@ def _handle_fleet_insights(
     # These run IN PARALLEL so total wall time ≈ max(runtime, evaluator, xray) + LLM.
     runtime_budget_seconds = 7.0    # Normal: 7s — parallel bottleneck; formerly 15s sequential
     runtime_max_candidate_streams = 3000
+    runtime_fixed_stream_pages = 25
     evaluator_max_groups = max(1, FLEET_EVALUATOR_MAX_GROUPS)
     evaluator_per_group_limit = max(50, FLEET_EVALUATOR_PER_GROUP_LIMIT)
     evaluator_budget_seconds = 5.0  # Normal: 5s — runs in parallel with runtime+xray
@@ -3141,6 +3297,7 @@ def _handle_fleet_insights(
         runtime_limit = max(200, min(runtime_limit, FLEET_FAST_RUNTIME_LIMIT))
         runtime_budget_seconds = max(1.0, FLEET_FAST_RUNTIME_BUDGET_SECONDS)
         runtime_max_candidate_streams = max(100, FLEET_FAST_RUNTIME_MAX_CANDIDATE_STREAMS)
+        runtime_fixed_stream_pages = min(runtime_fixed_stream_pages, 10)
         evaluator_max_groups = max(1, min(evaluator_max_groups, FLEET_FAST_EVALUATOR_MAX_GROUPS))
         evaluator_per_group_limit = max(50, min(evaluator_per_group_limit, FLEET_FAST_EVALUATOR_PER_GROUP_LIMIT))
         evaluator_budget_seconds = max(0.5, FLEET_FAST_EVALUATOR_BUDGET_SECONDS)
@@ -3149,18 +3306,34 @@ def _handle_fleet_insights(
         xray_max_segments = max(1, FLEET_FAST_XRAY_MAX_SEGMENTS)
         xray_pages_per_segment = max(1, FLEET_FAST_XRAY_MAX_PAGES_PER_SEGMENT)
 
-    # Medium-mode: windows > 2 days (but not fast_mode). Tighter budgets AND record caps
+    # Medium-mode: windows > 5 days (but not fast_mode). 2-3 day windows are common
+    # analyst ranges and should prefer completeness so that a longer window remains
+    # a superset of shorter windows for user/session discovery.
     # to prevent session-building + LLM from exceeding the 29s API Gateway timeout.
-    medium_mode = (window_minutes >= 2 * 24 * 60) and (not fast_mode) and (not is_analytical_overall)
+    medium_mode = (window_minutes > 5 * 24 * 60) and (not fast_mode) and (not is_analytical_overall) and (not completeness_first)
     if medium_mode:
-        runtime_limit = min(runtime_limit, 600)
-        runtime_max_candidate_streams = min(runtime_max_candidate_streams, 1200)
+        runtime_limit = min(runtime_limit, 1200)
+        runtime_max_candidate_streams = min(runtime_max_candidate_streams, 2400)
+        runtime_fixed_stream_pages = min(runtime_fixed_stream_pages, 20)
         runtime_budget_seconds = min(runtime_budget_seconds, 5.0)
-        evaluator_max_groups = min(evaluator_max_groups, 3)
-        evaluator_per_group_limit = min(evaluator_per_group_limit, 100)
+        evaluator_max_groups = min(evaluator_max_groups, 5)
+        evaluator_per_group_limit = min(evaluator_per_group_limit, 150)
         evaluator_budget_seconds = min(evaluator_budget_seconds, 3.0)
-        xray_max_traces = min(xray_max_traces, 120)
+        xray_max_traces = min(xray_max_traces, 180)
         xray_budget_seconds = min(xray_budget_seconds, 3.0)
+
+    if completeness_first:
+        # For enumeration/count/superset-sensitive queries, favor broader collection
+        # across all windows so longer lookbacks are less likely to drop entities.
+        runtime_limit = max(runtime_limit, 8000)
+        runtime_max_candidate_streams = max(runtime_max_candidate_streams, 8000)
+        runtime_fixed_stream_pages = max(runtime_fixed_stream_pages, 100)
+        runtime_budget_seconds = max(runtime_budget_seconds, 14.0)
+        evaluator_max_groups = max(evaluator_max_groups, min(20, FLEET_EVALUATOR_MAX_GROUPS * 2))
+        evaluator_per_group_limit = max(evaluator_per_group_limit, 400)
+        evaluator_budget_seconds = max(evaluator_budget_seconds, 5.0)
+        xray_max_traces = max(xray_max_traces, 700)
+        xray_budget_seconds = max(xray_budget_seconds, 5.0)
 
     # ── Emit start trace (Strands-style structured logging) ────────────────────
     _emit_analyzer_trace({
@@ -3168,6 +3341,8 @@ def _handle_fleet_insights(
         "analysis_id": analysis_id,
         "lookback_hours": lookback_hours,
         "lookback_mode": lookback_mode,
+        "query_profile": query_profile,
+        "completeness_first": completeness_first,
         "fast_mode": fast_mode,
         "budgets": {
             "runtime_seconds": runtime_budget_seconds,
@@ -3192,6 +3367,8 @@ def _handle_fleet_insights(
             limit=runtime_limit,
             max_seconds=runtime_budget_seconds,
             max_candidate_streams=runtime_max_candidate_streams,
+            max_fixed_stream_pages=runtime_fixed_stream_pages,
+            force_backfill_insights=completeness_first,
         )
         evaluator_future = _data_executor.submit(
             _fetch_evaluator_records_window,
@@ -3632,6 +3809,7 @@ def _handle_fleet_insights(
         question,
         merged.get("sessions", {}),
         merged.get("users", {}),
+        analyst_memory,
     )
     _is_deep_dive = (query_intent["mode"] == "deep_dive")
 
@@ -4411,6 +4589,7 @@ def _handle_session_insights(event: Dict[str, Any]) -> Dict[str, Any]:
 
         # Fleet mode ignores anchors and aggregates all traces in the requested timeframe.
         fleet_hours = _resolve_lookback_hours(body, default_hours=1)
+        query_profile = _classify_collection_strategy_llm(question, analyst_memory)
         try:
             result = _handle_fleet_insights(
                 question=question, 
@@ -4419,6 +4598,7 @@ def _handle_session_insights(event: Dict[str, Any]) -> Dict[str, Any]:
                 page=pagination_page,
                 page_size=pagination_page_size,
                 analyst_memory=analyst_memory,
+                query_profile=query_profile,
             )
             elapsed = round(time.perf_counter() - request_start, 2)
             # Log successful completion
