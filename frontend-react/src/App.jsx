@@ -571,6 +571,7 @@ function App({ signOut, user }) {
             question: questionText,
             analysis_mode: analystMode,
             analyst_memory: analystMemory,
+            auto_paginate_requested: autoPaginate,
             request_id: analystMode === "single_trace" ? effectiveAnchors.request_id : "",
             client_request_id: analystMode === "single_trace" ? effectiveAnchors.client_request_id : "",
             session_id: analystMode === "single_trace" ? effectiveAnchors.session_id : "",

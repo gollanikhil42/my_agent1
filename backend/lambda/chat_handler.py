@@ -542,6 +542,13 @@ def _should_paginate_sessions(
     pre_llm_elapsed: float,
     remaining_budget_seconds: float,
 ) -> bool:
+    effective_safe_page_size = min(max(1, int(page_size)), LLM_DISCOVERY_MAX_SESSIONS)
+    # In discovery mode, always paginate when session volume exceeds the LLM-safe
+    # session cap. This preserves the two-mode architecture and avoids forcing a
+    # single LLM call to reason over more sessions than it can reliably summarize
+    # within the response budget.
+    if sessions_total > effective_safe_page_size:
+        return True
     if sessions_total <= page_size:
         return False
     if remaining_budget_seconds < 12.0 and sessions_total > page_size:
@@ -592,6 +599,17 @@ def _extract_session_ids_from_message(message: str) -> list:
             seen.add(c)
             out.append(c)
     return out
+
+
+def _count_uuid_mentions(text: str) -> int:
+    value = str(text or "")
+    if not value:
+        return 0
+    matches = re.findall(
+        r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b",
+        value,
+    )
+    return len(set(str(m).strip().lower() for m in matches if str(m).strip()))
 
 
 def _extract_session_ids_deep(payload: Any) -> list:
@@ -2058,11 +2076,14 @@ def _build_discovery_diagnosis(
     merged: Dict[str, Any],
     analyst_memory: Any = None,
     max_tokens_override: int | None = None,
-) -> str:
+) -> Dict[str, Any]:
     window_minutes = int((merged.get("window") or {}).get("duration_minutes", 0) or 0)
     system_prompt = (
-        "Summarize the highest-risk sessions in concise plain language. "
-        "If the user asks for lists, include complete lists with full IDs and latency values. "
+        "Answer according to the user's request. "
+        "If the user asks for a summary, provide a concise fleet-level summary and highlight key issues. "
+        "For summary requests, do not enumerate every session; include at most 3-5 representative session IDs. "
+        "If the user explicitly asks for a list/enumeration/all sessions, include full session IDs and latency values. "
+        "If pagination context is present for list requests, list only sessions in the current page and mention page/total. "
         "No markdown. No filler."
     )
 
@@ -2081,15 +2102,28 @@ def _build_discovery_diagnosis(
 
     try:
         target_max_tokens = int(max_tokens_override) if max_tokens_override is not None else DIAGNOSIS_FLEET_DISCOVERY_MAX_TOKENS
+        effective_max_tokens = max(150, target_max_tokens)
         response = BEDROCK_CLIENT.converse(
             modelId=DIAGNOSIS_MODEL_ID,
             system=[{"text": system_prompt}],
             messages=[{"role": "user", "content": [{"text": user_content}]}],
-            inferenceConfig={"maxTokens": max(200, target_max_tokens), "temperature": 0.1},
+            inferenceConfig={"maxTokens": effective_max_tokens, "temperature": 0.1},
         )
-        return response["output"]["message"]["content"][0]["text"]
+        usage = response.get("usage", {}) if isinstance(response, dict) else {}
+        output_tokens = int(usage.get("outputTokens", 0) or 0)
+        return {
+            "text": response["output"]["message"]["content"][0]["text"],
+            "stop_reason": str(response.get("stopReason", "") or "").strip().lower(),
+            "output_tokens": output_tokens,
+            "max_tokens": int(effective_max_tokens),
+        }
     except Exception as exc:
-        return f"Fleet discovery unavailable: {exc}"
+        return {
+            "text": f"Fleet discovery unavailable: {exc}",
+            "stop_reason": "error",
+            "output_tokens": 0,
+            "max_tokens": 0,
+        }
 
 
 def _build_trace_lookup_diagnosis(question: str, merged: Dict[str, Any], analyst_memory: Any = None) -> str:
@@ -2568,6 +2602,37 @@ def _build_discovery_context(merged: Dict[str, Any], query_intent: Dict[str, Any
                 if str(user_id).strip() in paged_user_ids
             }
 
+            # Keep user-level session lists aligned with the current page so the
+            # LLM cannot leak IDs from pages not present in paged_sessions.
+            paged_session_ids = {str(sid).strip() for sid in paged_sessions.keys()}
+            paged_trace_totals_by_user: Dict[str, int] = {}
+            for _sid, _sess in paged_sessions.items():
+                if not isinstance(_sess, dict):
+                    continue
+                _uid = str(((_sess.get("user") or {}).get("user_id", "")).strip())
+                if not _uid:
+                    continue
+                paged_trace_totals_by_user[_uid] = paged_trace_totals_by_user.get(_uid, 0) + int(_sess.get("trace_count", 0) or 0)
+
+            trimmed_users: Dict[str, Any] = {}
+            for _uid, _user_obj in filtered_users.items():
+                if not isinstance(_user_obj, dict):
+                    continue
+                _user_sessions = [
+                    str(sid).strip()
+                    for sid in (_user_obj.get("sessions") or [])
+                    if str(sid).strip() in paged_session_ids
+                ]
+                if not _user_sessions:
+                    continue
+                trimmed_users[_uid] = {
+                    **_user_obj,
+                    "sessions": _user_sessions,
+                    "session_count": len(_user_sessions),
+                    "total_traces": int(paged_trace_totals_by_user.get(str(_uid).strip(), 0)),
+                }
+            filtered_users = trimmed_users
+
     # Build the per-session summary rows for all filtered sessions (used in
     # the response body / pagination).  For the LLM we only include the top
     # LLM_DISCOVERY_MAX_SESSIONS entries sorted by error-rate then max-latency
@@ -2859,7 +2924,14 @@ def _build_llm_analysis_context(merged: Dict[str, Any], max_diag_traces: int = 2
     }
 
 
-def _handle_fleet_insights(question: str, lookback_hours: int, lookback_mode: str = "", page: int = 1, page_size: int = 15, analyst_memory: Any = None) -> Dict[str, Any]:
+def _handle_fleet_insights(
+    question: str,
+    lookback_hours: int,
+    lookback_mode: str = "",
+    page: int = 1,
+    page_size: int = 15,
+    analyst_memory: Any = None,
+) -> Dict[str, Any]:
     handler_start = time.perf_counter()
     analysis_id = str(uuid.uuid4())[:8]
     window_minutes = int(lookback_hours * 60)
@@ -3862,7 +3934,7 @@ def _handle_fleet_insights(question: str, lookback_hours: int, lookback_mode: st
         llm_builder = _build_session_deep_dive_diagnosis
         llm_builder_args = (question, llm_context, analyst_memory)
     else:
-        discovery_primary_tokens = min(DIAGNOSIS_FLEET_DISCOVERY_MAX_TOKENS, 700)
+        discovery_primary_tokens = min(DIAGNOSIS_FLEET_DISCOVERY_MAX_TOKENS, 500)
         llm_builder = _build_discovery_diagnosis
         llm_builder_args = (question, llm_context, analyst_memory, discovery_primary_tokens)
 
@@ -3894,11 +3966,17 @@ def _handle_fleet_insights(question: str, lookback_hours: int, lookback_mode: st
             first_attempt_timeout = llm_timeout_seconds
         raw_answer = _run_llm_attempt(llm_builder, llm_builder_args, first_attempt_timeout)
     except FutureTimeoutError as exc:
+        def _raise_llm_phase_timeout(cause: Exception) -> None:
+            raise TimeoutError(
+                f"Fleet analysis timed out in LLM phase after {round(time.perf_counter() - llm_start, 2)}s "
+                f"(budget={round(llm_timeout_seconds, 2)}s)."
+            ) from cause
+
         if (not _is_trace_lookup) and (not _is_deep_dive):
             elapsed_so_far = time.perf_counter() - handler_start
             retry_budget = max(0.0, 28.2 - elapsed_so_far)
             if retry_budget >= 4.0:
-                retry_tokens = min(DIAGNOSIS_FLEET_DISCOVERY_MAX_TOKENS, 420)
+                retry_tokens = min(DIAGNOSIS_FLEET_DISCOVERY_MAX_TOKENS, 300)
                 _emit_analyzer_trace({
                     "phase": "llm_retry_start",
                     "analysis_id": analysis_id,
@@ -3913,22 +3991,24 @@ def _handle_fleet_insights(question: str, lookback_hours: int, lookback_mode: st
                         retry_budget,
                     )
                 except FutureTimeoutError as retry_exc:
-                    raise TimeoutError(
-                        f"Fleet analysis timed out in LLM phase after {round(time.perf_counter() - llm_start, 2)}s "
-                        f"(budget={round(llm_timeout_seconds, 2)}s)."
-                    ) from retry_exc
+                    _raise_llm_phase_timeout(retry_exc)
             else:
-                raise TimeoutError(
-                    f"Fleet analysis timed out in LLM phase after {round(time.perf_counter() - llm_start, 2)}s "
-                    f"(budget={round(llm_timeout_seconds, 2)}s)."
-                ) from exc
+                _raise_llm_phase_timeout(exc)
         else:
-            raise TimeoutError(
-                f"Fleet analysis timed out in LLM phase after {round(time.perf_counter() - llm_start, 2)}s "
-                f"(budget={round(llm_timeout_seconds, 2)}s)."
-            ) from exc
+            _raise_llm_phase_timeout(exc)
 
-    answer = _sanitize_analysis_answer(raw_answer, traces_total=len(all_traces))
+    llm_stop_reason = ""
+    llm_output_tokens = 0
+    llm_max_tokens_used = 0
+    if isinstance(raw_answer, dict):
+        raw_answer_text = str(raw_answer.get("text", "") or "")
+        llm_stop_reason = str(raw_answer.get("stop_reason", "") or "").strip().lower()
+        llm_output_tokens = int(raw_answer.get("output_tokens", 0) or 0)
+        llm_max_tokens_used = int(raw_answer.get("max_tokens", 0) or 0)
+    else:
+        raw_answer_text = str(raw_answer or "")
+
+    answer = _sanitize_analysis_answer(raw_answer_text, traces_total=len(all_traces))
     llm_elapsed = round(time.perf_counter() - llm_start, 2)
 
     if llm_elapsed > 15:
@@ -3946,6 +4026,9 @@ def _handle_fleet_insights(question: str, lookback_hours: int, lookback_mode: st
         "analysis_id": analysis_id,
         "llm_elapsed_seconds": llm_elapsed,
         "answer_size_chars": len(answer or ""),
+        "llm_stop_reason": llm_stop_reason,
+        "llm_output_tokens": llm_output_tokens,
+        "llm_max_tokens": llm_max_tokens_used,
     })
     
     total_elapsed = round(time.perf_counter() - handler_start, 2)
@@ -3975,7 +4058,27 @@ def _handle_fleet_insights(question: str, lookback_hours: int, lookback_mode: st
     response_start = time.perf_counter()
     _active_pagination = sessions_pagination_info if sessions_pagination_info else pagination_info
     _has_next_page = bool((_active_pagination or {}).get("has_next_page"))
-    _auto_paginate_recommended = (not _is_trace_lookup) and (not _is_deep_dive) and bool(_active_pagination) and _has_next_page
+    _sessions_on_page = int((_active_pagination or {}).get("sessions_on_this_page") or (_active_pagination or {}).get("page_size") or 0)
+    _uuid_mentions = _count_uuid_mentions(answer)
+    _listing_like_answer = _sessions_on_page > 0 and _uuid_mentions >= max(6, _sessions_on_page - 1)
+    _token_cap_hit = (
+        llm_stop_reason in {"max_tokens", "length", "max_output_tokens"}
+        or (
+            llm_output_tokens > 0
+            and llm_max_tokens_used > 0
+            and llm_output_tokens >= int(llm_max_tokens_used * 0.95)
+        )
+    )
+    # For list-style answers, the model may stay within token limits and still
+    # clearly indicate there are more pages. In that case continue automatically.
+    _matter_too_much = _listing_like_answer
+    _auto_paginate_recommended = (
+        (not _is_trace_lookup)
+        and (not _is_deep_dive)
+        and bool(_active_pagination)
+        and _has_next_page
+        and (_token_cap_hit or _matter_too_much)
+    )
     response_body = json.dumps(
         {
             "answer": answer,
@@ -3984,6 +4087,9 @@ def _handle_fleet_insights(question: str, lookback_hours: int, lookback_mode: st
             "sessions_pagination": sessions_pagination_info if sessions_pagination_info else None,
             "query_mode": query_intent.get("mode", "discovery"),
             "auto_paginate_recommended": _auto_paginate_recommended,
+            "auto_paginate_reason": (
+                "max_output_tokens" if _token_cap_hit else "too_much_matter" if _matter_too_much else "none"
+            ),
             "anchors": {
                 "request_id": "",
                 "client_request_id": "",
