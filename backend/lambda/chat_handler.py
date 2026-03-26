@@ -44,7 +44,7 @@ DIAGNOSIS_MODEL_ID = os.environ.get("DIAGNOSIS_MODEL_ID", "")
 DIAGNOSIS_SESSION_MAX_TOKENS = int(os.environ.get("DIAGNOSIS_SESSION_MAX_TOKENS", "1150"))
 DIAGNOSIS_PROMPT_UPGRADE_MAX_TOKENS = int(os.environ.get("DIAGNOSIS_PROMPT_UPGRADE_MAX_TOKENS", "920"))
 DIAGNOSIS_FLEET_SUMMARY_MAX_TOKENS = int(os.environ.get("DIAGNOSIS_FLEET_SUMMARY_MAX_TOKENS", "2000"))
-DIAGNOSIS_FLEET_DISCOVERY_MAX_TOKENS = int(os.environ.get("DIAGNOSIS_FLEET_DISCOVERY_MAX_TOKENS", "1200"))
+DIAGNOSIS_FLEET_DISCOVERY_MAX_TOKENS = int(os.environ.get("DIAGNOSIS_FLEET_DISCOVERY_MAX_TOKENS", "3000"))
 DIAGNOSIS_TRACE_LOOKUP_MAX_TOKENS = int(os.environ.get("DIAGNOSIS_TRACE_LOOKUP_MAX_TOKENS", "650"))
 DIAGNOSIS_FLEET_DEEP_DIVE_MAX_TOKENS = int(os.environ.get("DIAGNOSIS_FLEET_DEEP_DIVE_MAX_TOKENS", "800"))
 DIAGNOSIS_SESSION_DEEP_DIVE_MAX_TOKENS = int(os.environ.get("DIAGNOSIS_SESSION_DEEP_DIVE_MAX_TOKENS", "650"))
@@ -372,6 +372,8 @@ def _sanitize_analysis_answer(text: str, traces_total: int = 0) -> str:
         cleaned_lines.append(raw_line)
 
     cleaned = "\n".join(cleaned_lines)
+    cleaned = re.sub(r"\bavg\s+latency\b", "average latency", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\bmax\s+latency\b", "maximum latency", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     return cleaned.strip()
 
@@ -438,6 +440,134 @@ def _denormalize_trace_id(value: str) -> str:
     if len(compact) == 32 and re.fullmatch(r"[0-9a-f]{32}", compact):
         return f"1-{compact[:8]}-{compact[8:]}"
     return t  # unknown format, return as-is
+
+
+def _format_epoch_ms_to_iso_utc(value: Any) -> str:
+    epoch_ms = int(_to_float(value))
+    if epoch_ms <= 0:
+        return ""
+    try:
+        return datetime.fromtimestamp(epoch_ms / 1000.0, tz=timezone.utc).isoformat()
+    except Exception:
+        return ""
+
+
+def _classify_question_intent_llm(question: str, analyst_memory: Any = None) -> str:
+    q = str(question or "").strip()
+    if not q:
+        return "telemetry_analysis"
+
+    system_prompt = (
+        "Classify the user message into one of exactly two intents: "
+        "general_conversation or telemetry_analysis. "
+        "general_conversation means greeting/small-talk/chit-chat with no need to query logs/traces/sessions. "
+        "telemetry_analysis means requests about traces, sessions, users, latency, runtime diagnostics, or analysis actions. "
+        "Return ONLY JSON as {\"intent\": \"general_conversation\"} or {\"intent\": \"telemetry_analysis\"}."
+    )
+    memory_block = _format_analyst_memory(analyst_memory)
+    user_content = "".join(
+        [
+            f"Recent conversation:\n{memory_block}\n\n" if memory_block else "",
+            f"Message: {q}",
+        ]
+    )
+
+    try:
+        response = BEDROCK_CLIENT.converse(
+            modelId=DIAGNOSIS_MODEL_ID,
+            system=[{"text": system_prompt}],
+            messages=[{"role": "user", "content": [{"text": user_content}]}],
+            inferenceConfig={"maxTokens": 80, "temperature": 0.0},
+        )
+        text = str(response["output"]["message"]["content"][0]["text"] or "").strip()
+        parsed = json.loads(text)
+        intent = str((parsed or {}).get("intent", "")).strip().lower()
+        if intent in {"general_conversation", "telemetry_analysis"}:
+            return intent
+    except Exception:
+        pass
+
+    return "telemetry_analysis"
+
+
+def _build_general_conversation_reply(question: str, analyst_memory: Any = None) -> str:
+    system_prompt = (
+        "You are a friendly assistant for an operations dashboard. "
+        "For general conversation, reply naturally and conversationally in plain text. "
+        "Do not invent telemetry facts. If asked for analysis data, ask the user for a trace ID, session ID, or timeframe. "
+        "Keep it concise and helpful."
+    )
+    memory_block = _format_analyst_memory(analyst_memory)
+    user_content = "".join(
+        [
+            f"Recent conversation:\n{memory_block}\n\n" if memory_block else "",
+            f"User message: {question.strip()}",
+        ]
+    )
+    try:
+        response = BEDROCK_CLIENT.converse(
+            modelId=DIAGNOSIS_MODEL_ID,
+            system=[{"text": system_prompt}],
+            messages=[{"role": "user", "content": [{"text": user_content}]}],
+            inferenceConfig={"maxTokens": 220, "temperature": 0.5},
+        )
+        return str(response["output"]["message"]["content"][0]["text"] or "").strip()
+    except Exception:
+        return "Hi. I can help with both casual conversation and telemetry analysis. If you want analysis, share a session ID, trace ID, or timeframe."
+
+
+def _suggest_user_names(requested_user: str, users: Dict[str, Any], max_suggestions: int = 3) -> List[str]:
+    needle = str(requested_user or "").strip()
+    if not needle or not isinstance(users, dict):
+        return []
+
+    names: List[str] = []
+    for _uid, data in users.items():
+        bucket = data if isinstance(data, dict) else {}
+        uname = str(bucket.get("user_name", "")).strip()
+        if not uname:
+            continue
+        if uname.lower() in {"unknown", "anonymous", "none"}:
+            continue
+        if uname not in names:
+            names.append(uname)
+
+    if not names:
+        return []
+
+    system_prompt = (
+        "Select up to 3 likely username suggestions for a requested username. "
+        "Use only the provided candidate names. "
+        "Return ONLY JSON as {\"suggestions\": [\"name1\", \"name2\"]}."
+    )
+    user_content = json.dumps(
+        {
+            "requested_user": needle,
+            "candidate_user_names": names[:400],
+            "max_suggestions": max(1, int(max_suggestions)),
+        },
+        ensure_ascii=True,
+    )
+
+    try:
+        response = BEDROCK_CLIENT.converse(
+            modelId=DIAGNOSIS_MODEL_ID,
+            system=[{"text": system_prompt}],
+            messages=[{"role": "user", "content": [{"text": user_content}]}],
+            inferenceConfig={"maxTokens": 120, "temperature": 0.0},
+        )
+        parsed = json.loads(str(response["output"]["message"]["content"][0]["text"] or "{}"))
+        raw = parsed.get("suggestions", []) if isinstance(parsed, dict) else []
+        out: List[str] = []
+        for cand in raw if isinstance(raw, list) else []:
+            c = str(cand or "").strip()
+            if c and c in names and c not in out:
+                out.append(c)
+            if len(out) >= max(1, int(max_suggestions)):
+                break
+        return out
+    except Exception:
+        return []
 
 
 def _primary_filter_term(terms: Dict[str, str]) -> str:
@@ -2079,21 +2209,27 @@ def _build_discovery_diagnosis(
 ) -> Dict[str, Any]:
     window_minutes = int((merged.get("window") or {}).get("duration_minutes", 0) or 0)
     system_prompt = (
-        "Answer according to the user's request. "
-        "If the user asks for a summary, provide a concise fleet-level summary and highlight key issues. "
-        "For summary requests, do not enumerate every session; include at most 3-5 representative session IDs. "
-        "If the user explicitly asks for a list/enumeration/all sessions, include full session IDs and latency values. "
-        "If pagination context is present for list requests, list only sessions in the current page and mention page/total. "
-        "No markdown. No filler."
+        "You are a telemetry analyst. Understand what the user is asking and respond naturally. "
+        "For listing/enumeration requests ('list sessions', 'show all users', 'give me usernames', 'what sessions exist'): "
+        "list every item from the users and sessions data — include session IDs, usernames, timestamps (UTC), and metrics. "
+        "For summary/analysis requests: give a concise overview highlighting key issues. "
+        "For user-specific requests: focus only on that user's sessions and metrics. "
+        "Always include timestamps in UTC when available in the data. "
+        "Use 'average latency' and 'maximum latency' — never abbreviate as avg/max. "
+        "If user_filter.matched is false and user_filter.suggested_user_names has entries, explicitly say: "
+        "'No user named X was found. Did you mean: [suggestions]?' "
+        "If completeness_note is present in the context, mention it at the end of your response briefly. "
+        "If sessions or users show unknown-session or unknown-user, acknowledge this and mention data may be incomplete. "
+        "Plain text. Full IDs. No markdown."
     )
 
     context_json = json.dumps(merged, default=str)
-    user_question = question.strip() if question and question.strip() else "Summarize the slowest and most problematic sessions in this window."
+    user_question = question.strip() if question and question.strip() else "Summarize the sessions in this window."
     memory_block = _format_analyst_memory(analyst_memory)
     user_content = "".join(
         [
             f"Window size: {window_minutes} minutes.\n",
-            "Here is the compact discovery context for the highest-risk sessions in the selected window.\n",
+            "Discovery context (most recent sessions first, then by anomaly severity):\n",
             f"Context: {context_json}\n",
             f"Recent analyst conversation:\n{memory_block}\n" if memory_block else "",
             f"Question: {user_question}",
@@ -2102,12 +2238,12 @@ def _build_discovery_diagnosis(
 
     try:
         target_max_tokens = int(max_tokens_override) if max_tokens_override is not None else DIAGNOSIS_FLEET_DISCOVERY_MAX_TOKENS
-        effective_max_tokens = max(150, target_max_tokens)
+        effective_max_tokens = max(300, target_max_tokens)
         response = BEDROCK_CLIENT.converse(
             modelId=DIAGNOSIS_MODEL_ID,
             system=[{"text": system_prompt}],
             messages=[{"role": "user", "content": [{"text": user_content}]}],
-            inferenceConfig={"maxTokens": effective_max_tokens, "temperature": 0.1},
+            inferenceConfig={"maxTokens": effective_max_tokens, "temperature": 0.0},
         )
         usage = response.get("usage", {}) if isinstance(response, dict) else {}
         output_tokens = int(usage.get("outputTokens", 0) or 0)
@@ -2131,6 +2267,8 @@ def _build_trace_lookup_diagnosis(question: str, merged: Dict[str, Any], analyst
         "Analyze matched traces. Answer in 2-3 sentences only. "
         "Name the slowest step and dominant delay source. "
         "If evaluator_scores exist for a matched trace, report those scores and do not claim they are missing. "
+        "Include trace timestamp/date in UTC whenever available. "
+        "Use full phrases 'average latency' and 'maximum latency' instead of avg/max. "
         "Plain text. Full IDs."
     )
 
@@ -2354,6 +2492,7 @@ def _build_session_and_user_layers(
             {
                 "session_id": session_id,
                 "latest_trace_ts": latest_ts,
+                "latest_trace_timestamp_utc": _format_epoch_ms_to_iso_utc(latest_ts),
                 "user": _derive_session_user(traces_for_session),
                 "trace_count": trace_count,
                 "traces": traces_for_session,
@@ -2372,6 +2511,8 @@ def _build_session_and_user_layers(
     sessions_output: Dict[str, Dict[str, Any]] = {
         row["session_id"]: {
             "session_id": row["session_id"],
+            "latest_trace_ts": row.get("latest_trace_ts", 0),
+            "latest_trace_timestamp_utc": row.get("latest_trace_timestamp_utc", ""),
             "user": row.get("user", {}),
             "trace_count": row.get("trace_count", 0),
             "traces": row.get("traces", []),
@@ -2459,88 +2600,93 @@ def _compact_fleet_merged(merged: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _extract_requested_user_text(question: str) -> str:
-    text = (question or "").strip()
-    if not text:
-        return ""
-    patterns = [
-        r"(?:sessions?|traces?)\s+for\s+(?:user\s+)?([a-zA-Z0-9._@-]{3,64})",
-        r"(?:for|of)\s+user\s+([a-zA-Z0-9._@-]{3,64})",
-        r"user\s+([a-zA-Z0-9._@-]{3,64})",
-    ]
-    lowered = text.lower()
-    for pattern in patterns:
-        match = re.search(pattern, lowered)
-        if match:
-            return str(match.group(1) or "").strip()
-    return ""
+def _detect_query_mode(question: str, sessions: Dict[str, Any], users: Dict[str, Any]) -> Dict[str, Any]:
+    """Resolve query mode using an LLM classifier against known session/user candidates.
 
-
-def _resolve_user_from_question(question: str, users: Dict[str, Any]) -> Dict[str, str]:
-    """Find a user referenced in the question by user_id or user_name.
-
-    Returns {"user_id": ..., "user_name": ...} when matched; otherwise {}.
+    Returns one of:
+    - {"mode": "deep_dive", "session_id": ...}
+    - {"mode": "discovery", "user_id": ..., "user_name": ...}
+    - {"mode": "discovery", "requested_user": ...}
+    - {"mode": "discovery"}
     """
-    q = (question or "").strip().lower()
-    if not q or not isinstance(users, dict):
-        return {}
+    q = str(question or "").strip()
+    if not q:
+        return {"mode": "discovery"}
 
-    candidates: List[Dict[str, str]] = []
+    session_candidates = [
+        str(sid).strip()
+        for sid in sessions.keys()
+        if str(sid).strip()
+    ][:200]
+    known_user_candidates: List[Dict[str, str]] = []
     for user_id, user_data in users.items():
         bucket = user_data if isinstance(user_data, dict) else {}
         uid = str(user_id or bucket.get("user_id", "")).strip()
         uname = str(bucket.get("user_name", "")).strip()
-        aliases = {uid.lower(), uname.lower()}
-        for alias in aliases:
-            if not alias or alias in {"unknown", "unknown-user", "anonymous", "none"}:
-                continue
-            if re.search(rf"\b{re.escape(alias)}\b", q):
-                candidates.append(
-                    {
-                        "user_id": uid,
-                        "user_name": uname or "unknown",
-                        "matched_alias": alias,
-                    }
-                )
+        if not uid and not uname:
+            continue
+        known_user_candidates.append(
+            {
+                "user_id": uid,
+                "user_name": uname,
+            }
+        )
+    known_user_candidates = known_user_candidates[:200]
 
-    if not candidates:
-        return {}
-
-    # Prefer the most specific match (longest alias), then stable user_id order.
-    candidates.sort(key=lambda item: (-len(item.get("matched_alias", "")), item.get("user_id", "")))
-    winner = candidates[0]
-    return {"user_id": winner.get("user_id", ""), "user_name": winner.get("user_name", "unknown")}
-
-
-def _detect_query_mode(question: str, sessions: Dict[str, Any], users: Dict[str, Any]) -> Dict[str, Any]:
-    """Detect deep-dive session asks and user-focused discovery asks.
-
-    - deep_dive: question explicitly references a known session_id
-    - discovery (+ user filter): question references a known user by id/name
-    - discovery (unfiltered): default
-    """
-    q = (question or "").lower()
-    for sid in sessions.keys():
-        if sid.lower() in q:
-            return {"mode": "deep_dive", "session_id": sid}
-
-    explicit_session_match = re.search(
-        r"\b[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}\b",
-        q,
-        flags=re.IGNORECASE,
+    system_prompt = (
+        "Classify the user question into a query mode for telemetry analysis. "
+        "Return ONLY JSON with keys: mode, session_id, user_id, requested_user. "
+        "mode must be deep_dive or discovery. "
+        "Choose deep_dive only when the question targets one specific session ID from session_candidates. "
+        "Choose discovery for everything else: listing sessions, listing users, asking about a user, fleet summaries, general queries. "
+        "For user-specific discovery: if the user mentions a person's name or username, match it against known_user_candidates (case-insensitive, partial match ok) and set user_id. "
+        "If the name does not match any known candidate, set requested_user to that name and leave user_id empty. "
+        "If the question asks for all users / all sessions / a fleet overview with no specific user, leave user_id and requested_user empty."
     )
-    if explicit_session_match:
-        return {"mode": "deep_dive", "session_id": explicit_session_match.group(0)}
+    user_content = json.dumps(
+        {
+            "question": q,
+            "session_candidates": session_candidates,
+            "known_user_candidates": known_user_candidates,
+            "output_contract": {
+                "mode": "deep_dive|discovery",
+                "session_id": "string_or_empty",
+                "user_id": "string_or_empty",
+                "requested_user": "name_string_if_user_asked_for_specific_unknown_user_else_empty",
+            },
+        },
+        ensure_ascii=True,
+    )
 
-    matched_user = _resolve_user_from_question(question, users)
-    if matched_user:
+    try:
+        response = BEDROCK_CLIENT.converse(
+            modelId=DIAGNOSIS_MODEL_ID,
+            system=[{"text": system_prompt}],
+            messages=[{"role": "user", "content": [{"text": user_content}]}],
+            inferenceConfig={"maxTokens": 180, "temperature": 0.0},
+        )
+        parsed = json.loads(str(response["output"]["message"]["content"][0]["text"] or "{}"))
+    except Exception:
+        return {"mode": "discovery"}
+
+    mode = str((parsed or {}).get("mode", "discovery")).strip().lower()
+    if mode not in {"deep_dive", "discovery"}:
+        mode = "discovery"
+
+    session_id = str((parsed or {}).get("session_id", "")).strip()
+    if mode == "deep_dive" and session_id and session_id in sessions:
+        return {"mode": "deep_dive", "session_id": session_id}
+
+    user_id = str((parsed or {}).get("user_id", "")).strip()
+    if user_id and user_id in users:
+        user_bucket = users.get(user_id, {}) if isinstance(users, dict) else {}
         return {
             "mode": "discovery",
-            "user_id": matched_user.get("user_id", ""),
-            "user_name": matched_user.get("user_name", "unknown"),
+            "user_id": user_id,
+            "user_name": str((user_bucket or {}).get("user_name", "unknown") or "unknown"),
         }
 
-    requested_user = _extract_requested_user_text(question)
+    requested_user = str((parsed or {}).get("requested_user", "")).strip()
     if requested_user:
         return {"mode": "discovery", "requested_user": requested_user}
 
@@ -2579,10 +2725,12 @@ def _build_discovery_context(merged: Dict[str, Any], query_intent: Dict[str, Any
             "sessions_found": len(filtered_sessions),
         }
     elif requested_user:
+        suggestions = _suggest_user_names(requested_user, users)
         user_filter_meta = {
             "requested_user": requested_user,
             "matched": False,
             "sessions_found": 0,
+            "suggested_user_names": suggestions,
         }
 
     paged_sessions = filtered_sessions
@@ -2646,6 +2794,8 @@ def _build_discovery_context(merged: Dict[str, Any], query_intent: Dict[str, Any
                 "trace_count": sess.get("trace_count", 0),
                 "avg_latency_ms": (sess.get("session_metrics") or {}).get("avg_e2e_ms"),
                 "max_latency_ms": (sess.get("session_metrics") or {}).get("max_e2e_ms"),
+                "latest_trace_epoch_ms": sess.get("latest_trace_ts"),
+                "latest_trace_timestamp_utc": _format_epoch_ms_to_iso_utc(sess.get("latest_trace_ts")),
                 "error_rate": (sess.get("session_metrics") or {}).get("error_rate"),
                 "delayed_rate": (sess.get("session_metrics") or {}).get("delayed_rate"),
             },
@@ -2653,10 +2803,12 @@ def _build_discovery_context(merged: Dict[str, Any], query_intent: Dict[str, Any
         for sid, sess in paged_sessions.items()
         if isinstance(sess, dict)
     ]
-    # Sort: highest error_rate first, then highest max_latency, so the LLM
-    # cap keeps the most problematic sessions visible.
+    # Sort: most recent first, then highest error_rate, then highest max_latency.
+    # Recency-first ensures the newest sessions are always visible to the LLM
+    # regardless of whether they had errors — critical for list/enumeration queries.
     all_session_rows.sort(
         key=lambda item: (
+            -_to_float((item[1] or {}).get("latest_trace_epoch_ms")),
             -_to_float((item[1] or {}).get("error_rate")),
             -_to_float((item[1] or {}).get("max_latency_ms")),
         )
@@ -2665,6 +2817,24 @@ def _build_discovery_context(merged: Dict[str, Any], query_intent: Dict[str, Any
     sessions_on_page_count = len(all_session_rows)
     llm_session_rows = all_session_rows[:LLM_DISCOVERY_MAX_SESSIONS]
     sessions_truncated = sessions_on_page_count > LLM_DISCOVERY_MAX_SESSIONS
+
+    # Data completeness signal: tell the LLM when runtime logs were unavailable
+    # (only X-Ray data collected), which causes unknown-session / unknown-user entries.
+    runtime_events_scanned = int(
+        ((merged.get("sources") or {}).get("runtime") or {}).get("events_scanned", -1) or 0
+    )
+    has_unknown_sessions = any(
+        str(sid).strip().lower() in {"unknown-session", "unknown"}
+        for sid in filtered_sessions.keys()
+    )
+    completeness_note = None
+    if runtime_events_scanned == 0 or (has_unknown_sessions and runtime_events_scanned < 5):
+        completeness_note = (
+            "Session IDs and user names are derived from runtime CloudWatch logs. "
+            "Some or all sessions show 'unknown-session' / 'unknown-user' because runtime log events "
+            "were not available at analysis time (logs may still be ingesting or the log stream is empty). "
+            "Try re-running the same query in a few seconds for complete attribution."
+        )
 
     return {
         "analysis_mode": "discovery",
@@ -2694,6 +2864,7 @@ def _build_discovery_context(merged: Dict[str, Any], query_intent: Dict[str, Any
         "pagination_context": merged.get("pagination_context", {}),
         "sessions_pagination_context": merged.get("sessions_pagination_context", {}),
         "user_filter": user_filter_meta,
+        "completeness_note": completeness_note,
     }
 
 
@@ -2764,6 +2935,8 @@ def _build_deep_dive_context(merged: Dict[str, Any], session_id: str) -> Dict[st
                 "status": str(tr.get("status", "success")),
                 "is_delayed": bool(tr.get("is_delayed", False)),
                 "e2e_ms": round(_to_float(tr.get("e2e_ms") or stage_ms.get("e2e")), 2),
+                "timestamp_epoch_ms": int(_to_float(tr.get("timestamp_epoch_ms"))),
+                "timestamp_utc": str(tr.get("timestamp_utc", "")),
                 "stage_ms": stage_ms,
                 "evaluator_scores": _slim_eval(tr.get("evaluator_scores") or tr.get("evaluator_metrics") or {}),
                 "user": tr.get("user", {}),
@@ -2815,7 +2988,9 @@ def _build_deep_dive_context(merged: Dict[str, Any], session_id: str) -> Dict[st
 
 def _build_session_deep_dive_diagnosis(question: str, merged: Dict[str, Any], analyst_memory: Any = None) -> str:
     system_prompt = (
-        "Analyze this session. Answer in 2-3 sentences. Plain text. Print full IDs."
+        "Analyze this session. Answer in 2-3 sentences. Plain text. Print full IDs. "
+        "Include trace/session timestamp and date in UTC when available. "
+        "Use full phrases 'average latency' and 'maximum latency' instead of avg/max."
     )
 
     user_question = question.strip() if question and question.strip() else "Explain what happened in this session."
@@ -2873,6 +3048,8 @@ def _build_llm_analysis_context(merged: Dict[str, Any], max_diag_traces: int = 2
             "status": str(tr.get("status", "success")),
             "is_delayed": bool(tr.get("is_delayed", False)),
             "e2e_ms": round(_to_float(e2e), 2),
+            "timestamp_epoch_ms": int(_to_float(tr.get("timestamp_epoch_ms"))),
+            "timestamp_utc": str(tr.get("timestamp_utc", "")),
             "stage_ms": tr.get("stage_latency_ms") or {
                 "runtime": tr.get("runtime_latency_ms"),
                 "evaluator": tr.get("evaluator_latency_ms"),
@@ -2897,6 +3074,8 @@ def _build_llm_analysis_context(merged: Dict[str, Any], max_diag_traces: int = 2
                     "status": str(tr.get("status", "success")),
                     "e2e_ms": round(_to_float(e2e), 2),
                     "is_delayed": bool(tr.get("is_delayed", False)),
+                    "timestamp_epoch_ms": int(_to_float(tr.get("timestamp_epoch_ms"))),
+                    "timestamp_utc": str(tr.get("timestamp_utc", "")),
                 })
         slim_sessions[sid] = {
             "session_id": sid,
@@ -3116,6 +3295,8 @@ def _handle_fleet_insights(
             tools_used = rec.get("metrics", {}).get("tools_used", [])
             runtime_details_by_trace[trace_id] = {
                 "_ts": current_ts,
+                "timestamp_epoch_ms": int(current_ts) if current_ts > 0 else 0,
+                "timestamp_utc": _format_epoch_ms_to_iso_utc(current_ts),
                 "user": {
                     "user_id": str(rec.get("user_id", "")),
                     "user_name": str(rec.get("user_name", "")),
@@ -3266,6 +3447,8 @@ def _handle_fleet_insights(
             "evaluator_latency_ms": round(_to_float(t.get("evaluator_latency_ms")), 2),
             "inferred_model_or_gap_ms": round(_to_float(t.get("inferred_model_or_gap_ms")), 2),
             "status": t.get("status", "success"),
+            "timestamp_epoch_ms": int(_to_float((runtime_details_by_trace.get(str(t.get("trace_id", "")), {}) or {}).get("timestamp_epoch_ms"))),
+            "timestamp_utc": str((runtime_details_by_trace.get(str(t.get("trace_id", "")), {}) or {}).get("timestamp_utc", "")),
             "user": (runtime_details_by_trace.get(str(t.get("trace_id", "")), {}) or {}).get("user", {}),
             "evaluator_scores": t.get("evaluator_metrics", {}),
             "xray": _xray_summary_for_trace(str(t.get("trace_id", ""))),
@@ -3281,6 +3464,8 @@ def _handle_fleet_insights(
             "evaluator_latency_ms": round(_to_float(t.get("evaluator_latency_ms")), 2),
             "inferred_model_or_gap_ms": round(_to_float(t.get("inferred_model_or_gap_ms")), 2),
             "status": t.get("status", "success"),
+            "timestamp_epoch_ms": int(_to_float((runtime_details_by_trace.get(str(t.get("trace_id", "")), {}) or {}).get("timestamp_epoch_ms"))),
+            "timestamp_utc": str((runtime_details_by_trace.get(str(t.get("trace_id", "")), {}) or {}).get("timestamp_utc", "")),
             "user": (runtime_details_by_trace.get(str(t.get("trace_id", "")), {}) or {}).get("user", {}),
             "evaluator_scores": t.get("evaluator_metrics", {}),
             "xray": _xray_summary_for_trace(str(t.get("trace_id", ""))),
@@ -3298,6 +3483,8 @@ def _handle_fleet_insights(
             "inferred_model_or_gap_ms": round(_to_float(t.get("inferred_model_or_gap_ms")), 2),
             "status": t.get("status", "success"),
             "is_delayed": bool(t.get("is_delayed")),
+            "timestamp_epoch_ms": int(_to_float((runtime_details_by_trace.get(str(t.get("trace_id", "")), {}) or {}).get("timestamp_epoch_ms"))),
+            "timestamp_utc": str((runtime_details_by_trace.get(str(t.get("trace_id", "")), {}) or {}).get("timestamp_utc", "")),
             "user": (runtime_details_by_trace.get(str(t.get("trace_id", "")), {}) or {}).get("user", {}),
             "evaluator_scores": t.get("evaluator_metrics", {}),
             "xray": _xray_summary_for_trace(str(t.get("trace_id", ""))),
@@ -3313,6 +3500,8 @@ def _handle_fleet_insights(
             "trace_id": trace_id,
             "status": t.get("status", "success"),
             "is_delayed": bool(t.get("is_delayed")),
+            "timestamp_epoch_ms": int(_to_float(rt.get("timestamp_epoch_ms"))),
+            "timestamp_utc": str(rt.get("timestamp_utc", "")),
             "stage_latency_ms": {
                 "runtime": round(_to_float(t.get("runtime_latency_ms")), 2),
                 "model_or_handoff_gap": round(_to_float(t.get("inferred_model_or_gap_ms")), 2),
@@ -3934,7 +4123,7 @@ def _handle_fleet_insights(
         llm_builder = _build_session_deep_dive_diagnosis
         llm_builder_args = (question, llm_context, analyst_memory)
     else:
-        discovery_primary_tokens = min(DIAGNOSIS_FLEET_DISCOVERY_MAX_TOKENS, 500)
+        discovery_primary_tokens = min(DIAGNOSIS_FLEET_DISCOVERY_MAX_TOKENS, 1800)
         llm_builder = _build_discovery_diagnosis
         llm_builder_args = (question, llm_context, analyst_memory, discovery_primary_tokens)
 
@@ -3976,7 +4165,7 @@ def _handle_fleet_insights(
             elapsed_so_far = time.perf_counter() - handler_start
             retry_budget = max(0.0, 28.2 - elapsed_so_far)
             if retry_budget >= 4.0:
-                retry_tokens = min(DIAGNOSIS_FLEET_DISCOVERY_MAX_TOKENS, 300)
+                retry_tokens = min(DIAGNOSIS_FLEET_DISCOVERY_MAX_TOKENS, 1200)
                 _emit_analyzer_trace({
                     "phase": "llm_retry_start",
                     "analysis_id": analysis_id,
@@ -4079,6 +4268,26 @@ def _handle_fleet_insights(
         and _has_next_page
         and (_token_cap_hit or _matter_too_much)
     )
+    # If the model hit the token cap, clean up any trailing incomplete line and
+    # append a user-visible note so the response never ends mid-word.
+    if _token_cap_hit and answer:
+        lines = answer.rstrip().splitlines()
+        if lines:
+            last_line = lines[-1].rstrip()
+            # Drop the incomplete fragment if it doesn't end on a clean boundary.
+            _line_complete = bool(last_line) and (
+                last_line[-1] in ".,:;)!?%"
+                or last_line[-1].isdigit()
+                or last_line.lower().endswith(" ms")
+            )
+            if not _line_complete and len(lines) > 1:
+                lines = lines[:-1]
+        answer = "\n".join(lines).rstrip()
+        if _has_next_page:
+            answer += "\n\n(Response reached the output limit. Remaining sessions are on the next page.)"
+        else:
+            answer += "\n\n(Response reached the output limit. Some details may be omitted.)"
+
     response_body = json.dumps(
         {
             "answer": answer,
@@ -4172,6 +4381,34 @@ def _handle_session_insights(event: Dict[str, Any]) -> Dict[str, Any]:
     pagination_page_size = max(5, min(50, pagination_page_size))
 
     if analysis_mode in {"fleet_1h", "all_traces_1h", "fleet", "fleet_window", "multi_session_window"}:
+        if _classify_question_intent_llm(question, analyst_memory) == "general_conversation":
+            answer = _build_general_conversation_reply(question, analyst_memory)
+            return {
+                "statusCode": 200,
+                "headers": CORS_HEADERS,
+                "body": json.dumps(
+                    {
+                        "answer": _sanitize_analysis_answer(answer, traces_total=0),
+                        "merged": {
+                            "analysis_mode": "general_conversation",
+                            "note": "No telemetry data was collected for this conversational turn.",
+                        },
+                        "pagination": None,
+                        "sessions_pagination": None,
+                        "query_mode": "general_conversation",
+                        "auto_paginate_recommended": False,
+                        "auto_paginate_reason": "none",
+                        "anchors": {
+                            "request_id": "",
+                            "client_request_id": "",
+                            "session_id": "",
+                            "evaluator_session_id": "",
+                            "xray_trace_id": "",
+                        },
+                    }
+                ),
+            }
+
         # Fleet mode ignores anchors and aggregates all traces in the requested timeframe.
         fleet_hours = _resolve_lookback_hours(body, default_hours=1)
         try:
