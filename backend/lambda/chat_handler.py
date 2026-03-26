@@ -3882,7 +3882,14 @@ def _handle_fleet_insights(question: str, lookback_hours: int, lookback_mode: st
 
     try:
         if (not _is_trace_lookup) and (not _is_deep_dive):
-            first_attempt_timeout = min(llm_timeout_seconds, 12.0)
+            # Give discovery mode 20s on the first attempt.
+            # Previously capped at 12s, which caused spurious retries on days
+            # when Bedrock TTFB is 12-18s regardless of context size (7KB is fine
+            # but Bedrock still takes >12s to start responding). With a 20s cap
+            # the first attempt succeeds on slow-Bedrock days; if it still times
+            # out then the retry budget drops below the 4s threshold and we fail
+            # cleanly rather than burning another 10s on a futile retry.
+            first_attempt_timeout = min(llm_timeout_seconds, 20.0)
         else:
             first_attempt_timeout = llm_timeout_seconds
         raw_answer = _run_llm_attempt(llm_builder, llm_builder_args, first_attempt_timeout)
