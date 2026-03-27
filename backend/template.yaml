@@ -34,7 +34,7 @@ Parameters:
     Description: Runtime OTEL log stream name
   EvaluatorLogGroup:
     Type: String
-    Default: ""
+    Default: /aws/bedrock-agentcore/evaluations/results/evaluation_quick_start_1773400924069-RMD3JBHdQM
     Description: Evaluator CloudWatch log group
   EvaluatorLogPrefix:
     Type: String
@@ -74,7 +74,7 @@ Parameters:
     Description: Lookback hours for overall timeframe mode
   MaxAnalysisLookbackHours:
     Type: String
-    Default: "2160"
+    Default: "720"
     Description: Safety cap for analysis lookback to avoid Lambda timeout
   XrayMaxLookbackHours:
     Type: String

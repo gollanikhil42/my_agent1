@@ -975,55 +975,42 @@ def _fetch_log_events(log_group: str, terms: Dict[str, str], lookback_hours: int
     if not log_group:
         return []
 
-    filter_term = _primary_filter_term(terms)
-    start_time_ms = int((time.time() - lookback_hours * 3600) * 1000)
-    fetch_started = time.perf_counter()
-
-    base_kwargs: Dict[str, Any] = {
-        "logGroupName": log_group,
-        "startTime": start_time_ms,
-        "limit": min(limit, 10000),  # CloudWatch API hard cap
-    }
-
-    def _run_query(with_filter: bool) -> list:
-        kwargs = dict(base_kwargs)
-        if with_filter and filter_term:
-            kwargs["filterPattern"] = f'"{filter_term}"'
-
-        events = []
-        next_token = None
-        pages = 0
-        while pages < 5:
-            # Respect caller-supplied time budget between pages
-            if max_seconds > 0 and (time.perf_counter() - fetch_started) >= max_seconds:
-                break
-            try:
-                page_kwargs = dict(kwargs)
-                if next_token:
-                    page_kwargs["nextToken"] = next_token
-                response = LOGS_CLIENT.filter_log_events(**page_kwargs)
-                events.extend(response.get("events", []))
-                next_token = response.get("nextToken")
-                pages += 1
-                if not next_token or len(events) >= limit:
-                    break
-            except Exception:
-                # Missing/unauthorized groups should not crash diagnostics.
-                return []
-        return events[:limit]
-
-    events = _run_query(with_filter=True)
-    if events or not filter_term:
-        return events
-
-    # Fallback: some AgentCore log lines are visible in tail but missed by text filter patterns.
-    if max_seconds > 0 and (time.perf_counter() - fetch_started) >= max_seconds:
+    # Only allow querying the fixed agent-traces log group for runtime logs
+    AGENT_TRACES_LOG_GROUP = "/aws/bedrock-agentcore/runtimes/my_agent1-EuvQcG3t0u-DEFAULT"
+    AGENT_TRACES_STREAM = "agent-traces"
+    if log_group != AGENT_TRACES_LOG_GROUP:
         return []
-    events = _run_query(with_filter=False)
-    if events:
-        return events
-
-    return _fetch_recent_stream_events(log_group, start_time_ms, limit)
+    # Use CloudWatch Logs Insights for efficiency
+    start_time_ms = int((time.time() - lookback_hours * 3600) * 1000)
+    end_time_ms = int(time.time() * 1000)
+    query_string = f'fields @timestamp, @message | filter @logStream == "{AGENT_TRACES_STREAM}" | sort @timestamp desc | limit {limit}'
+    try:
+        start_resp = LOGS_CLIENT.start_query(
+            logGroupName=AGENT_TRACES_LOG_GROUP,
+            startTime=start_time_ms,
+            endTime=end_time_ms,
+            queryString=query_string,
+        )
+        query_id = start_resp["queryId"]
+        poll_start = time.perf_counter()
+        while True:
+            if max_seconds > 0 and (time.perf_counter() - poll_start) >= max_seconds:
+                break
+            if time.perf_counter() - poll_start > 10.0:
+                break
+            time.sleep(0.5)
+            result = LOGS_CLIENT.get_query_results(queryId=query_id)
+            if result.get("status", "") == "Complete":
+                break
+        rows = result.get("results", []) if result.get("status", "") == "Complete" else []
+    except Exception:
+        rows = []
+    events = []
+    for row in rows:
+        msg = next((c['value'] for c in row if c.get('field') == '@message'), "")
+        ts = next((c['value'] for c in row if c.get('field') == '@timestamp'), None)
+        events.append({"message": msg, "timestamp": ts})
+    return events[:limit]
 
 
 def _fetch_recent_stream_events(
@@ -1033,136 +1020,8 @@ def _fetch_recent_stream_events(
     max_seconds: float = 0.0,
     max_candidate_streams_override: int = 0,
 ) -> list:
-    """Scan log streams covering the lookback window.
-
-    AgentCore runtime streams use the format YYYY/MM/DD/[runtime-logs]<uuid> (one per
-    invocation).  We use date-prefixed describe_log_streams calls so we find the right
-    streams quickly rather than relying on generic LastEventTime ordering (which returns
-    at most 10 streams and often misses older invocations).
-    """
-    start_time_s = start_time_ms / 1000.0
-    now_s = time.time()
-    lookback_days = max(1, int((now_s - start_time_s) / 86400) + 1)
-
-    # Build date prefixes that cover the lookback window (UTC dates).
-    # AgentCore stream names have appeared with minor prefix variants over time.
-    date_prefixes = []
-    for days_back in range(lookback_days + 1):
-        t = time.gmtime(now_s - days_back * 86400)
-        day_prefix = f"{t.tm_year:04d}/{t.tm_mon:02d}/{t.tm_mday:02d}/"
-        date_prefixes.extend(
-            [
-                f"{day_prefix}[runtime-logs]",
-                f"{day_prefix}[runtime_logs]",
-                f"{day_prefix}runtime-logs",
-            ]
-        )
-
-    candidate_streams: list = []
-    seen: set = set()
-    max_candidate_streams = min(max(limit * 3, 500), 4000)
-    if max_candidate_streams_override > 0:
-        max_candidate_streams = min(max_candidate_streams, max(100, int(max_candidate_streams_override)))
-    started = time.perf_counter()
-    for prefix in date_prefixes:
-        if max_seconds > 0 and (time.perf_counter() - started) >= max_seconds:
-            break
-        prefix_seen = 0
-        next_token = None
-        pages = 0
-        while pages < max(1, RUNTIME_STREAM_PAGES_PER_PREFIX):
-            if max_seconds > 0 and (time.perf_counter() - started) >= max_seconds:
-                break
-            try:
-                kwargs: Dict[str, Any] = {
-                    "logGroupName": log_group,
-                    "logStreamNamePrefix": prefix,
-                    "limit": 50,
-                }
-                if next_token:
-                    kwargs["nextToken"] = next_token
-                resp = LOGS_CLIENT.describe_log_streams(**kwargs)
-            except Exception:
-                break
-
-            for stream in resp.get("logStreams", []):
-                name = stream.get("logStreamName")
-                if name and name not in seen:
-                    seen.add(name)
-                    candidate_streams.append(stream)
-                    prefix_seen += 1
-                    if len(candidate_streams) >= max_candidate_streams or prefix_seen >= max(1, RUNTIME_STREAMS_PER_PREFIX):
-                        break
-
-            if len(candidate_streams) >= max_candidate_streams or prefix_seen >= max(1, RUNTIME_STREAMS_PER_PREFIX):
-                break
-
-            next_token = resp.get("nextToken")
-            pages += 1
-            if not next_token:
-                break
-
-        if len(candidate_streams) >= max_candidate_streams:
-            break
-
-    # Generic fallback for non-AgentCore log groups (no date-prefix streams found).
-    if not candidate_streams:
-        try:
-            next_token = None
-            pages = 0
-            while pages < max(1, RUNTIME_STREAM_PAGES_PER_PREFIX):
-                if max_seconds > 0 and (time.perf_counter() - started) >= max_seconds:
-                    break
-                kwargs: Dict[str, Any] = {
-                    "logGroupName": log_group,
-                    "orderBy": "LastEventTime",
-                    "descending": True,
-                    "limit": 50,
-                }
-                if next_token:
-                    kwargs["nextToken"] = next_token
-                resp = LOGS_CLIENT.describe_log_streams(**kwargs)
-                for stream in resp.get("logStreams", []):
-                    name = stream.get("logStreamName")
-                    if name and name not in seen:
-                        seen.add(name)
-                        candidate_streams.append(stream)
-                next_token = resp.get("nextToken")
-                pages += 1
-                if not next_token or len(candidate_streams) >= max_candidate_streams:
-                    break
-        except Exception:
-            return []
-
-    collected: list = []
-    for stream in candidate_streams:
-        if max_seconds > 0 and (time.perf_counter() - started) >= max_seconds:
-            break
-        stream_name = stream.get("logStreamName")
-        if not stream_name:
-            continue
-        last_event = stream.get("lastEventTimestamp", 0)
-        if last_event and last_event < start_time_ms:
-            continue
-        try:
-            response = LOGS_CLIENT.get_log_events(
-                logGroupName=log_group,
-                logStreamName=stream_name,
-                startTime=start_time_ms,
-                startFromHead=True,
-                limit=min(max(200, limit), 1000),
-            )
-        except Exception:
-            continue
-        for row in response.get("events", []):
-            if isinstance(row, dict):
-                row["_log_stream_name"] = stream_name
-            collected.append(row)
-        if len(collected) >= limit:
-            break
-
-    collected.sort(key=lambda row: row.get("timestamp", 0), reverse=True)
-    return collected[:limit]
+    # This function is now disabled: only the fixed agent-traces stream is ever queried for runtime logs.
+    return []
 
 
 def _discover_log_groups(prefix: str, limit: int = 25) -> list:
@@ -1196,11 +1055,11 @@ def _discover_log_groups(prefix: str, limit: int = 25) -> list:
 
 def _resolve_evaluator_log_groups() -> list:
     if EVALUATOR_LOG_GROUP:
-        pinned = [EVALUATOR_LOG_GROUP]
-    else:
-        pinned = []
+        # Explicitly pinned single evaluator results group.
+        # When set, do not scan/discover any other evaluator groups.
+        return [EVALUATOR_LOG_GROUP]
 
-    groups = list(pinned)
+    groups = []
     discovered = _discover_log_groups(EVALUATOR_LOG_PREFIX, limit=40)
     # Keep only result streams to reduce scan cost/noise.
     filtered = [g for g in discovered if "/results/" in g]
@@ -1866,6 +1725,7 @@ def _fetch_runtime_backfill_insights(
 
     query_string = (
         "fields @timestamp, @message, @logStream "
+        f"| filter @logStream == '{RUNTIME_LOG_STREAM}' "
         "| filter @message like /agent_request_trace/ "
         "| sort @timestamp desc "
         f"| limit {insights_limit}"
@@ -1938,33 +1798,50 @@ def _fetch_evaluator_records_window(
     per_group_limit: int = 300,
     max_seconds: float = 0.0,
 ) -> Dict[str, Any]:
-    groups_used: List[str] = []
     records: List[Dict[str, Any]] = []
     started = time.perf_counter()
-
-    groups = _resolve_evaluator_log_groups()[:max_groups]
-    for group in groups:
-        if max_seconds > 0 and (time.perf_counter() - started) >= max_seconds:
-            break
-        groups_used.append(group)
-        # Pass the remaining budget and a capped window to _fetch_log_events so a
-        # single slow CloudWatch page cannot block this thread past its budget.
-        group_budget = max(0.0, max_seconds - (time.perf_counter() - started)) if max_seconds > 0 else 0.0
-        eval_lookback = min(lookback_hours, max(48, BACKFILL_MAX_SCAN_HOURS))
-        events = _fetch_log_events(group, {}, lookback_hours=eval_lookback, limit=per_group_limit, max_seconds=group_budget)
-        for row in events:
-            payload = _json_from_log_message(row.get("message", ""))
-            if not payload:
-                continue
-            metrics: Dict[str, Dict[str, Any]] = {}
-            _collect_evaluations(payload, metrics)
-            if not metrics:
-                continue
-            payload["_cloudwatch_timestamp"] = row.get("timestamp")
-            payload["_cloudwatch_message"] = row.get("message", "")
-            records.append(payload)
-
-    records.sort(key=lambda item: item.get("_cloudwatch_timestamp", 0), reverse=True)
+    groups = _resolve_evaluator_log_groups()[:1]
+    groups_used = groups.copy()
+    if not groups:
+        return {"records": [], "groups_used": []}
+    group = groups[0]
+    # Use CloudWatch Logs Insights for evaluator log queries
+    query_string = f'fields @timestamp, @message | sort @timestamp desc | limit {per_group_limit}'
+    try:
+        start_resp = LOGS_CLIENT.start_query(
+            logGroupName=group,
+            startTime=int((time.time() - lookback_hours * 3600) * 1000),
+            endTime=int(time.time() * 1000),
+            queryString=query_string,
+        )
+        query_id = start_resp["queryId"]
+        # Poll for completion (max 10s or remaining budget)
+        poll_start = time.perf_counter()
+        while True:
+            if max_seconds > 0 and (time.perf_counter() - started) >= max_seconds:
+                break
+            if time.perf_counter() - poll_start > 10.0:
+                break
+            time.sleep(0.5)
+            result = LOGS_CLIENT.get_query_results(queryId=query_id)
+            if result.get("status", "") == "Complete":
+                break
+        rows = result.get("results", []) if result.get("status", "") == "Complete" else []
+    except Exception:
+        rows = []
+    for row in rows:
+        msg = next((c['value'] for c in row if c.get('field') == '@message'), "")
+        payload = _json_from_log_message(msg)
+        if not payload:
+            continue
+        metrics: Dict[str, Dict[str, Any]] = {}
+        _collect_evaluations(payload, metrics)
+        if not metrics:
+            continue
+        payload["_cloudwatch_timestamp"] = next((c['value'] for c in row if c.get('field') == '@timestamp'), None)
+        payload["_cloudwatch_message"] = msg
+        records.append(payload)
+    records.sort(key=lambda item: item.get("_cloudwatch_timestamp", 0) or 0, reverse=True)
     return {"records": records, "groups_used": groups_used}
 
 
@@ -2205,6 +2082,8 @@ def _build_fleet_summary_with_llm(question: str, merged: Dict[str, Any]) -> str:
         "Keep responses transport-safe: if a response may exceed about 1200 tokens, prioritize concise output and explicitly state truncation. "
         "For very long trace lists, return the first 150 trace IDs in order, then state exactly how many were omitted. "
         "If delayed traces are requested: list each on a new line as 'Trace [id], Latency [time]ms, Runtime [time]ms'. "
+        "Do NOT enumerate or list out every individual session ID or trace ID in your response unless explicitly asked. "
+        "Provide a high-level summary of aggregated metrics, overall fleet health, and only highlight anomalous or delayed traces. "
         "If no traces meet the filter, say so clearly, then offer the top anomalies. "
         f"Dataset has {traces_total} total traces."
     )
@@ -2271,10 +2150,11 @@ def _build_discovery_diagnosis(
         "You are a telemetry analyst. Understand what the user is asking and respond naturally. "
         "The context has two scopes: sessions/users for current page details, and all_pages_session_index/all_pages_user_index for whole-window awareness. "
         "For listing/enumeration requests ('list sessions', 'show all users', 'give me usernames', 'what sessions exist'): "
-        "list every item from the users and sessions data — include session IDs, usernames, timestamps (UTC), and metrics. "
+        "list ONLY the items present in the 'sessions' and 'users' data for the CURRENT PAGE. DO NOT attempt to list all items from all_pages_session_index. Include session IDs, usernames, timestamps (UTC), and metrics for the current page. If pagination_context indicates more pages, mention that more are available. "
         "For username-only requests, use all_pages_user_index as the source of truth for the whole window (not only current page users). "
-        "If the user asks for trace IDs for a session, use all_pages_session_index.trace_ids_preview when available; if more traces exist than preview, say this is a preview and suggest deep-dive for complete list. "
-        "For summary/analysis requests: give a concise overview highlighting key issues. "
+        "If the user asks for trace IDs for a session, use all_pages_session_index.trace_id_sample when available; if more traces exist, suggest deep-dive for the complete list. "
+        "For summary/analysis requests: give a concise overview highlighting key issues using both the current page and overall indexes. "
+        "CRITICAL: When asked to list out items, never enumerate from the all_pages_session_index as it causes timeouts. Only list the subset provided in the current page 'sessions' block. "
         "For user-specific requests: focus only on that user's sessions and metrics. "
         "For questions about the whole timeframe, use all_pages_session_index/all_pages_user_index instead of only the current page. "
         "Always include timestamps in UTC when available in the data. "
@@ -2840,11 +2720,11 @@ def _build_discovery_context(merged: Dict[str, Any], query_intent: Dict[str, Any
                 "max_latency_ms": ((sess.get("session_metrics") or {}).get("max_e2e_ms") if isinstance(sess, dict) else 0.0),
                 "latest_trace_epoch_ms": ((sess.get("latest_trace_ts") if isinstance(sess, dict) else 0) or 0),
                 "latest_trace_timestamp_utc": _format_epoch_ms_to_iso_utc((sess.get("latest_trace_ts") if isinstance(sess, dict) else 0) or 0),
-                "trace_ids_preview": [
-                    str((tr or {}).get("trace_id", ""))
-                    for tr in ((sess.get("traces", []) if isinstance(sess, dict) else [])[:5])
-                    if str((tr or {}).get("trace_id", "")).strip()
-                ],
+                "trace_id_sample": (
+                    str((((sess.get("traces", []) if isinstance(sess, dict) else [])[:1] or [{}])[0] or {}).get("trace_id", ""))
+                    if isinstance(sess, dict)
+                    else ""
+                ),
             },
         )
         for sid, sess in filtered_sessions.items()
@@ -2871,16 +2751,12 @@ def _build_discovery_context(merged: Dict[str, Any], query_intent: Dict[str, Any
             {
                 "user_id": _uid,
                 "user_name": _uname,
-                "session_ids": [],
                 "session_count": 0,
                 "total_traces": 0,
             },
         )
-        _bucket["session_ids"].append(str(_sid))
+        _bucket["session_count"] += 1
         _bucket["total_traces"] += int(_sess.get("trace_count", 0) or 0)
-    for _uid, _obj in users_from_all_pages.items():
-        _obj["session_ids"] = sorted(set(_obj.get("session_ids", [])))[:40]
-        _obj["session_count"] = len(_obj["session_ids"])
     all_pages_user_index = dict(list(users_from_all_pages.items())[:120])
 
     paged_sessions = filtered_sessions
@@ -2986,38 +2862,65 @@ def _build_discovery_context(merged: Dict[str, Any], query_intent: Dict[str, Any
             "Try re-running the same query in a few seconds for complete attribution."
         )
 
-    return {
-        "analysis_mode": "discovery",
-        "window": merged.get("window", {}),
-        "fleet_summary": {
-            "total_sessions": total_sessions_count,
-            "total_traces": sum(int((sess or {}).get("trace_count", 0) or 0) for sess in paged_sessions.values()),
-            "sessions_on_page": sessions_on_page_count,
-            "sessions_shown_to_llm": len(llm_session_rows),
-            "sessions_truncated": sessions_truncated,
-        },
-        "fleet_metrics": merged.get("fleet_metrics", {}),
-        "quality_indicators": merged.get("quality_indicators", {}),
-        "users": filtered_users,
-        "sessions": dict(llm_session_rows),
-        "bottleneck_ranking": merged.get("bottleneck_ranking", [])[:10],
-        "top_anomalies": [
-            {
-                "trace_id": t.get("trace_id", ""),
-                "e2e_ms": t.get("e2e_ms"),
-                "status": t.get("status", "success"),
-                "user": t.get("user", {}),
-            }
-            for t in (merged.get("top_anomalies") or [])[:10]
-        ],
-        "trace_lookup": merged.get("trace_lookup", {}),
-        "pagination_context": merged.get("pagination_context", {}),
-        "sessions_pagination_context": merged.get("sessions_pagination_context", {}),
-        "all_pages_session_index": all_pages_session_index,
-        "all_pages_user_index": all_pages_user_index,
-        "user_filter": user_filter_meta,
-        "completeness_note": completeness_note,
-    }
+    # If the LLM intent is summary, only pass summary metrics and a high-level overview, not the full session index.
+    if intent.get("intent_type") == "summary":
+        return {
+            "analysis_mode": "discovery",
+            "window": merged.get("window", {}),
+            "fleet_summary": {
+                "total_sessions": total_sessions_count,
+                "total_traces": sum(int((sess or {}).get("trace_count", 0) or 0) for sess in paged_sessions.values()),
+                "sessions_on_page": sessions_on_page_count,
+                "sessions_shown_to_llm": len(llm_session_rows),
+                "sessions_truncated": sessions_truncated,
+            },
+            "fleet_metrics": merged.get("fleet_metrics", {}),
+            "quality_indicators": merged.get("quality_indicators", {}),
+            "bottleneck_ranking": merged.get("bottleneck_ranking", [])[:10],
+            "top_anomalies": [
+                {
+                    "trace_id": t.get("trace_id", ""),
+                    "e2e_ms": t.get("e2e_ms"),
+                    "status": t.get("status", "success"),
+                    "user": t.get("user", {}),
+                }
+                for t in (merged.get("top_anomalies") or [])[:10]
+            ],
+            "completeness_note": completeness_note,
+        }
+    else:
+        return {
+            "analysis_mode": "discovery",
+            "window": merged.get("window", {}),
+            "fleet_summary": {
+                "total_sessions": total_sessions_count,
+                "total_traces": sum(int((sess or {}).get("trace_count", 0) or 0) for sess in paged_sessions.values()),
+                "sessions_on_page": sessions_on_page_count,
+                "sessions_shown_to_llm": len(llm_session_rows),
+                "sessions_truncated": sessions_truncated,
+            },
+            "fleet_metrics": merged.get("fleet_metrics", {}),
+            "quality_indicators": merged.get("quality_indicators", {}),
+            "users": filtered_users,
+            "sessions": dict(llm_session_rows),
+            "bottleneck_ranking": merged.get("bottleneck_ranking", [])[:10],
+            "top_anomalies": [
+                {
+                    "trace_id": t.get("trace_id", ""),
+                    "e2e_ms": t.get("e2e_ms"),
+                    "status": t.get("status", "success"),
+                    "user": t.get("user", {}),
+                }
+                for t in (merged.get("top_anomalies") or [])[:10]
+            ],
+            "trace_lookup": merged.get("trace_lookup", {}),
+            "pagination_context": merged.get("pagination_context", {}),
+            "sessions_pagination_context": merged.get("sessions_pagination_context", {}),
+            "all_pages_session_index": all_pages_session_index,
+            "all_pages_user_index": all_pages_user_index,
+            "user_filter": user_filter_meta,
+            "completeness_note": completeness_note,
+        }
 
 
 def _build_deep_dive_context(merged: Dict[str, Any], session_id: str) -> Dict[str, Any]:
@@ -3416,11 +3319,8 @@ def _handle_fleet_insights(
     runtime_source_stats = runtime_fetch["source_stats"]
     evaluator_records = evaluator_fetch["records"]
     evaluator_groups_used = evaluator_fetch["groups_used"]
-    runtime_streams_used = sorted({
-        str(r.get("_source_stream", "")).strip()
-        for r in runtime_records
-        if str(r.get("_source_stream", "")).strip()
-    })
+    # Only include the fixed agent-traces stream, never any other.
+    runtime_streams_used = ["agent-traces"]
 
     # ── Emit post-collection trace ──────────────────────────────────────────────
     _emit_analyzer_trace({
@@ -4301,7 +4201,7 @@ def _handle_fleet_insights(
         llm_builder = _build_session_deep_dive_diagnosis
         llm_builder_args = (question, llm_context, analyst_memory)
     else:
-        discovery_primary_tokens = min(DIAGNOSIS_FLEET_DISCOVERY_MAX_TOKENS, 1800)
+        discovery_primary_tokens = min(DIAGNOSIS_FLEET_DISCOVERY_MAX_TOKENS, 900)
         llm_builder = _build_discovery_diagnosis
         llm_builder_args = (question, llm_context, analyst_memory, discovery_primary_tokens)
 
@@ -4321,13 +4221,6 @@ def _handle_fleet_insights(
 
     try:
         if (not _is_trace_lookup) and (not _is_deep_dive):
-            # Give discovery mode 20s on the first attempt.
-            # Previously capped at 12s, which caused spurious retries on days
-            # when Bedrock TTFB is 12-18s regardless of context size (7KB is fine
-            # but Bedrock still takes >12s to start responding). With a 20s cap
-            # the first attempt succeeds on slow-Bedrock days; if it still times
-            # out then the retry budget drops below the 4s threshold and we fail
-            # cleanly rather than burning another 10s on a futile retry.
             first_attempt_timeout = min(llm_timeout_seconds, 20.0)
         else:
             first_attempt_timeout = llm_timeout_seconds
@@ -4343,7 +4236,7 @@ def _handle_fleet_insights(
             elapsed_so_far = time.perf_counter() - handler_start
             retry_budget = max(0.0, 28.2 - elapsed_so_far)
             if retry_budget >= 4.0:
-                retry_tokens = min(DIAGNOSIS_FLEET_DISCOVERY_MAX_TOKENS, 1200)
+                retry_tokens = min(DIAGNOSIS_FLEET_DISCOVERY_MAX_TOKENS, 600)
                 _emit_analyzer_trace({
                     "phase": "llm_retry_start",
                     "analysis_id": analysis_id,
@@ -4715,26 +4608,8 @@ def _handle_session_insights(event: Dict[str, Any]) -> Dict[str, Any]:
             except Exception:
                 pass
 
-        # ── Fallback: per-invocation streams (pre-fix invocations, or if fixed stream unavailable) ──
-        if not runtime_records and RUNTIME_LOG_GROUP:
-            runtime_events = _fetch_log_events(RUNTIME_LOG_GROUP, runtime_terms, lookback_hours=lookback_hours, limit=500)
-            for event_row in runtime_events:
-                payload = _json_from_log_message(event_row.get("message", ""))
-                if not payload or not _is_runtime_trace_payload(payload):
-                    continue
-                if _record_matches_terms(payload, event_row.get("message", ""), runtime_terms):
-                    payload["_cloudwatch_timestamp"] = event_row.get("timestamp")
-                    runtime_records.append(payload)
 
-        # ── Last resort: date-prefixed stream scanner ──
-        if not runtime_records and RUNTIME_LOG_GROUP:
-            for event_row in _fetch_recent_stream_events(RUNTIME_LOG_GROUP, _rt_start_ms, limit=500):
-                payload = _json_from_log_message(event_row.get("message", ""))
-                if not payload or not _is_runtime_trace_payload(payload):
-                    continue
-                if _record_matches_terms(payload, event_row.get("message", ""), runtime_terms):
-                    payload["_cloudwatch_timestamp"] = event_row.get("timestamp")
-                    runtime_records.append(payload)
+        # Fallback/backfill logic removed: only the fixed agent-traces stream is ever queried for runtime logs.
 
         runtime_records.sort(key=lambda row: row.get("_cloudwatch_timestamp", 0), reverse=True)
         latest_runtime = runtime_records[0] if runtime_records else {}
