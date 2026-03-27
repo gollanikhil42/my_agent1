@@ -474,7 +474,7 @@ def _classify_question_intent_llm(question: str, analyst_memory: Any = None) -> 
 
     try:
         response = BEDROCK_CLIENT.converse(
-            modelId=DIAGNOSIS_MODEL_ID,
+            modelId="anthropic.claude-3-haiku-20240307-v1:0",
             system=[{"text": system_prompt}],
             messages=[{"role": "user", "content": [{"text": user_content}]}],
             inferenceConfig={"maxTokens": 80, "temperature": 0.0},
@@ -518,7 +518,7 @@ def _classify_collection_strategy_llm(question: str, analyst_memory: Any = None)
 
     try:
         response = BEDROCK_CLIENT.converse(
-            modelId=DIAGNOSIS_MODEL_ID,
+            modelId="anthropic.claude-3-haiku-20240307-v1:0",
             system=[{"text": system_prompt}],
             messages=[{"role": "user", "content": [{"text": user_content}]}],
             inferenceConfig={"maxTokens": 80, "temperature": 0.0},
@@ -550,7 +550,7 @@ def _build_general_conversation_reply(question: str, analyst_memory: Any = None)
     )
     try:
         response = BEDROCK_CLIENT.converse(
-            modelId=DIAGNOSIS_MODEL_ID,
+            modelId="anthropic.claude-3-haiku-20240307-v1:0",
             system=[{"text": system_prompt}],
             messages=[{"role": "user", "content": [{"text": user_content}]}],
             inferenceConfig={"maxTokens": 220, "temperature": 0.5},
@@ -595,7 +595,7 @@ def _suggest_user_names(requested_user: str, users: Dict[str, Any], max_suggesti
 
     try:
         response = BEDROCK_CLIENT.converse(
-            modelId=DIAGNOSIS_MODEL_ID,
+            modelId="anthropic.claude-3-haiku-20240307-v1:0",
             system=[{"text": system_prompt}],
             messages=[{"role": "user", "content": [{"text": user_content}]}],
             inferenceConfig={"maxTokens": 120, "temperature": 0.0},
@@ -2152,17 +2152,15 @@ def _build_discovery_diagnosis(
         "For listing/enumeration requests ('list sessions', 'show all users', 'give me usernames', 'what sessions exist'): "
         "list ONLY the items present in the 'sessions' and 'users' data for the CURRENT PAGE. DO NOT attempt to list all items from all_pages_session_index. Include session IDs, usernames, timestamps (UTC), and metrics for the current page. If pagination_context indicates more pages, mention that more are available. "
         "For username-only requests, use all_pages_user_index as the source of truth for the whole window (not only current page users). "
-        "If the user asks for trace IDs for a session, use all_pages_session_index.trace_id_sample when available; if more traces exist, suggest deep-dive for the complete list. "
-        "For summary/analysis requests: give a concise overview highlighting key issues using both the current page and overall indexes. "
+        "If the user asks for trace IDs for a session, use all_pages_session_index.trace_id_sample when available. "
+        "For summary/analysis requests ('Give me a summary', 'Overview'): give a short, crisp, high-level overview. "
+        "CRITICAL FOR SUMMARIES: Keep the summary strictly under 150 words. Focus only on fleet averages, total counts, and the top 2-3 anomalies. DO NOT list out individual sessions. DO NOT mention pagination, 'next page', or that more sessions are available. This is vital to prevent UI pagination loops. "
+        "CRITICAL FOR ALL RESPONSES: You are operating behind a strict 29-second AWS API Gateway hard timeout limit. Keep EVERY single response concise and strictly under 250 words. Never list more than 5 distinct items (sessions/traces/issues) under any circumstances. Rambling or exhaustively listing items WILL crash the system! "
         "CRITICAL: When asked to list out items, never enumerate from the all_pages_session_index as it causes timeouts. Only list the subset provided in the current page 'sessions' block. "
         "For user-specific requests: focus only on that user's sessions and metrics. "
-        "For questions about the whole timeframe, use all_pages_session_index/all_pages_user_index instead of only the current page. "
         "Always include timestamps in UTC when available in the data. "
         "Use 'average latency' and 'maximum latency' — never abbreviate as avg/max. "
-        "If user_filter.matched is false and user_filter.suggested_user_names has entries, explicitly say: "
-        "'No user named X was found. Did you mean: [suggestions]?' "
         "If completeness_note is present in the context, mention it at the end of your response briefly. "
-        "If sessions or users show unknown-session or unknown-user, acknowledge this and mention data may be incomplete. "
         "Plain text. Full IDs. No markdown."
     )
 
