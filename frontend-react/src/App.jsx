@@ -8,12 +8,20 @@ const ANALYSIS_MAX_RETRIES = 2;
 const ANALYST_MEMORY_LIMIT = 6;
 const RETRYABLE_STATUS = new Set([429, 502, 503]);
 const DEFAULT_FLEET_PAGE_SIZE = 20;
-const ANALYSER_SUGGESTIONS = [
+const FLEET_SUGGESTIONS = [
   "Give me a summary of all sessions in this time window and highlight any issues.",
   "Which sessions are the slowest and what is causing the latency?",
   "Which sessions had the most errors and what patterns do you see?",
   "List all users and show their sessions along with any issues they faced.",
   "Analyze the most problematic session in detail and explain what went wrong.",
+];
+
+const SINGLE_TRACE_SUGGESTIONS = [
+  "Break down the latency for this trace and identify the slowest sub-segment.",
+  "Check for any service errors, faults, or throttles in this X-Ray trace.",
+  "Are there any specific S3 or Bedrock sub-segments causing delays?",
+  "Show me the evaluator scores and quality metrics for this trace.",
+  "Provide a full technical summary of all X-Ray segments in this trace.",
 ];
 const LOOKBACK_OPTIONS = [
   { value: "1", label: "1 hour" },
@@ -557,8 +565,8 @@ function App({ signOut, user }) {
       analystAbortRef.current = controller;
       setAutoPageProgress(null);
 
-      async function fetchAnalysisPage(targetPage) {
-        const session = await fetchAuthSession();
+      async function fetchAnalysisPage(targetPage, forceTokenRefresh = false) {
+        const session = await fetchAuthSession({ forceRefresh: forceTokenRefresh });
         const jwtToken = session.tokens?.idToken?.toString() || "";
         const response = await postWithRetry(`${API_BASE_URL}/session-insights`, {
           method: "POST",
@@ -599,6 +607,11 @@ function App({ signOut, user }) {
             },
           }),
         }, ANALYSIS_MAX_RETRIES, controller.signal);
+
+        // If we get a 401, force-refresh the token and retry once (handles transient JWT expiry).
+        if (response.status === 401 && !forceTokenRefresh) {
+          return fetchAnalysisPage(targetPage, true);
+        }
 
         const data = await response.json().catch(() => ({}));
         const answer = response.ok
@@ -836,59 +849,60 @@ function App({ signOut, user }) {
 
             <aside className={`left-menu ${controlsOpen ? "open" : "collapsed"}`}>
               <div className="left-menu-scroll">
-              <div className="analysis-toolbar">
-                <label>
-                  <span>Mode</span>
-                  <select value={analystMode} onChange={(e) => setAnalystMode(e.target.value)}>
-                    <option value="fleet_window">Fleet window</option>
-                    <option value="single_trace">Single trace</option>
-                  </select>
-                </label>
-                <label>
-                  <span>Time</span>
-                  <select
-                    value={logLookbackHours}
-                    onChange={(e) => setLogLookbackHours(e.target.value || "1")}
-                    disabled={analystMode === "single_trace"}
-                  >
-                    {LOOKBACK_OPTIONS.map((opt) => (
-                      <option key={opt.value} value={opt.value}>{opt.label}</option>
-                    ))}
-                  </select>
-                </label>
-                {analystMode === "single_trace" && (
-                  <label className="trace-id-field">
-                    <span>X-Ray Trace ID</span>
-                    <input
-                      value={analystAnchors.xray_trace_id || ""}
-                      onChange={(e) =>
-                        setAnalystAnchors((prev) => ({
-                          ...prev,
-                          xray_trace_id: e.target.value.trim(),
-                        }))
-                      }
-                      placeholder={autoAnchors.xray_trace_id || "send a chat message to capture trace ID"}
-                    />
+                <div className="analysis-toolbar">
+                  <label>
+                    <span>Mode</span>
+                    <select value={analystMode} onChange={(e) => setAnalystMode(e.target.value)}>
+                      <option value="fleet_window">Fleet window</option>
+                      <option value="single_trace">Single trace</option>
+                    </select>
                   </label>
-                )}
-              </div>
+                  {isFleetMode && (
+                    <label>
+                      <span>Time</span>
+                      <select
+                        value={logLookbackHours}
+                        onChange={(e) => setLogLookbackHours(e.target.value || "1")}
+                      >
+                        {LOOKBACK_OPTIONS.map((opt) => (
+                          <option key={opt.value} value={opt.value}>{opt.label}</option>
+                        ))}
+                      </select>
+                    </label>
+                  )}
+                  {analystMode === "single_trace" && (
+                    <label className="trace-id-field">
+                      <span>X-Ray Trace ID</span>
+                      <input
+                        value={analystAnchors.xray_trace_id || ""}
+                        onChange={(e) =>
+                          setAnalystAnchors((prev) => ({
+                            ...prev,
+                            xray_trace_id: e.target.value.trim(),
+                          }))
+                        }
+                        placeholder={autoAnchors.xray_trace_id || "send a chat message to capture trace ID"}
+                      />
+                    </label>
+                  )}
+                </div>
 
-              <div className="menu-suggestions">
-                <p>Suggestions</p>
-                {ANALYSER_SUGGESTIONS.map((suggestion, index) => (
-                  <button
-                    key={suggestion}
-                    type="button"
-                    className="suggestion-chip"
-                    onClick={() => setLogQuestion(suggestion)}
-                    disabled={isBusy}
-                  >
-                    <span className="suggestion-index">0{index + 1}</span>
-                    <span className="suggestion-text">{suggestion}</span>
-                  </button>
-                ))}
+                <div className="menu-suggestions">
+                  <p>Suggestions</p>
+                  {(isFleetMode ? FLEET_SUGGESTIONS : SINGLE_TRACE_SUGGESTIONS).map((suggestion, index) => (
+                    <button
+                      key={suggestion}
+                      type="button"
+                      className="suggestion-chip"
+                      onClick={() => setLogQuestion(suggestion)}
+                      disabled={isBusy}
+                    >
+                      <span className="suggestion-index">0{index + 1}</span>
+                      <span className="suggestion-text">{suggestion}</span>
+                    </button>
+                  ))}
+                </div>
               </div>
-            </div>
             </aside>
           </>
         )}

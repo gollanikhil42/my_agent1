@@ -41,7 +41,7 @@ BEDROCK_CLIENT = boto3.client(
     ),
 )
 DIAGNOSIS_MODEL_ID = os.environ.get("DIAGNOSIS_MODEL_ID", "")
-DIAGNOSIS_SESSION_MAX_TOKENS = int(os.environ.get("DIAGNOSIS_SESSION_MAX_TOKENS", "1150"))
+DIAGNOSIS_SESSION_MAX_TOKENS = int(os.environ.get("DIAGNOSIS_SESSION_MAX_TOKENS", "600"))
 DIAGNOSIS_PROMPT_UPGRADE_MAX_TOKENS = int(os.environ.get("DIAGNOSIS_PROMPT_UPGRADE_MAX_TOKENS", "920"))
 DIAGNOSIS_FLEET_SUMMARY_MAX_TOKENS = int(os.environ.get("DIAGNOSIS_FLEET_SUMMARY_MAX_TOKENS", "2000"))
 DIAGNOSIS_FLEET_DISCOVERY_MAX_TOKENS = int(os.environ.get("DIAGNOSIS_FLEET_DISCOVERY_MAX_TOKENS", "3000"))
@@ -139,6 +139,45 @@ RUNTIME_BACKFILL_ENABLED = str(os.environ.get("RUNTIME_BACKFILL_ENABLED", "false
     "1", "true", "yes", "on"
 }
 XRAY_QUERY_CHUNK_HOURS = int(os.environ.get("XRAY_QUERY_CHUNK_HOURS", "24"))
+
+_resolved_runtime_log_groups_cache: List[str] = []
+
+def _resolve_runtime_log_groups() -> List[str]:
+    """Dynamically resolve all matching runtime log groups."""
+    global _resolved_runtime_log_groups_cache
+    if _resolved_runtime_log_groups_cache:
+        return _resolved_runtime_log_groups_cache
+
+    base = RUNTIME_LOG_GROUP
+    if not base:
+        return []
+
+    groups = []
+    # Check if the literal group exists
+    try:
+        LOGS_CLIENT.describe_log_streams(logGroupName=base, limit=1)
+        groups.append(base)
+    except Exception:
+        pass
+
+    # Fallback: scan for groups starting with the runtime prefix
+    prefix = base.split("-DEFAULT")[0] if "-DEFAULT" in base else base
+    discovered = _discover_log_groups(prefix, limit=10)
+    for g in discovered:
+        if g not in groups:
+            groups.append(g)
+
+    if groups:
+        _resolved_runtime_log_groups_cache = groups
+    return groups
+
+
+def _resolve_runtime_log_group() -> str:
+    """Return the single primary runtime log group (first entry from the list resolver)."""
+    groups = _resolve_runtime_log_groups()
+    return groups[0] if groups else (RUNTIME_LOG_GROUP or "")
+
+
 # X-Ray retains traces for 30 days; querying beyond that returns nothing.
 XRAY_MAX_LOOKBACK_HOURS = int(os.environ.get("XRAY_MAX_LOOKBACK_HOURS", "720"))
 # Max hours of CloudWatch logs to scan in a single filter_log_events call.
@@ -427,6 +466,40 @@ def _normalize_trace_id(value: str) -> str:
     return text.replace("-", "")
 
 
+def _extract_xray_epoch_ms(trace_id: str) -> int:
+    """Extract the Unix epoch in milliseconds embedded in an X-Ray trace ID.
+    X-Ray format: 1-<8-char hex epoch seconds>-<24-char hex unique id>
+    Returns 0 if the ID is malformed or the timestamp is implausible.
+    """
+    try:
+        t = str(trace_id or "").strip()
+        parts = t.split("-")
+        if len(parts) >= 3 and parts[0] == "1" and len(parts[1]) == 8:
+            epoch_seconds = int(parts[1], 16)
+            now = time.time()
+            # Accept timestamps within the last 30 days
+            if 0 < (now - epoch_seconds) < 30 * 24 * 3600:
+                return int(epoch_seconds * 1000)
+    except Exception:
+        pass
+    return 0
+
+
+def _denormalize_trace_id(value: str) -> str:
+    """Convert a compact 32-char hex trace ID back to X-Ray API format 1-XXXXXXXX-XXXXXXXXXXXXXXXXXXXXXXXX.
+    Already-formatted IDs (starting with '1-') are returned unchanged."""
+    t = str(value or "").strip().lower()
+    if not t:
+        return ""
+    if t.startswith("1-") and t.count("-") >= 2:
+        return t  # already in X-Ray format
+    # Remove any stray dashes first, then reformat
+    compact = t.replace("-", "")
+    if len(compact) == 32 and re.fullmatch(r"[0-9a-f]{32}", compact):
+        return f"1-{compact[:8]}-{compact[8:]}"
+    return t
+
+
 def _denormalize_trace_id(value: str) -> str:
     """Convert a compact 32-char hex trace ID back to X-Ray API format 1-XXXXXXXX-XXXXXXXXXXXXXXXXXXXXXXXX.
     Already-formatted IDs (starting with '1-') are returned unchanged."""
@@ -532,6 +605,57 @@ def _classify_collection_strategy_llm(question: str, analyst_memory: Any = None)
         pass
 
     return "balanced"
+
+
+def _classify_fleet_request_llm(question: str, analyst_memory: Any = None) -> Dict[str, str]:
+    """Single Haiku call that classifies BOTH intent and collection strategy.
+
+    Replaces two serial Haiku calls (_classify_question_intent_llm +
+    _classify_collection_strategy_llm), cutting pre-flight LLM time roughly in half.
+
+    Returns a dict with:
+      intent   — "general_conversation" | "telemetry_analysis"
+      strategy — "completeness_first" | "balanced"
+    """
+    q = str(question or "").strip()
+    if not q:
+        return {"intent": "telemetry_analysis", "strategy": "balanced"}
+
+    system_prompt = (
+        "Classify the user message for a telemetry analysis dashboard. "
+        "Return ONLY JSON with two keys:\n"
+        "  intent:   'general_conversation' (greeting/small-talk, no logs needed) OR 'telemetry_analysis' (traces/sessions/latency/errors)\n"
+        "  strategy: 'completeness_first' (user explicitly wants to LIST every session/user/trace by ID, or wants an EXACT total count) "
+        "OR 'balanced' (summaries, overviews, highlights, patterns, slowest/fastest analysis, issue diagnosis — even if the word 'all' appears)"
+    )
+    memory_block = _format_analyst_memory(analyst_memory)
+    user_content = "".join(
+        [
+            f"Recent conversation:\n{memory_block}\n\n" if memory_block else "",
+            f"Message: {q}",
+        ]
+    )
+
+    try:
+        response = BEDROCK_CLIENT.converse(
+            modelId="anthropic.claude-3-haiku-20240307-v1:0",
+            system=[{"text": system_prompt}],
+            messages=[{"role": "user", "content": [{"text": user_content}]}],
+            inferenceConfig={"maxTokens": 80, "temperature": 0.0},
+        )
+        text = str(response["output"]["message"]["content"][0]["text"] or "").strip()
+        parsed = json.loads(text)
+        intent = str((parsed or {}).get("intent", "")).strip().lower()
+        strategy = str((parsed or {}).get("strategy", "")).strip().lower()
+        if intent not in {"general_conversation", "telemetry_analysis"}:
+            intent = "telemetry_analysis"
+        if strategy not in {"completeness_first", "balanced"}:
+            strategy = "balanced"
+        return {"intent": intent, "strategy": strategy}
+    except Exception:
+        pass
+
+    return {"intent": "telemetry_analysis", "strategy": "balanced"}
 
 
 def _build_general_conversation_reply(question: str, analyst_memory: Any = None) -> str:
@@ -971,22 +1095,46 @@ def _record_matches_terms(record: Dict[str, Any], message: str, terms: Dict[str,
     return False
 
 
-def _fetch_log_events(log_group: str, terms: Dict[str, str], lookback_hours: int = 24, limit: int = 200, max_seconds: float = 0.0) -> list:
+def _fetch_log_events(log_group: str, terms: Dict[str, str], lookback_hours: int = 24, limit: int = 200, max_seconds: float = 0.0, log_stream: str = "") -> list:
     if not log_group:
         return []
 
-    # Only allow querying the fixed agent-traces log group for runtime logs
-    AGENT_TRACES_LOG_GROUP = "/aws/bedrock-agentcore/runtimes/my_agent1-EuvQcG3t0u-DEFAULT"
-    AGENT_TRACES_STREAM = "agent-traces"
-    if log_group != AGENT_TRACES_LOG_GROUP:
-        return []
     # Use CloudWatch Logs Insights for efficiency
     start_time_ms = int((time.time() - lookback_hours * 3600) * 1000)
     end_time_ms = int(time.time() * 1000)
-    query_string = f'fields @timestamp, @message | filter @logStream == "{AGENT_TRACES_STREAM}" | sort @timestamp desc | limit {limit}'
+    # Build a filter pattern based on the provided terms for more efficient retrieval
+    filters = []
+    for k, v in (terms or {}).items():
+        if not v:
+            continue
+        # Use simple substring matching or exact matching based on the field
+        if k == "xray_trace_id":
+            # Search for ALL formats (raw, normalized, denormalized) to be safe.
+            # dash-separated IDs in logs will NOT match compact hex search terms.
+            raw_id = str(v).strip()
+            norm_id = _normalize_trace_id(raw_id)
+            denorm_id = _denormalize_trace_id(raw_id)
+            
+            id_set = {raw_id, norm_id, denorm_id}
+            id_set.discard("")
+            
+            if len(id_set) > 1:
+                or_terms = " or ".join([f'@message like "{tid}"' for tid in id_set])
+                filters.append(f'| filter {or_terms}')
+            elif id_set:
+                filters.append(f'| filter @message like "{next(iter(id_set))}"')
+        elif k == "session_id":
+            filters.append(f'| filter @message like "{v}"')
+        elif k == "request_id":
+            filters.append(f'| filter @message like "{v}"')
+
+    # Allow searching a specific stream if requested, otherwise scan the whole group.
+    stream_filter = f'| filter @logStream == "{log_stream}"' if log_stream else ""
+    query_string = f'fields @timestamp, @message, @logStream {stream_filter} {" ".join(filters)} | sort @timestamp desc | limit {limit}'
+    
     try:
         start_resp = LOGS_CLIENT.start_query(
-            logGroupName=AGENT_TRACES_LOG_GROUP,
+            logGroupName=log_group,
             startTime=start_time_ms,
             endTime=end_time_ms,
             queryString=query_string,
@@ -1013,15 +1161,68 @@ def _fetch_log_events(log_group: str, terms: Dict[str, str], lookback_hours: int
     return events[:limit]
 
 
-def _fetch_recent_stream_events(
-    log_group: str,
-    start_time_ms: int,
-    limit: int,
+def _fetch_runtime_backfill_insights(
+    lookback_hours: int,
+    limit: int = 1500,
     max_seconds: float = 0.0,
-    max_candidate_streams_override: int = 0,
+    start_time_ms_override: int = 0,
 ) -> list:
-    # This function is now disabled: only the fixed agent-traces stream is ever queried for runtime logs.
-    return []
+    """Perform a whole-group scan for runtime logs across all streams."""
+    resolved_group = _resolve_runtime_log_group()
+    if not resolved_group:
+        return []
+
+    # Use CloudWatch Logs Insights for the most robust cross-stream search
+    start_time_ms = start_time_ms_override or int((time.time() - lookback_hours * 3600) * 1000)
+    end_time_ms = int(time.time() * 1000)
+    
+    # Only pick up agent_request_trace ever for backfill
+    query_string = f'fields @timestamp, @message, @logStream as _log_stream_name | filter @message like "agent_request_trace" | sort @timestamp desc | limit {limit}'
+    
+    try:
+        start_resp = LOGS_CLIENT.start_query(
+            logGroupName=resolved_group,
+            startTime=start_time_ms,
+            endTime=end_time_ms,
+            queryString=query_string,
+        )
+        query_id = start_resp["queryId"]
+        poll_start = time.perf_counter()
+        while True:
+            if max_seconds > 0 and (time.perf_counter() - poll_start) >= max_seconds:
+                break
+            if time.perf_counter() - poll_start > 15.0:
+                break
+            time.sleep(0.5)
+            result = LOGS_CLIENT.get_query_results(queryId=query_id)
+            if result.get("status", "") in {"Complete", "Failed", "Cancelled"}:
+                break
+        
+        rows = result.get("results", []) if result.get("status", "") == "Complete" else []
+        events = []
+        for row in rows:
+            msg = next((c['value'] for c in row if c.get('field') == '@message'), "")
+            ts = next((c['value'] for c in row if c.get('field') == '@timestamp'), "")
+            sn = next((c['value'] for c in row if c.get('field') == '_log_stream_name'), "")
+            if msg:
+                events.append({
+                    "message": msg,
+                    "timestamp": _parse_cw_timestamp(ts),
+                    "_log_stream_name": sn
+                })
+        return events
+    except Exception:
+        return []
+    
+
+
+def _parse_cw_timestamp(ts_str: str) -> int:
+    try:
+        # 2026-03-29 14:12:00.000
+        dt = datetime.strptime(ts_str.split(".")[0], "%Y-%m-%d %H:%M:%S")
+        return int(dt.replace(tzinfo=timezone.utc).timestamp() * 1000)
+    except Exception:
+        return int(time.time() * 1000)
 
 
 def _discover_log_groups(prefix: str, limit: int = 25) -> list:
@@ -1262,7 +1463,8 @@ def _summarize_xray(trace_id: str) -> Dict[str, Any]:
     }
 
 
-def _compact_xray_detail(summary: Dict[str, Any]) -> Dict[str, Any]:
+def _compact_xray_detail(summary: Dict[str, Any], is_single_trace: bool = False) -> Dict[str, Any]:
+    limit = 120 if is_single_trace else 40
     return {
         "trace_id": str(summary.get("trace_id", "")),
         "total_latency_ms": summary.get("total_latency_ms"),
@@ -1270,7 +1472,7 @@ def _compact_xray_detail(summary: Dict[str, Any]) -> Dict[str, Any]:
         "slowest_step_overall": summary.get("slowest_step_overall"),
         "slowest_aggregate_step": summary.get("slowest_aggregate_step"),
         "totals_by_name": summary.get("totals_by_name", {}),
-        "steps": (summary.get("steps") or [])[:40],
+        "steps": (summary.get("steps") or [])[:limit],
         "error": summary.get("error", ""),
     }
 
@@ -1356,16 +1558,16 @@ def _build_diagnosis(question: str, merged: Dict[str, Any], analyst_memory: Any 
     system_prompt = (
         "You are a session log analyst for an AWS Bedrock AgentCore application. "
         "You have access to structured diagnostics data for a single agent session, "
-        "including runtime metadata (latency, token counts), X-Ray trace step timings, "
+        "including runtime metadata, granular X-Ray trace step timings (segments/subsegments), "
         "and evaluator quality metric scores. "
-        "Answer the user's question concisely and accurately using only the data provided. "
-        "Explain findings in plain language for a non-technical reader. "
+        "Answer the user's question with a technical yet readable focus. "
+        "Provide a granular, step-by-step breakdown of the X-Ray subsegments if they are present in the diagnostics. "
+        "Identify exact bottlenecks (e.g. S3 GetObject, Bedrock ConverseStream, log creation latency). "
         "FORMATTING RULES: Plain text only. No emojis, no markdown, no tables, no bullet points. "
         "Short paragraphs and professional tone. Prefer 3-5 short paragraphs. "
         "Format numbers readably (e.g. '8.1 seconds' or '3.4 seconds'). "
         "Do not mention request IDs, session IDs, trace IDs, or internal anchor values unless user explicitly asks. "
         "If you mention any identifier, always print the full value exactly as provided. Never shorten or abbreviate it. "
-        "If tools_used is empty or zero, do not report it or mention it - S3 price retrieval is pre-injected as context before the model call, not a Bedrock tool call. "
         "Do not fabricate values."
     )
 
@@ -1551,7 +1753,8 @@ def _fetch_runtime_records_window(
     max_fixed_stream_pages: int = 25,
     force_backfill_insights: bool = False,
 ) -> Dict[str, Any]:
-    if not RUNTIME_LOG_GROUP:
+    resolved_group = _resolve_runtime_log_group()
+    if not resolved_group:
         return {
             "records": [],
             "source_stats": {
@@ -1618,7 +1821,7 @@ def _fetch_runtime_records_window(
                 if max_seconds > 0 and (time.perf_counter() - started) >= max_seconds:
                     break
                 kwargs: Dict[str, Any] = {
-                    "logGroupName": RUNTIME_LOG_GROUP,
+                    "logGroupName": resolved_group,
                     "logStreamName": RUNTIME_LOG_STREAM,
                     "startTime": start_ms,
                     "startFromHead": True,
@@ -1665,17 +1868,7 @@ def _fetch_runtime_records_window(
             ):
                 _append_runtime_event(row, "backfill")
 
-    # Last resort: stream-level scan if everything above returned nothing.
-    if RUNTIME_BACKFILL_ENABLED and not records:
-        stream_budget_seconds = max(0.0, max_seconds - (time.perf_counter() - started)) if max_seconds > 0 else 0.0
-        for row in _fetch_recent_stream_events(
-            RUNTIME_LOG_GROUP,
-            start_ms,
-            limit=stream_scan_limit,
-            max_seconds=stream_budget_seconds,
-            max_candidate_streams_override=max_candidate_streams,
-        ):
-            _append_runtime_event(row, "backfill")
+    # Last resort stream-level scan removed: only the fixed agent-traces stream is used.
 
     records.sort(key=lambda item: item.get("_cloudwatch_timestamp", 0), reverse=True)
     return {
@@ -2205,8 +2398,9 @@ def _build_discovery_diagnosis(
 
 def _build_trace_lookup_diagnosis(question: str, merged: Dict[str, Any], analyst_memory: Any = None) -> str:
     system_prompt = (
-        "Analyze matched traces. Answer in 2-3 sentences only. "
-        "Name the slowest step and dominant delay source. "
+        "Analyze matched traces. Answer in 3-5 short paragraphs. "
+        "Provide a granular, step-by-step breakdown of the X-Ray subsegments and timings. "
+        "Identify exactly which sub-step (e.g. Bedrock ConverseStream, S3 GetObject, log creation) dominated the latency. "
         "If evaluator_scores exist for a matched trace, report those scores and do not claim they are missing. "
         "Include trace timestamp/date in UTC whenever available. "
         "Use full phrases 'average latency' and 'maximum latency' instead of avg/max. "
@@ -2632,7 +2826,7 @@ def _detect_query_mode(
 
     try:
         response = BEDROCK_CLIENT.converse(
-            modelId=DIAGNOSIS_MODEL_ID,
+            modelId="anthropic.claude-3-haiku-20240307-v1:0",
             system=[{"text": system_prompt}],
             messages=[{"role": "user", "content": [{"text": user_content}]}],
             inferenceConfig={"maxTokens": 180, "temperature": 0.0},
@@ -3041,7 +3235,9 @@ def _build_deep_dive_context(merged: Dict[str, Any], session_id: str) -> Dict[st
 
 def _build_session_deep_dive_diagnosis(question: str, merged: Dict[str, Any], analyst_memory: Any = None) -> str:
     system_prompt = (
-        "Analyze this session. Answer in 2-3 sentences. Plain text. Print full IDs. "
+        "Analyze this session in detail. Answer in 3-5 short paragraphs. Plain text. "
+        "Provide a granular, step-by-step breakdown of the X-Ray subsegments and timings. "
+        "Highlight exactly which sub-step dominated the latency. "
         "Include trace/session timestamp and date in UTC when available. "
         "Use full phrases 'average latency' and 'maximum latency' instead of avg/max."
     )
@@ -3071,19 +3267,30 @@ def _build_session_deep_dive_diagnosis(question: str, merged: Dict[str, Any], an
 
 
 def _build_llm_analysis_context(merged: Dict[str, Any], max_diag_traces: int = 25) -> Dict[str, Any]:
-    """Build an ultra-compact dict for the LLM call only.
+    """Build an ultra-compact dict for the LLM call only."""
+    analysis_mode = str(merged.get("analysis_mode", "")).strip().lower()
+    # In single_trace or trace_lookup modes, we want the LLM to see the full segment breakdown.
+    # We limit segments in fleet-wide deep-dives to avoid context bloat and 503 timeouts.
+    include_steps_default = analysis_mode in {"single_trace", "trace_lookup"}
+    include_steps_deep_dive = analysis_mode == "deep_dive"
 
-    Strips token-heavy fields the LLM does not need (prompt/answer excerpts,
-    token usage, raw tool call lists, reasoning steps, full X-Ray segment trees)
-    while preserving every session ID, every trace ID, user identity, latency
-    metrics, evaluator scores (score+label only), and slim X-Ray timing/error flags.
+    # We use a counter to limit total segments included across all traces in a deep-dive.
+    steps_included_count = 0
+    MAX_TOTAL_STEPS_IN_CONTEXT = 300 if include_steps_deep_dive else 2000
 
-    The full detail is kept in the original ``merged`` dict returned to the client.
-    """
     def _slim_xray(raw: Any) -> Dict[str, Any]:
+        nonlocal steps_included_count
         if not isinstance(raw, dict):
             return {}
-        return {k: raw[k] for k in ("duration_ms", "has_error", "has_fault", "has_throttle", "slowest_step") if k in raw}
+        slim = {k: raw[k] for k in ("duration_ms", "has_error", "has_fault", "has_throttle", "slowest_step") if k in raw}
+        
+        should_include = include_steps_default or (include_steps_deep_dive and steps_included_count < MAX_TOTAL_STEPS_IN_CONTEXT)
+        if should_include and "steps" in raw:
+            steps = raw["steps"]
+            if isinstance(steps, list):
+                slim["steps"] = steps[:120] if include_steps_default else steps[:40]
+                steps_included_count += len(slim["steps"])
+        return slim
 
     def _slim_eval(scores: Any) -> Any:
         if not isinstance(scores, dict):
@@ -3138,11 +3345,30 @@ def _build_llm_analysis_context(merged: Dict[str, Any], max_diag_traces: int = 2
             "session_metrics": sess.get("session_metrics", {}),
         }
 
+    # xray_trace_details can be a list (fleet trace-lookup mode) or a dict (other modes).
+    # Normalise to dict so the .items() call below never raises AttributeError.
+    _raw_xray_details = merged.get("xray_trace_details")
+    if isinstance(_raw_xray_details, list):
+        _xray_details_dict: Dict[str, Any] = {
+            str((d or {}).get("trace_id", "")): d
+            for d in _raw_xray_details
+            if isinstance(d, dict) and str((d or {}).get("trace_id", ""))
+        }
+    elif isinstance(_raw_xray_details, dict):
+        _xray_details_dict = _raw_xray_details
+    else:
+        _xray_details_dict = {}
+
     return {
-        "analysis_mode": merged.get("analysis_mode"),
+        "analysis_mode": analysis_mode,
         "window": merged.get("window", {}),
         "fleet_summary": merged.get("fleet_summary", {}),
         "fleet_metrics": merged.get("fleet_metrics", {}),
+        # Single-trace mode keys:
+        "request": merged.get("request", {}),
+        "xray": _slim_xray(merged.get("xray") or {}),
+        # Evaluator quality scores (populated in single-trace and trace-lookup modes).
+        "evaluations": merged.get("evaluations", {}),
         "quality_indicators": merged.get("quality_indicators", {}),
         "users": merged.get("users", {}),
         "bottleneck_ranking": merged.get("bottleneck_ranking", []),
@@ -3153,6 +3379,7 @@ def _build_llm_analysis_context(merged: Dict[str, Any], max_diag_traces: int = 2
         "trace_lookup": merged.get("trace_lookup", {}),
         "pagination_context": merged.get("pagination_context", {}),
         "sessions_pagination_context": merged.get("sessions_pagination_context", {}),
+        "xray_trace_details": {k: _slim_xray(v) for k, v in _xray_details_dict.items()},
     }
 
 
@@ -3226,10 +3453,11 @@ def _handle_fleet_insights(
     if completeness_first:
         # For enumeration/count/superset-sensitive queries, favor broader collection
         # across all windows so longer lookbacks are less likely to drop entities.
+        # Budget capped at 9s (down from 14s) to always leave ≥12s for the main LLM call.
         runtime_limit = max(runtime_limit, 8000)
         runtime_max_candidate_streams = max(runtime_max_candidate_streams, 8000)
         runtime_fixed_stream_pages = max(runtime_fixed_stream_pages, 100)
-        runtime_budget_seconds = max(runtime_budget_seconds, 14.0)
+        runtime_budget_seconds = max(runtime_budget_seconds, 9.0)
         evaluator_max_groups = max(evaluator_max_groups, min(20, FLEET_EVALUATOR_MAX_GROUPS * 2))
         evaluator_per_group_limit = max(evaluator_per_group_limit, 400)
         evaluator_budget_seconds = max(evaluator_budget_seconds, 5.0)
@@ -4450,7 +4678,9 @@ def _handle_session_insights(event: Dict[str, Any]) -> Dict[str, Any]:
     pagination_page_size = max(5, min(50, pagination_page_size))
 
     if analysis_mode in {"fleet_1h", "all_traces_1h", "fleet", "fleet_window", "multi_session_window"}:
-        if _classify_question_intent_llm(question, analyst_memory) == "general_conversation":
+        # Single merged Haiku call for both intent + strategy — halves pre-flight LLM latency.
+        fleet_classify = _classify_fleet_request_llm(question, analyst_memory)
+        if fleet_classify["intent"] == "general_conversation":
             answer = _build_general_conversation_reply(question, analyst_memory)
             return {
                 "statusCode": 200,
@@ -4480,7 +4710,7 @@ def _handle_session_insights(event: Dict[str, Any]) -> Dict[str, Any]:
 
         # Fleet mode ignores anchors and aggregates all traces in the requested timeframe.
         fleet_hours = _resolve_lookback_hours(body, default_hours=1)
-        query_profile = _classify_collection_strategy_llm(question, analyst_memory)
+        query_profile = fleet_classify["strategy"]
         try:
             result = _handle_fleet_insights(
                 question=question, 
@@ -4581,73 +4811,88 @@ def _handle_session_insights(event: Dict[str, Any]) -> Dict[str, Any]:
             if not any(runtime_terms.values()):
                 runtime_terms["session_id"] = session_id
 
+        runtime_groups = _resolve_runtime_log_groups()
+        # Explicit single-trace lookups: use a 7-day floor so old traces are always reachable.
+        lookup_lookback = min(max(lookback_hours or 1, 168), MAX_ANALYSIS_LOOKBACK_HOURS)
+
+        # ── Parallel I/O ─────────────────────────────────────────────────
+        # The evaluator window scan and X-Ray fetch are independent of the runtime log fetch.
+        # Run them concurrently so total data-collection time = max(each) instead of sum(each).
+        _parallel_executor = ThreadPoolExecutor(max_workers=4)
+        _eval_future = _parallel_executor.submit(
+            _fetch_evaluator_records_window,
+            lookback_hours=lookup_lookback,
+            max_groups=5,
+            per_group_limit=500,
+            max_seconds=6.0,  # tighter cap: frees more budget for the LLM
+        )
+        # X-Ray can start now if we already have the trace ID; re-fetched below if ID changes.
+        _xray_future = (
+            _parallel_executor.submit(
+                lambda tid: _summarize_xray(_denormalize_trace_id(tid)), xray_trace_id
+            )
+            if xray_trace_id else None
+        )
+
+        # Runtime log fetch (sequential per group — usually just one group)
         runtime_records = []
-        _rt_start_ms = int((time.time() - lookback_hours * 3600) * 1000)
-
-        # ── Primary path: fixed stream written to by the runtime directly ──
-        # my_agent1.py calls put_log_events to LOG_GROUP/agent-traces on every invocation,
-        # so get_log_events on the fixed stream is fast and completely reliable.
-        if RUNTIME_LOG_GROUP and RUNTIME_LOG_STREAM:
-            try:
-                resp = LOGS_CLIENT.get_log_events(
-                    logGroupName=RUNTIME_LOG_GROUP,
-                    logStreamName=RUNTIME_LOG_STREAM,
-                    startTime=_rt_start_ms,
-                    startFromHead=False,
-                    limit=200,
-                )
-                for event_row in resp.get("events", []):
-                    payload = _json_from_log_message(event_row.get("message", ""))
-                    if not payload or not _is_runtime_trace_payload(payload):
-                        continue
-                    if _record_matches_terms(payload, event_row.get("message", ""), runtime_terms):
-                        payload["_cloudwatch_timestamp"] = event_row.get("timestamp")
-                        runtime_records.append(payload)
-            except Exception:
-                pass
-
-
-        # Fallback/backfill logic removed: only the fixed agent-traces stream is ever queried for runtime logs.
+        for group in runtime_groups:
+            runtime_events = _fetch_log_events(group, runtime_terms, lookback_hours=lookup_lookback, limit=50)
+            for re in runtime_events:
+                p = _json_from_log_message(re.get("message", ""))
+                if p and _is_runtime_trace_payload(p) and _record_matches_terms(p, re.get("message", ""), runtime_terms):
+                    p["_cloudwatch_timestamp"] = re.get("timestamp")
+                    p["_source_stream"] = re.get("@logStream", "")
+                    runtime_records.append(p)
 
         runtime_records.sort(key=lambda row: row.get("_cloudwatch_timestamp", 0), reverse=True)
         latest_runtime = runtime_records[0] if runtime_records else {}
 
-        # If request/session was provided and we found runtime data, use exact IDs for tighter evaluator matching.
+        # Update IDs from the freshly fetched runtime record.
         if latest_runtime:
             request_id = str(latest_runtime.get("request_id", request_id))
-            # Do not override a caller/session anchor with runtime trace session_id.
-            # Runtime session_id may differ from evaluator/OTEL correlation session.
             if not session_id:
                 session_id = str(latest_runtime.get("session_id", session_id))
-            xray_trace_id = str(latest_runtime.get("xray_trace_id", xray_trace_id))
+            updated_trace_id = str(latest_runtime.get("xray_trace_id", xray_trace_id))
+            if updated_trace_id and updated_trace_id != xray_trace_id:
+                # Runtime gave us a better/corrected trace ID — re-fetch X-Ray with the new one.
+                xray_trace_id = updated_trace_id
+                _xray_future = _parallel_executor.submit(
+                    lambda tid: _summarize_xray(_denormalize_trace_id(tid)), xray_trace_id
+                )
             client_request_id = str(latest_runtime.get("client_request_id", client_request_id))
-            terms = {
-                "request_id": request_id,
-                "session_id": session_id,
-                "xray_trace_id": xray_trace_id,
-                "client_request_id": client_request_id,
-            }
 
-        evaluator_events = []
-        evaluator_groups_used = []
-        # Evaluator result logs usually anchor on session and trace, not request/client IDs.
-        evaluator_terms: Dict[str, str] = {}
-        if xray_trace_id:
-            evaluator_terms["xray_trace_id"] = xray_trace_id
-        elif evaluator_session_id or session_id:
-            evaluator_terms["session_id"] = evaluator_session_id or session_id
-        if not any(evaluator_terms.values()):
-            evaluator_terms["request_id"] = request_id
-            evaluator_terms["client_request_id"] = client_request_id
+        # ── Collect parallel results ──────────────────────────────────────
+        eval_budget_left = max(1.0, 20.0 - (time.perf_counter() - trace_start))
+        try:
+            eval_window = _eval_future.result(timeout=eval_budget_left)
+        except Exception:
+            eval_window = {"records": [], "groups_used": []}
 
-        for group in _resolve_evaluator_log_groups()[:40]:
-            evaluator_groups_used.append(group)
-            evaluator_events.extend(
-                _fetch_log_events(group, evaluator_terms, lookback_hours=lookback_hours, limit=200)
-            )
+        xray_summary = {}
+        xray_error = ""
+        if _xray_future is not None:
+            xray_budget_left = max(1.0, 22.0 - (time.perf_counter() - trace_start))
+            try:
+                xray_summary = _xray_future.result(timeout=xray_budget_left)
+            except Exception as exc:
+                xray_error = str(exc)
+                xray_summary = {"trace_id": xray_trace_id, "steps": [], "totals_by_name": {}, "error": str(exc)}
+        elif xray_trace_id:
+            # xray_trace_id was not known at start; fetch now.
+            try:
+                xray_summary = _summarize_xray(_denormalize_trace_id(xray_trace_id))
+            except Exception as exc:
+                xray_error = str(exc)
+                xray_summary = {"trace_id": xray_trace_id, "steps": [], "totals_by_name": {}, "error": str(exc)}
+
+        _parallel_executor.shutdown(wait=False, cancel_futures=True)
+
+        # ── Process evaluator records ─────────────────────────────────────
         evaluator_records = []
         evaluations: Dict[str, Dict[str, Any]] = {}
         evaluator_session_candidates = []
+        evaluator_groups_used = list(eval_window.get("groups_used", []))
         runtime_session_id = str(latest_runtime.get("session_id", "")).strip() if latest_runtime else ""
 
         def _add_evaluator_session_candidate(value: str) -> None:
@@ -4655,46 +4900,34 @@ def _handle_session_insights(event: Dict[str, Any]) -> Dict[str, Any]:
             if v and v not in evaluator_session_candidates:
                 evaluator_session_candidates.append(v)
 
-        for event_row in evaluator_events:
-            payload = _json_from_log_message(event_row.get("message", ""))
-            if not payload:
-                continue
-            if _record_matches_terms(payload, event_row.get("message", ""), evaluator_terms):
-                evaluator_records.append(payload)
-                _collect_evaluations(payload, evaluations)
-                for sid in _extract_session_ids_deep(payload):
-                    _add_evaluator_session_candidate(sid)
-                for sid in _extract_session_ids_from_message(event_row.get("message", "")):
-                    _add_evaluator_session_candidate(sid)
+        target_trace_normalized = _normalize_trace_id(xray_trace_id) if xray_trace_id else ""
+        for rec in eval_window.get("records", []):
+            anchors = _extract_record_anchors(rec)
+            rec_trace_id = _normalize_trace_id(str(anchors.get("xray_trace_id", "")))
+            rec_session_id = str(anchors.get("session_id", "")).strip()
 
-        # Fallback: online evaluator metrics can appear in runtime OTEL logs rather than
-        # /evaluations/results groups, so scan runtime logs for gen_ai.evaluation.result.
-        if not evaluations:
-            runtime_otel_events = _fetch_log_events(
-                RUNTIME_LOG_GROUP,
-                evaluator_terms,
-                lookback_hours=lookback_hours,
-                limit=600,
+            trace_match = bool(target_trace_normalized and rec_trace_id == target_trace_normalized)
+            session_match = bool(
+                rec_session_id and (
+                    rec_session_id == str(evaluator_session_id or "").strip()
+                    or rec_session_id == str(session_id or "").strip()
+                )
             )
-            for event_row in runtime_otel_events:
-                payload = _json_from_log_message(event_row.get("message", ""))
-                if not payload:
-                    continue
-                if str(payload.get("name", "")) != "gen_ai.evaluation.result":
-                    continue
-                if _record_matches_terms(payload, event_row.get("message", ""), evaluator_terms):
-                    evaluator_records.append(payload)
-                    _collect_evaluations(payload, evaluations)
-                    for sid in _extract_session_ids_deep(payload):
-                        _add_evaluator_session_candidate(sid)
-                    for sid in _extract_session_ids_from_message(event_row.get("message", "")):
-                        _add_evaluator_session_candidate(sid)
 
-        otel_session_id = _find_otel_session_id(xray_trace_id, lookback_hours=lookback_hours) if xray_trace_id else ""
+            if trace_match or session_match:
+                evaluator_records.append(rec)
+                _collect_evaluations(rec, evaluations)
+                for sid in _extract_session_ids_deep(rec):
+                    _add_evaluator_session_candidate(sid)
+                for sid in _extract_session_ids_from_message(rec.get("_cloudwatch_message", "")):
+                    _add_evaluator_session_candidate(sid)
+
+        # otel_session_id is only for anchor echo-back; not worth a 4-6s sequential CW Insights
+        # call that eats directly into the LLM budget — derive from evaluator candidates instead.
+        otel_session_id = ""
 
         # Prefer evaluator/OTEL session.id for anchor echo-back when available.
         evaluator_session_id = ""
-        # Prefer a candidate that differs from runtime event_request_trace session_id.
         for value in evaluator_session_candidates:
             if value and value != runtime_session_id:
                 evaluator_session_id = value
@@ -4705,22 +4938,7 @@ def _handle_session_insights(event: Dict[str, Any]) -> Dict[str, Any]:
                     evaluator_session_id = value
                     break
 
-        xray_summary = {}
-        xray_error = ""
-        if xray_trace_id:
-            try:
-                # X-Ray batch_get_traces requires the 1-XXXXXXXX-XXXXXXXXXXXXXXXXXXXXXXXX format.
-                # Fleet mode normalises IDs to compact 32-hex; denormalise before lookup.
-                xray_summary = _summarize_xray(_denormalize_trace_id(xray_trace_id))
-            except Exception as exc:
-                xray_error = str(exc)
-                xray_summary = {
-                    "trace_id": xray_trace_id,
-                    "steps": [],
-                    "totals_by_name": {},
-                    "slowest_step": None,
-                    "error": str(exc),
-                }
+        xray_error = xray_summary.get("error", "")
 
         request = {
             "prompt": latest_runtime.get("request_payload", {}).get("prompt", ""),
@@ -4764,6 +4982,7 @@ def _handle_session_insights(event: Dict[str, Any]) -> Dict[str, Any]:
         }
 
         merged = {
+            "analysis_mode": "single_trace",
             "request": request,
             "evaluations": evaluations,
             "xray": xray_summary,
@@ -4783,12 +5002,21 @@ def _handle_session_insights(event: Dict[str, Any]) -> Dict[str, Any]:
             "evaluator_records": len(evaluator_records),
         })
         
-        # Invoke LLM to generate analysis
+        # Invoke LLM to generate analysis — hard-cap at 22s so we never blow the API GW timeout.
         llm_start = time.perf_counter()
-        answer = _sanitize_analysis_answer(
-            _build_diagnosis(question, merged, analyst_memory),
-            traces_total=0,
-        )
+        pre_llm_elapsed = round(time.perf_counter() - trace_start, 2)
+        llm_hard_timeout = max(4.0, 28.0 - pre_llm_elapsed)
+        _llm_executor = ThreadPoolExecutor(max_workers=1)
+        try:
+            _llm_future = _llm_executor.submit(_build_diagnosis, question, merged, analyst_memory)
+            try:
+                raw_llm = _llm_future.result(timeout=llm_hard_timeout)
+            except FutureTimeoutError:
+                _llm_future.cancel()
+                raw_llm = "[Analysis timed out. Data collection completed but LLM response exceeded the time budget. Try asking again.]"
+        finally:
+            _llm_executor.shutdown(wait=False, cancel_futures=True)
+        answer = _sanitize_analysis_answer(raw_llm, traces_total=0)
         llm_elapsed = round(time.perf_counter() - llm_start, 2)
         total_elapsed = round(time.perf_counter() - trace_start, 2)
         

@@ -60,7 +60,7 @@ LOG_GROUP = os.environ.get(
 )
 # Fixed stream – all agent_request_trace events land here so the backend
 # can read them reliably via get_log_events without per-invocation stream discovery.
-LOG_STREAM = os.environ.get("RUNTIME_LOG_STREAM", "")
+LOG_STREAM = os.environ.get("RUNTIME_LOG_STREAM", "agent-traces")
 LOG_GROUP_ENC = LOG_GROUP.replace("/", "%2F")
 PRICE_BUCKET = os.environ.get("PRICE_BUCKET", "").strip()
 PRICE_KEY = os.environ.get("PRICE_KEY", "").strip()
