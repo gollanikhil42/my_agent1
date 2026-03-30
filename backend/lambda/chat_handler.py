@@ -625,8 +625,9 @@ def _classify_fleet_request_llm(question: str, analyst_memory: Any = None) -> Di
         "Classify the user message for a telemetry analysis dashboard. "
         "Return ONLY JSON with two keys:\n"
         "  intent:   'general_conversation' (greeting/small-talk, no logs needed) OR 'telemetry_analysis' (traces/sessions/latency/errors)\n"
-        "  strategy: 'completeness_first' (user explicitly wants to LIST every session/user/trace by ID, or wants an EXACT total count) "
-        "OR 'balanced' (summaries, overviews, highlights, patterns, slowest/fastest analysis, issue diagnosis — even if the word 'all' appears)"
+        "  strategy: 'completeness_first' (user explicitly wants to LIST every SESSION by ID, or wants an EXACT total count of SESSIONS — NOT for user/username queries) "
+        "OR 'balanced' (summaries, overviews, highlights, patterns, slowest/fastest analysis, issue diagnosis, "
+        "ANY user/username/who-used listing — even when the words 'list', 'all', or 'every' appear in a user-focused query)"
     )
     memory_block = _format_analyst_memory(analyst_memory)
     user_content = "".join(
@@ -2342,9 +2343,15 @@ def _build_discovery_diagnosis(
     system_prompt = (
         "You are a telemetry analyst. Understand what the user is asking and respond naturally. "
         "The context has two scopes: sessions/users for current page details, and all_pages_session_index/all_pages_user_index for whole-window awareness. "
-        "For listing/enumeration requests ('list sessions', 'show all users', 'give me usernames', 'what sessions exist'): "
-        "list ONLY the items present in the 'sessions' and 'users' data for the CURRENT PAGE. DO NOT attempt to list all items from all_pages_session_index. Include session IDs, usernames, timestamps (UTC), and metrics for the current page. If pagination_context indicates more pages, mention that more are available. "
-        "For username-only requests, use all_pages_user_index as the source of truth for the whole window (not only current page users). "
+        "USERNAME/USER LISTING REQUESTS ('who used the system', 'list all users', 'list usernames', 'give me usernames', 'what users', 'show users'): "
+        "ALWAYS answer using all_pages_user_index ONLY — it already contains ALL users across the entire window. "
+        "List every user from all_pages_user_index, then say 'These are all users in the window — no more pages needed.' DO NOT mention pagination for user-only requests. "
+        "SESSION LISTING REQUESTS ('list sessions', 'show all sessions', 'what sessions exist'): "
+        "list ONLY the sessions present in the current page 'sessions' data. DO NOT enumerate from all_pages_session_index. "
+        "CRITICAL LISTING FORMAT: When listing sessions, format EACH session on its own numbered line EXACTLY as: "
+        "{session_id} | {user_name} | {trace_count} traces | average latency {avg_e2e_ms} ms | maximum latency {max_e2e_ms} ms | latest {latest_trace_timestamp_utc} "
+        "Use that exact pipe-separated format for EVERY session — no deviations, no markdown, no extra fields. "
+        "If pagination_context indicates more pages exist for sessions, mention that after the list. "
         "If the user asks for trace IDs for a session, use all_pages_session_index.trace_id_sample when available. "
         "For summary/analysis requests ('Give me a summary', 'Overview'): give a short, crisp, high-level overview. "
         "CRITICAL FOR SUMMARIES: Keep the summary strictly under 150 words. Focus only on fleet averages, total counts, and the top 2-3 anomalies. DO NOT list out individual sessions. DO NOT mention pagination, 'next page', or that more sessions are available. This is vital to prevent UI pagination loops. "
@@ -2636,6 +2643,25 @@ def _build_session_and_user_layers(
         )
         traces_for_session = traces_for_session[:max_traces_per_session]
 
+        # Derive user: first from pre-built trace diagnostics, then fall back to
+        # raw runtime_logs stored in the trace slot (runtime records always carry
+        # real user_id/user_name even when the diagnostic object has empty fields).
+        derived_user = _derive_session_user(traces_for_session)
+        if not _is_known_user_id(derived_user.get("user_id", "")):
+            for _tid_s, _slot in trace_slots.items():
+                for _rec in _slot.get("runtime_logs", []):
+                    _uid = str(_rec.get("user_id", "")).strip()
+                    if _is_known_user_id(_uid):
+                        derived_user = {
+                            "user_id": _uid,
+                            "user_name": str(_rec.get("user_name", "unknown") or "unknown"),
+                            "department": str(_rec.get("department", "unknown") or "unknown"),
+                            "user_role": str(_rec.get("user_role", "unknown") or "unknown"),
+                        }
+                        break
+                if _is_known_user_id(derived_user.get("user_id", "")):
+                    break
+
         e2e_values = [
             _to_float((row.get("stage_latency_ms") or {}).get("e2e"))
             for row in traces_for_session
@@ -2650,7 +2676,7 @@ def _build_session_and_user_layers(
                 "session_id": session_id,
                 "latest_trace_ts": latest_ts,
                 "latest_trace_timestamp_utc": _format_epoch_ms_to_iso_utc(latest_ts),
-                "user": _derive_session_user(traces_for_session),
+                "user": derived_user,
                 "trace_count": trace_count,
                 "traces": traces_for_session,
                 "session_metrics": {
@@ -3453,16 +3479,23 @@ def _handle_fleet_insights(
     if completeness_first:
         # For enumeration/count/superset-sensitive queries, favor broader collection
         # across all windows so longer lookbacks are less likely to drop entities.
-        # Budget capped at 9s (down from 14s) to always leave ≥12s for the main LLM call.
+        # Budget capped at 7s (parallel max, not sum) to always leave ≥14s for LLM.
         runtime_limit = max(runtime_limit, 8000)
         runtime_max_candidate_streams = max(runtime_max_candidate_streams, 8000)
         runtime_fixed_stream_pages = max(runtime_fixed_stream_pages, 100)
-        runtime_budget_seconds = max(runtime_budget_seconds, 9.0)
+        runtime_budget_seconds = max(runtime_budget_seconds, 7.0)
         evaluator_max_groups = max(evaluator_max_groups, min(20, FLEET_EVALUATOR_MAX_GROUPS * 2))
         evaluator_per_group_limit = max(evaluator_per_group_limit, 400)
-        evaluator_budget_seconds = max(evaluator_budget_seconds, 5.0)
+        evaluator_budget_seconds = max(evaluator_budget_seconds, 4.0)
         xray_max_traces = max(xray_max_traces, 700)
-        xray_budget_seconds = max(xray_budget_seconds, 5.0)
+        xray_budget_seconds = max(xray_budget_seconds, 4.0)
+
+    # For continuation pages (page > 1), use tighter collection so more budget
+    # remains for the LLM — the user already saw the full dataset on page 1.
+    if page > 1:
+        runtime_budget_seconds = min(runtime_budget_seconds, 5.0)
+        evaluator_budget_seconds = min(evaluator_budget_seconds, 3.0)
+        xray_budget_seconds = min(xray_budget_seconds, 3.0)
 
     # ── Emit start trace (Strands-style structured logging) ────────────────────
     _emit_analyzer_trace({
@@ -4545,8 +4578,12 @@ def _handle_fleet_insights(
     _active_pagination = sessions_pagination_info if sessions_pagination_info else pagination_info
     _has_next_page = bool((_active_pagination or {}).get("has_next_page"))
     _sessions_on_page = int((_active_pagination or {}).get("sessions_on_this_page") or (_active_pagination or {}).get("page_size") or 0)
-    _uuid_mentions = _count_uuid_mentions(answer)
-    _listing_like_answer = _sessions_on_page > 0 and _uuid_mentions >= max(6, _sessions_on_page - 1)
+    # Count only session IDs from the current page that appear in the answer.
+    # User listing answers contain user UUIDs (Cognito sub IDs), not session IDs —
+    # we must not trigger pagination for those.
+    _page_session_ids = set(str(sid).strip().lower() for sid in (merged.get("sessions") or {}).keys() if str(sid).strip())
+    _session_id_mentions = sum(1 for sid in _page_session_ids if sid and sid in answer.lower())
+    _listing_like_answer = _sessions_on_page > 0 and _session_id_mentions >= max(2, min(_sessions_on_page - 1, 4))
     _token_cap_hit = (
         llm_stop_reason in {"max_tokens", "length", "max_output_tokens"}
         or (
@@ -4555,15 +4592,23 @@ def _handle_fleet_insights(
             and llm_output_tokens >= int(llm_max_tokens_used * 0.95)
         )
     )
-    # For list-style answers, the model may stay within token limits and still
-    # clearly indicate there are more pages. In that case continue automatically.
-    _matter_too_much = _listing_like_answer
+    # Auto-paginate only when BOTH conditions are true:
+    #   1. completeness_first=True  → the classifier confirmed this is a full session enumeration request
+    #   2. _listing_like_answer=True → the answer actually contains session IDs (sanity check)
+    # This prevents analysis answers (e.g. "top 5 slowest sessions") that mention a few session IDs
+    # from triggering pagination, while still paginating genuine "list all sessions" requests.
+    # User listing answers have completeness_first=False (balanced) so they never reach here.
+    _matter_too_much = _listing_like_answer and completeness_first
     _auto_paginate_recommended = (
         (not _is_trace_lookup)
         and (not _is_deep_dive)
         and bool(_active_pagination)
         and _has_next_page
-        and (_token_cap_hit or _matter_too_much)
+        # Token cap alone must NOT trigger pagination for analysis queries — that would repeat
+        # the same analysis on a different data slice indefinitely. Only paginate on token cap
+        # when completeness_first=True (confirmed enumeration). For analysis queries that hit
+        # the cap, the truncation note below is added and pagination stops.
+        and ((_token_cap_hit and completeness_first) or _matter_too_much)
     )
     # If the model hit the token cap, clean up any trailing incomplete line and
     # append a user-visible note so the response never ends mid-word.
@@ -4781,6 +4826,23 @@ def _handle_session_insights(event: Dict[str, Any]) -> Dict[str, Any]:
                 }),
             }
 
+    # Validate: if xray_trace_id looks like a session UUID, reject early with a helpful message.
+    # X-Ray trace IDs have format: 1-HHHHHHHH-HHHHHHHHHHHHHHHHHHHHHHHH
+    # Session IDs are plain UUIDs: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+    if xray_trace_id and _is_uuid(xray_trace_id):
+        return {
+            "statusCode": 400,
+            "headers": CORS_HEADERS,
+            "body": json.dumps({
+                "error": (
+                    f"The value '{xray_trace_id}' looks like a session ID, not an X-Ray trace ID. "
+                    "X-Ray trace IDs have the format: 1-HHHHHHHH-HHHHHHHHHHHHHHHHHHHHHHHH. "
+                    "To analyze a specific session, switch to Fleet Window mode and ask about that session ID."
+                ),
+                "hint": "session_id_in_trace_field",
+            }),
+        }
+
     terms = {
         "request_id": request_id,
         "session_id": session_id,
@@ -4793,6 +4855,35 @@ def _handle_session_insights(event: Dict[str, Any]) -> Dict[str, Any]:
             "statusCode": 400,
             "headers": CORS_HEADERS,
             "body": json.dumps({"error": "Provide at least one of request_id, session_id, evaluator_session_id, xray_trace_id, client_request_id"}),
+        }
+
+    # Intent gate for single-trace mode: route general conversation before any I/O.
+    # This prevents prompt injection from triggering a full trace analysis.
+    _single_intent = _classify_question_intent_llm(question, analyst_memory)
+    if _single_intent == "general_conversation":
+        answer = _build_general_conversation_reply(question, analyst_memory)
+        return {
+            "statusCode": 200,
+            "headers": CORS_HEADERS,
+            "body": json.dumps({
+                "answer": _sanitize_analysis_answer(answer, traces_total=0),
+                "merged": {
+                    "analysis_mode": "general_conversation",
+                    "note": "No telemetry data was collected for this conversational turn.",
+                },
+                "pagination": None,
+                "sessions_pagination": None,
+                "query_mode": "general_conversation",
+                "auto_paginate_recommended": False,
+                "auto_paginate_reason": "none",
+                "anchors": {
+                    "request_id": request_id,
+                    "client_request_id": client_request_id,
+                    "session_id": session_id,
+                    "evaluator_session_id": evaluator_session_id,
+                    "xray_trace_id": xray_trace_id,
+                },
+            }),
         }
 
     trace_start = time.perf_counter()
@@ -4901,12 +4992,22 @@ def _handle_session_insights(event: Dict[str, Any]) -> Dict[str, Any]:
                 evaluator_session_candidates.append(v)
 
         target_trace_normalized = _normalize_trace_id(xray_trace_id) if xray_trace_id else ""
+        target_trace_denorm = _denormalize_trace_id(xray_trace_id) if xray_trace_id else ""
         for rec in eval_window.get("records", []):
             anchors = _extract_record_anchors(rec)
             rec_trace_id = _normalize_trace_id(str(anchors.get("xray_trace_id", "")))
             rec_session_id = str(anchors.get("session_id", "")).strip()
+            raw_message = str(rec.get("_cloudwatch_message", ""))
 
-            trace_match = bool(target_trace_normalized and rec_trace_id == target_trace_normalized)
+            trace_match = bool(
+                target_trace_normalized and (
+                    rec_trace_id == target_trace_normalized
+                    # Evaluator logs often embed the trace ID only in the raw log text,
+                    # not in structured OTEL fields — check both compact and X-Ray formats.
+                    or (target_trace_normalized and target_trace_normalized in _normalize_trace_id(raw_message))
+                    or (target_trace_denorm and target_trace_denorm in raw_message)
+                )
+            )
             session_match = bool(
                 rec_session_id and (
                     rec_session_id == str(evaluator_session_id or "").strip()
@@ -4939,6 +5040,23 @@ def _handle_session_insights(event: Dict[str, Any]) -> Dict[str, Any]:
                     break
 
         xray_error = xray_summary.get("error", "")
+
+        # If xray_trace_id was explicitly provided but X-Ray and runtime logs found nothing, return 404.
+        # Evaluator records are fetched by time-window and are NOT anchored to the specific trace ID,
+        # so their presence does not confirm the trace exists — exclude them from this check.
+        if xray_trace_id and not runtime_records and xray_error == "trace_not_found":
+            return {
+                "statusCode": 404,
+                "headers": CORS_HEADERS,
+                "body": json.dumps({
+                    "error": (
+                        f"Trace not found. The X-Ray trace ID '{xray_trace_id}' was not found in X-Ray "
+                        "or runtime logs. Please verify the trace ID is correct. "
+                        "Note: X-Ray traces are retained for 30 days."
+                    ),
+                    "hint": "trace_not_found",
+                }),
+            }
 
         request = {
             "prompt": latest_runtime.get("request_payload", {}).get("prompt", ""),

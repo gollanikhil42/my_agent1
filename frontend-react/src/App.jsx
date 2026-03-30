@@ -118,6 +118,15 @@ function isTraceListingQuestion(question) {
   ].some((keyword) => text.includes(keyword));
 }
 
+function isUuidLike(value) {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(value || "").trim());
+}
+
+function isXrayTraceIdLike(value) {
+  const text = String(value || "").trim().toLowerCase();
+  return /^1-[0-9a-f]{8}-[0-9a-f]{24}$/.test(text) || /^[0-9a-f]{32}$/.test(text.replace(/-/g, ""));
+}
+
 function normalizeMessageText(input) {
   if (input && typeof input === "object") {
     if (typeof input.explanation === "string") {
@@ -256,6 +265,7 @@ function App({ signOut, user }) {
   const [latestSessionsPagination, setLatestSessionsPagination] = useState(null);
   const [autoPageProgress, setAutoPageProgress] = useState(null);
   const [controlsOpen, setControlsOpen] = useState(true);
+  const [viewportWidth, setViewportWidth] = useState(() => window.innerWidth);
   const [copiedId, setCopiedId] = useState("");
   const [profile, setProfile] = useState({ name: user?.username || "User", department: "", role: "" });
   const chatAbortRef = useRef(null);
@@ -279,9 +289,8 @@ function App({ signOut, user }) {
     return found?.label || `${logLookbackHours} hours`;
   }, [logLookbackHours]);
 
-  const isBusy = busyChat || busyLog;
-
   const isFleetMode = analystMode !== "single_trace";
+  const isOverlayViewport = viewportWidth <= 640;
   const totalFleetTraces = latestPagination?.total_traces || latestMerged?.fleet_metrics?.traces_total || 0;
   const analystMemory = useMemo(
     () => buildAnalystMemory(logMessages, latestMerged, analystMode, effectiveAnchors, totalFleetTraces),
@@ -340,6 +349,27 @@ function App({ signOut, user }) {
     }
     loadProfile();
   }, [user]);
+
+  useEffect(() => {
+    function handleResize() {
+      const nextWidth = window.innerWidth;
+      setViewportWidth(nextWidth);
+      if (nextWidth <= 640) {
+        setControlsOpen(false);
+      }
+    }
+
+    window.addEventListener("resize", handleResize);
+    handleResize();
+    return () => window.removeEventListener("resize", handleResize);
+  }, []);
+
+  useEffect(() => {
+    if (!isOverlayViewport || mode === "assistant") {
+      return;
+    }
+    setControlsOpen(false);
+  }, [isOverlayViewport, mode]);
 
   function copyToClipboard(value, key) {
     if (!value) {
@@ -424,13 +454,13 @@ function App({ signOut, user }) {
   }
 
   function stopCurrentGeneration() {
-    if (busyChat && chatAbortRef.current) {
+    if (mode === "assistant" && busyChat && chatAbortRef.current) {
       chatAbortRef.current.abort();
       chatAbortRef.current = null;
       setBusyChat(false);
       setMessages((prev) => [...prev, makeMessage("system", "Response stopped.", "status")]);
     }
-    if (busyLog && analystAbortRef.current) {
+    if (mode !== "assistant" && busyLog && analystAbortRef.current) {
       analystAbortRef.current.abort();
       analystAbortRef.current = null;
       setBusyLog(false);
@@ -442,7 +472,7 @@ function App({ signOut, user }) {
   async function sendPrompt(event) {
     event.preventDefault();
     const trimmed = prompt.trim();
-    if (!trimmed || isBusy) {
+    if (!trimmed || busyChat) {
       return;
     }
 
@@ -516,8 +546,35 @@ function App({ signOut, user }) {
   async function sendLogQuestion(event) {
     event.preventDefault();
     const trimmed = logQuestion.trim();
-    if (!trimmed || isBusy) {
+    if (!trimmed || busyLog) {
       return;
+    }
+
+    if (analystMode === "single_trace") {
+      const candidateTraceId = String(analystAnchors.xray_trace_id || autoAnchors.xray_trace_id || "").trim();
+      if (!candidateTraceId) {
+        setLogMessages((prev) => [
+          ...prev,
+          makeMessage("system", "No trace ID available yet. Paste an X-Ray trace ID, or send one assistant prompt first so a trace ID is captured automatically.", "metric"),
+        ]);
+        return;
+      }
+
+      if (isUuidLike(candidateTraceId) && !isXrayTraceIdLike(candidateTraceId)) {
+        setLogMessages((prev) => [
+          ...prev,
+          makeMessage("system", `That looks like a session ID, not an X-Ray trace ID. Paste the trace ID instead, for example ${autoAnchors.xray_trace_id || "1-xxxxxxxx-xxxxxxxxxxxxxxxxxxxxxxxx"}.`, "metric"),
+        ]);
+        return;
+      }
+
+      if (!isXrayTraceIdLike(candidateTraceId)) {
+        setLogMessages((prev) => [
+          ...prev,
+          makeMessage("system", "That does not look like a valid X-Ray trace ID. Use either the 32-character hex ID or the AWS X-Ray format 1-xxxxxxxx-xxxxxxxxxxxxxxxxxxxxxxxx.", "metric"),
+        ]);
+        return;
+      }
     }
 
     if (analystMode === "single_trace" && !effectiveAnchors.xray_trace_id) {
@@ -547,7 +604,7 @@ function App({ signOut, user }) {
       autoPaginate = false,
     } = options;
 
-    if (!questionText || isBusy) {
+    if (!questionText || busyLog) {
       return;
     }
 
@@ -726,7 +783,7 @@ function App({ signOut, user }) {
   }
 
   async function goToFleetPage(nextPage) {
-    if (!lastFleetQuestion || !isFleetMode || isBusy) {
+    if (!lastFleetQuestion || !isFleetMode || busyLog) {
       return;
     }
     if (nextPage < 1) {
@@ -800,8 +857,23 @@ function App({ signOut, user }) {
   const isAssistantMode = mode === "assistant";
   const activeMessages = isAssistantMode ? messages : logMessages;
   const activeBusy = isAssistantMode ? busyChat : busyLog;
+  const isBusy = activeBusy;
   const activeQuestion = isAssistantMode ? prompt : logQuestion;
   const activeCharCount = isAssistantMode ? prompt.length : logQuestion.length;
+  const activeStopLabel = isAssistantMode ? "Stop response" : "Stop analysis";
+  const shellClassName = [
+    "chat-shell",
+    isAssistantMode ? "assistant-only" : "",
+    !isAssistantMode ? "analyst-shell" : "",
+    !isAssistantMode && !controlsOpen ? "menu-collapsed" : "",
+    !isAssistantMode && isOverlayViewport ? "compact-shell" : "",
+  ].filter(Boolean).join(" ");
+  const menuClassName = [
+    "left-menu",
+    controlsOpen ? "open" : "collapsed",
+    isOverlayViewport ? "compact" : "",
+  ].filter(Boolean).join(" ");
+  const menuToggleClassName = "menu-toggle";
 
   return (
     <main className="sensei-shell">
@@ -835,19 +907,27 @@ function App({ signOut, user }) {
         </div>
       </header>
 
-      <section className={`chat-shell ${isAssistantMode ? "assistant-only" : ""} ${!isAssistantMode && !controlsOpen ? "menu-collapsed" : ""}`}>
+      <section className={shellClassName}>
         {!isAssistantMode && (
           <>
+            {controlsOpen && isOverlayViewport && (
+              <button
+                type="button"
+                className="menu-backdrop"
+                aria-label="Close analyser menu"
+                onClick={() => setControlsOpen(false)}
+              />
+            )}
             <button
               type="button"
-              className="menu-toggle"
+              className={menuToggleClassName}
               onClick={() => setControlsOpen((prev) => !prev)}
               aria-expanded={controlsOpen}
             >
               {controlsOpen ? "Hide menu" : "Show menu"}
             </button>
 
-            <aside className={`left-menu ${controlsOpen ? "open" : "collapsed"}`}>
+            <aside className={menuClassName}>
               <div className="left-menu-scroll">
                 <div className="analysis-toolbar">
                   <label>
@@ -883,6 +963,7 @@ function App({ signOut, user }) {
                         }
                         placeholder={autoAnchors.xray_trace_id || "send a chat message to capture trace ID"}
                       />
+                      <small className="field-hint">Use an X-Ray trace ID, not a session ID.</small>
                     </label>
                   )}
                 </div>
@@ -895,7 +976,7 @@ function App({ signOut, user }) {
                       type="button"
                       className="suggestion-chip"
                       onClick={() => setLogQuestion(suggestion)}
-                      disabled={isBusy}
+                      disabled={busyLog}
                     >
                       <span className="suggestion-index">0{index + 1}</span>
                       <span className="suggestion-text">{suggestion}</span>
@@ -919,17 +1000,17 @@ function App({ signOut, user }) {
               onKeyDown={handleComposerKeyDown}
               placeholder="Ask anything"
               maxLength={4000}
-              disabled={isBusy}
+              disabled={activeBusy}
             />
             <div className="composer-row">
               <p className="char-count">{activeCharCount}/4000</p>
               <div className="composer-actions">
-                {isBusy && (
+                {activeBusy && (
                   <button className="stop" type="button" onClick={stopCurrentGeneration}>
-                    Stop
+                    {activeStopLabel}
                   </button>
                 )}
-                <button className="send" type="submit" disabled={isBusy} title="Send" aria-label="Send">
+                <button className="send" type="submit" disabled={activeBusy} title="Send" aria-label="Send">
                   <span className="plane" aria-hidden="true">&#10148;</span>
                 </button>
               </div>

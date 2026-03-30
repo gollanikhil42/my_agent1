@@ -26,8 +26,11 @@ body,
 body {
   margin: 0;
   font-family: "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+  font-size: 14px;
   background: linear-gradient(180deg, var(--bg-top) 0%, var(--bg) 72%);
   color: var(--text);
+  overflow-x: hidden;
+  overflow-y: hidden;
 }
 
 button,
@@ -38,56 +41,71 @@ textarea {
 }
 
 .sensei-shell {
+  height: 100dvh;
   min-height: 100dvh;
   background: linear-gradient(180deg, var(--bg-top) 0%, var(--bg) 72%);
   overflow: hidden;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
 }
 
 .sensei-topbar {
-  height: 56px;
   position: sticky;
   top: 0;
   z-index: 50;
   border-bottom: 1px solid var(--line);
   display: grid;
-  grid-template-columns: auto 1fr auto;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-areas: "brand nav user";
   align-items: center;
-  gap: 18px;
-  padding: 0 18px;
+  gap: 5px;
+  min-height: 36px;
+  padding: 3px 10px;
+  background: linear-gradient(180deg, rgba(11, 116, 216, 0.96) 0%, rgba(11, 111, 209, 0.94) 100%);
+  backdrop-filter: blur(10px);
 }
 
 .sensei-brand {
+  grid-area: brand;
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 6px;
   letter-spacing: 0.02em;
+  min-width: 0;
 }
 
 .sensei-brand strong {
-  font-size: 2rem;
+  font-size: clamp(0.88rem, 1vw, 1.04rem);
   font-weight: 800;
   line-height: 1;
 }
 
 .sensei-brand span {
-  font-size: 2rem;
+  font-size: clamp(0.84rem, 0.92vw, 0.98rem);
   font-weight: 700;
   line-height: 1;
 }
 
 .sensei-nav {
+  grid-area: nav;
   display: flex;
   align-items: center;
-  gap: 8px;
+  justify-content: flex-start;
+  justify-self: start;
+  flex-wrap: wrap;
+  gap: 4px;
+  min-width: 0;
 }
 
 .nav-tab {
   border: 1px solid transparent;
-  border-radius: 10px;
+  border-radius: 8px;
   background: transparent;
   color: var(--text);
-  padding: 8px 16px;
+  padding: 3px 8px;
   cursor: pointer;
+  white-space: nowrap;
+  font-size: 0.8rem;
 }
 
 .nav-tab.active {
@@ -96,14 +114,17 @@ textarea {
 }
 
 .sensei-user {
+  grid-area: user;
   display: flex;
   align-items: center;
-  gap: 10px;
+  justify-self: end;
+  flex-wrap: wrap;
+  gap: 6px;
 }
 
 .sensei-user span {
-  width: 36px;
-  height: 36px;
+  width: 24px;
+  height: 24px;
   border-radius: 50%;
   display: grid;
   place-items: center;
@@ -116,8 +137,9 @@ textarea {
   border-radius: 999px;
   background: rgba(52, 137, 213, 0.65);
   color: var(--text);
-  padding: 8px 14px;
+  padding: 3px 8px;
   cursor: pointer;
+  font-size: 0.8rem;
 }
 
 .new-session {
@@ -125,18 +147,37 @@ textarea {
   border-radius: 999px;
   background: rgba(79, 170, 245, 0.72);
   color: var(--text);
-  padding: 8px 14px;
+  padding: 3px 8px;
   cursor: pointer;
+  font-size: 0.8rem;
 }
 
 .chat-shell {
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr);
-  gap: 14px;
-  padding: 12px;
-  height: calc(100dvh - 56px);
+  grid-template-columns: minmax(0, 1fr);
+  gap: 10px;
+  width: 100%;
+  max-width: 100%;
+  margin: 0 auto;
+  padding: 8px 10px;
+  height: 100%;
+  min-height: 0;
   overflow: hidden;
   position: relative;
+  align-items: stretch;
+}
+
+.chat-shell.analyst-shell {
+  padding-top: 30px;
+}
+
+/* When menu is open on non-overlay viewports, push content right so the fixed menu panel doesn't cover it */
+.chat-shell.analyst-shell:not(.menu-collapsed):not(.compact-shell) {
+  padding-left: 262px;
+}
+
+.chat-shell.compact-shell {
+  padding-top: 30px;
 }
 
 .chat-shell.assistant-only {
@@ -144,49 +185,108 @@ textarea {
 }
 
 .chat-shell.menu-collapsed {
-  grid-template-columns: 0 minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr);
   gap: 0;
 }
 
 .menu-toggle {
-  position: absolute;
+  position: fixed;
   left: 14px;
-  top: 12px;
+  top: 38px;
   z-index: 20;
   border: 1px solid var(--chip-border);
-  border-radius: 10px;
+  border-radius: 8px;
   background: rgba(18, 95, 168, 0.9);
   color: var(--text);
-  padding: 8px 12px;
+  padding: 4px 8px;
+  cursor: pointer;
+  font-size: 0.76rem;
+}
+
+.menu-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 18;
+  border: 0;
+  background: rgba(2, 22, 43, 0.42);
   cursor: pointer;
 }
 
 .left-menu {
+  position: fixed;
+  top: 58px;
+  left: 14px;
+  z-index: 19;
   border: 1px solid var(--line);
-  border-radius: 14px;
+  border-radius: 10px;
   background: rgba(23, 102, 177, 0.75);
-  width: 290px;
+  width: 236px;
+  max-width: calc(100vw - 28px);
+  height: calc(100dvh - 68px);
   min-height: 0;
   overflow: hidden;
-  transition: width 180ms ease, border-color 180ms ease, background-color 180ms ease;
+  box-shadow: 0 18px 38px rgba(2, 23, 47, 0.34);
+  transition: transform 180ms ease, opacity 180ms ease, border-color 180ms ease, background-color 180ms ease;
+}
+
+.left-menu.compact {
+  top: 42px;
+  left: 12px;
+  width: min(320px, calc(100vw - 24px));
+  max-width: calc(100vw - 24px);
+  height: calc(100dvh - 50px);
 }
 
 .left-menu.collapsed {
-  width: 0;
+  transform: translateX(calc(-100% - 16px));
+  opacity: 0;
+  pointer-events: none;
   border-color: transparent;
   background: transparent;
+}
+
+.left-menu.compact.collapsed {
+  transform: translateX(calc(-100% - 12px));
+  opacity: 0;
+  pointer-events: none;
+}
+
+.left-menu.open,
+.left-menu.compact.open {
+  transform: translateX(0);
+  opacity: 1;
 }
 
 .left-menu-scroll {
   height: 100%;
   overflow-y: auto;
-  padding: 56px 10px 12px;
+  padding: 12px 8px 8px;
   display: grid;
-  gap: 12px;
+  gap: 8px;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
 }
 
 .left-menu.collapsed .left-menu-scroll > * {
   display: none;
+}
+
+.left-menu-scroll::-webkit-scrollbar,
+.messages::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+  display: none;
+}
+
+.left-menu-scroll::-webkit-scrollbar-track,
+.messages::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.left-menu-scroll::-webkit-scrollbar-thumb,
+.messages::-webkit-scrollbar-thumb {
+  background: transparent;
+  border: 0;
 }
 
 .menu-suggestions {
@@ -203,29 +303,42 @@ textarea {
 }
 
 .chat-center {
-  width: min(920px, 100%);
+  width: 100%;
+  max-width: 760px;
+  min-width: 0;
+  justify-self: center;
   margin: 0 auto;
   height: 100%;
   min-height: 0;
-  display: grid;
-  grid-template-rows: 1fr auto;
-  gap: 10px;
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  gap: 6px;
+  overflow: hidden;
+}
+
+.chat-shell.compact-shell .chat-center,
+.chat-shell.assistant-only .chat-center,
+.chat-shell.menu-collapsed .chat-center {
+  width: 100%;
+  max-width: 760px;
+  justify-self: stretch;
 }
 
 .analysis-toolbar {
   display: flex;
   flex-wrap: wrap;
-  gap: 10px;
-  padding: 8px;
-  border-radius: 12px;
+  gap: 6px;
+  padding: 7px;
+  border-radius: 10px;
   background: rgba(29, 107, 181, 0.55);
   border: 1px solid var(--line);
 }
 
 .analysis-toolbar label {
   display: grid;
-  gap: 6px;
-  min-width: 160px;
+  gap: 5px;
+  min-width: 132px;
 }
 
 .analysis-toolbar label span {
@@ -235,31 +348,44 @@ textarea {
   letter-spacing: 0.08em;
 }
 
+.field-hint {
+  font-size: 0.72rem;
+  line-height: 1.35;
+  color: var(--muted);
+}
+
 .analysis-toolbar select,
 .analysis-toolbar input {
   border: 1px solid var(--chip-border);
-  border-radius: 10px;
+  border-radius: 8px;
   background: rgba(196, 229, 255, 0.9);
   color: #1f3142;
-  padding: 10px 12px;
+  padding: 8px 10px;
 }
 
 .trace-id-field {
-  min-width: 260px;
+  min-width: 190px;
   flex: 1;
 }
 
 .chat-feed {
+  width: 100%;
+  flex: 1 1 auto;
   min-height: 0;
   overflow: hidden;
 }
 
 .messages {
+  width: 100%;
+  flex: 1 1 auto;
   height: 100%;
   overflow-y: auto;
   display: grid;
-  gap: 18px;
-  padding: 14px 8px 8px;
+  align-content: start;
+  gap: 12px;
+  padding: 8px 4px 4px;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
 }
 
 .message {
@@ -276,12 +402,13 @@ textarea {
 }
 
 .bubble-wrap {
-  max-width: min(760px, 100%);
+  max-width: min(620px, 100%);
   width: fit-content;
+  min-width: 0;
   display: inline-flex;
   flex-direction: column;
   align-items: flex-start;
-  gap: 8px;
+  gap: 5px;
 }
 
 .bubble-header {
@@ -297,14 +424,15 @@ textarea {
 }
 
 .bubble {
-  border-radius: 16px;
-  padding: 14px 16px;
+  border-radius: 14px;
+  padding: 10px 12px;
   display: inline-block;
   width: fit-content;
-  max-width: min(760px, 100%);
+  max-width: min(620px, 100%);
   white-space: pre-wrap;
   word-break: break-word;
-  line-height: 1.55;
+  overflow-wrap: anywhere;
+  line-height: 1.5;
 }
 
 .message.user .bubble {
@@ -326,12 +454,12 @@ textarea {
   align-self: flex-start;
   width: max-content;
   border: 1px solid var(--chip-border);
-  border-radius: 10px;
+  border-radius: 8px;
   background: transparent;
   color: var(--text);
-  padding: 6px 10px;
+  padding: 4px 8px;
   cursor: pointer;
-  font-size: 0.78rem;
+  font-size: 0.7rem;
 }
 
 .typing {
@@ -360,13 +488,13 @@ textarea {
 .suggestion-chip {
   text-align: left;
   border: 1px solid rgba(196, 228, 252, 0.28);
-  border-radius: 12px;
+  border-radius: 9px;
   background: linear-gradient(160deg, rgba(93, 177, 247, 0.33), rgba(56, 140, 210, 0.28));
   color: var(--text);
-  padding: 10px 12px;
+  padding: 7px 9px;
   cursor: pointer;
   display: grid;
-  gap: 6px;
+  gap: 3px;
   transition: transform 140ms ease, border-color 140ms ease, background-color 140ms ease;
 }
 
@@ -383,7 +511,7 @@ textarea {
 }
 
 .suggestion-text {
-  font-size: 0.84rem;
+  font-size: 0.76rem;
   line-height: 1.35;
 }
 
@@ -391,25 +519,30 @@ textarea {
   position: sticky;
   bottom: 0;
   width: 100%;
+  min-width: 0;
+  align-self: stretch;
+  margin-top: auto;
   border: 1px solid rgba(228, 241, 252, 0.35);
   border-radius: 14px;
   background: var(--panel);
-  padding: 10px;
+  padding: 7px 8px;
   display: grid;
-  gap: 8px;
-  box-shadow: 0 14px 40px rgba(4, 45, 88, 0.34);
+  gap: 6px;
+  box-shadow: 0 8px 20px rgba(4, 45, 88, 0.22);
 }
 
 .floating-composer textarea {
   width: 100%;
-  min-height: 70px;
-  max-height: 180px;
+  min-height: 44px;
+  min-width: 0;
+  max-height: 96px;
   border: 1px solid rgba(163, 194, 220, 0.9);
   border-radius: 10px;
   background: var(--input);
   color: var(--input-text);
-  padding: 12px;
-  resize: vertical;
+  padding: 8px 10px;
+  line-height: 1.4;
+  resize: none;
 }
 
 .floating-composer textarea:focus {
@@ -422,32 +555,36 @@ textarea {
   display: flex;
   justify-content: space-between;
   align-items: center;
+  gap: 8px;
 }
 
 .composer-actions {
   display: flex;
   align-items: center;
+  margin-left: auto;
   gap: 8px;
+  flex-shrink: 0;
 }
 
 .stop {
   border: 1px solid rgba(47, 97, 138, 0.25);
-  border-radius: 10px;
+  border-radius: 8px;
   background: #d9e9f8;
   color: #26405c;
-  padding: 8px 12px;
+  padding: 6px 9px;
   cursor: pointer;
+  font-size: 0.82rem;
 }
 
 .char-count {
   margin: 0;
   color: #27425d;
-  font-size: 0.78rem;
+  font-size: 0.72rem;
 }
 
 .send {
-  width: 38px;
-  height: 38px;
+  width: 34px;
+  height: 34px;
   border: 0;
   border-radius: 50%;
   display: grid;
@@ -476,50 +613,227 @@ textarea {
   }
 }
 
+@media (max-width: 1280px) {
+  .chat-center {
+    max-width: 720px;
+  }
+}
+
 @media (max-width: 900px) {
-  .sensei-topbar {
-    position: sticky;
-    grid-template-columns: 1fr;
-    height: auto;
-    padding: 10px 12px;
-    gap: 8px;
-  }
-
-  .sensei-brand strong,
-  .sensei-brand span {
-    font-size: 1.2rem;
-  }
-
-  .sensei-user {
-    justify-content: flex-start;
-  }
-
   .chat-shell {
     grid-template-columns: 1fr;
-    height: calc(100dvh - 108px);
     padding: 10px;
   }
 
-  .menu-toggle {
-    position: static;
-    justify-self: start;
+  .chat-shell.analyst-shell {
+    padding-top: 32px;
   }
 
-  .left-menu {
-    width: 100%;
-  }
-
-  .left-menu.collapsed {
-    width: 0;
-    border: 0;
-    margin: 0;
-  }
-
-  .left-menu.collapsed .left-menu-scroll > * {
-    display: none;
+  /* Re-assert menu-open padding after the padding: 10px override above */
+  .chat-shell.analyst-shell:not(.menu-collapsed):not(.compact-shell) {
+    padding-left: 262px;
   }
 
   .floating-composer {
     width: 100%;
+  }
+
+  .chat-center {
+    max-width: 100%;
+  }
+
+  .menu-toggle {
+    top: 42px;
+    left: 10px;
+  }
+
+  .floating-composer textarea {
+    min-height: 62px;
+    max-height: 136px;
+  }
+}
+
+@media (max-width: 640px) {
+  .sensei-topbar {
+    grid-template-columns: 1fr auto;
+    grid-template-areas:
+      "brand user"
+      "nav nav";
+    padding: 5px 8px;
+    gap: 3px;
+  }
+
+  .sensei-brand {
+    gap: 6px;
+    flex-wrap: nowrap;
+  }
+
+  .sensei-brand strong,
+  .sensei-brand span {
+    font-size: 0.9rem;
+  }
+
+  .sensei-user {
+    justify-self: end;
+    justify-content: flex-end;
+  }
+
+  .menu-toggle {
+    top: 75px;
+    left: 8px;
+  }
+
+  .left-menu.compact {
+    top: 75px;
+    height: calc(100dvh - 87px);
+  }
+
+  .analysis-toolbar {
+    padding: 10px;
+  }
+
+  .analysis-toolbar label,
+  .trace-id-field {
+    min-width: 100%;
+  }
+
+  .messages {
+    padding: 12px 4px 8px;
+    gap: 14px;
+  }
+
+  .bubble,
+  .message.user .bubble,
+  .message.assistant .bubble,
+  .message.system .bubble {
+    max-width: 100%;
+  }
+
+  .floating-composer {
+    padding: 8px;
+  }
+
+  .floating-composer textarea {
+    min-height: 72px;
+    max-height: 150px;
+  }
+
+  .composer-row {
+    align-items: center;
+  }
+
+  .composer-actions {
+    justify-content: flex-end;
+  }
+
+  .char-count {
+    flex: 1 1 auto;
+  }
+}
+
+@media (max-width: 420px) {
+  .chat-shell {
+    padding: 8px;
+  }
+
+  .menu-toggle {
+    left: 8px;
+    top: 84px;
+    padding: 7px 9px;
+  }
+
+  .left-menu.compact,
+  .left-menu.compact.collapsed {
+    width: calc(100vw - 16px);
+    max-width: calc(100vw - 16px);
+    border-radius: 12px;
+  }
+
+  .left-menu.compact {
+    top: 90px;
+    left: 8px;
+    height: calc(100dvh - 102px);
+  }
+
+  .left-menu-scroll {
+    padding: 48px 8px 10px;
+  }
+
+  .sensei-user {
+    gap: 3px;
+    flex-wrap: nowrap;
+  }
+
+  .sensei-user span {
+    width: 22px;
+    height: 22px;
+    flex-shrink: 0;
+  }
+
+  .new-session,
+  .signout {
+    font-size: 0.72rem;
+    padding: 2px 5px;
+  }
+
+  .bubble {
+    padding: 12px 14px;
+  }
+
+  .floating-composer textarea {
+    min-height: 68px;
+  }
+
+  .composer-actions {
+    margin-left: 0;
+    justify-content: flex-end;
+  }
+}
+
+@media (max-width: 320px) {
+  .sensei-topbar {
+    padding: 4px 6px;
+    gap: 2px;
+  }
+
+  .sensei-user {
+    gap: 2px;
+  }
+
+  .sensei-user span {
+    width: 18px;
+    height: 18px;
+    font-size: 0.6rem;
+  }
+
+  .new-session,
+  .signout {
+    font-size: 0.64rem;
+    padding: 2px 4px;
+  }
+
+  .sensei-brand strong,
+  .sensei-brand span {
+    font-size: 0.8rem;
+  }
+}
+
+@media (max-width: 250px) {
+  /* At extremely narrow widths brand + buttons can't share a row — hide button labels,
+     keep only the avatar so the topbar doesn't overflow or overlap the brand. */
+  .new-session,
+  .signout {
+    display: none;
+  }
+
+  .sensei-brand strong,
+  .sensei-brand span {
+    font-size: 0.72rem;
+  }
+
+  .sensei-user span {
+    width: 16px;
+    height: 16px;
+    font-size: 0.55rem;
   }
 }
