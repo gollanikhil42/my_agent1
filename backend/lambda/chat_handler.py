@@ -41,13 +41,13 @@ BEDROCK_CLIENT = boto3.client(
     ),
 )
 DIAGNOSIS_MODEL_ID = os.environ.get("DIAGNOSIS_MODEL_ID", "")
-DIAGNOSIS_SESSION_MAX_TOKENS = int(os.environ.get("DIAGNOSIS_SESSION_MAX_TOKENS", "600"))
+DIAGNOSIS_SESSION_MAX_TOKENS = int(os.environ.get("DIAGNOSIS_SESSION_MAX_TOKENS", "1000"))
 DIAGNOSIS_PROMPT_UPGRADE_MAX_TOKENS = int(os.environ.get("DIAGNOSIS_PROMPT_UPGRADE_MAX_TOKENS", "920"))
 DIAGNOSIS_FLEET_SUMMARY_MAX_TOKENS = int(os.environ.get("DIAGNOSIS_FLEET_SUMMARY_MAX_TOKENS", "2000"))
-DIAGNOSIS_FLEET_DISCOVERY_MAX_TOKENS = int(os.environ.get("DIAGNOSIS_FLEET_DISCOVERY_MAX_TOKENS", "3000"))
-DIAGNOSIS_TRACE_LOOKUP_MAX_TOKENS = int(os.environ.get("DIAGNOSIS_TRACE_LOOKUP_MAX_TOKENS", "650"))
-DIAGNOSIS_FLEET_DEEP_DIVE_MAX_TOKENS = int(os.environ.get("DIAGNOSIS_FLEET_DEEP_DIVE_MAX_TOKENS", "800"))
-DIAGNOSIS_SESSION_DEEP_DIVE_MAX_TOKENS = int(os.environ.get("DIAGNOSIS_SESSION_DEEP_DIVE_MAX_TOKENS", "650"))
+DIAGNOSIS_FLEET_DISCOVERY_MAX_TOKENS = int(os.environ.get("DIAGNOSIS_FLEET_DISCOVERY_MAX_TOKENS", "5000"))
+DIAGNOSIS_TRACE_LOOKUP_MAX_TOKENS = int(os.environ.get("DIAGNOSIS_TRACE_LOOKUP_MAX_TOKENS", "1000"))
+DIAGNOSIS_FLEET_DEEP_DIVE_MAX_TOKENS = int(os.environ.get("DIAGNOSIS_FLEET_DEEP_DIVE_MAX_TOKENS", "1400"))
+DIAGNOSIS_SESSION_DEEP_DIVE_MAX_TOKENS = int(os.environ.get("DIAGNOSIS_SESSION_DEEP_DIVE_MAX_TOKENS", "1400"))
 RUNTIME_SERVICE_NAME = os.environ.get("RUNTIME_SERVICE_NAME", "")
 
 # ── Analyzer structured logging (mirrors my_agent1.py trace format) ─────────────
@@ -111,7 +111,7 @@ EVALUATOR_LOG_GROUP = os.environ.get(
     "",
 )
 EVALUATOR_LOG_PREFIX = os.environ.get("EVALUATOR_LOG_PREFIX", "")
-FLEET_RUNTIME_LIMIT = int(os.environ.get("FLEET_RUNTIME_LIMIT", "1800"))
+FLEET_RUNTIME_LIMIT = int(os.environ.get("FLEET_RUNTIME_LIMIT", "4000"))
 FLEET_EVALUATOR_MAX_GROUPS = int(os.environ.get("FLEET_EVALUATOR_MAX_GROUPS", "10"))
 FLEET_EVALUATOR_PER_GROUP_LIMIT = int(os.environ.get("FLEET_EVALUATOR_PER_GROUP_LIMIT", "300"))
 FLEET_XRAY_MAX_TRACES = int(os.environ.get("FLEET_XRAY_MAX_TRACES", "600"))
@@ -608,26 +608,30 @@ def _classify_collection_strategy_llm(question: str, analyst_memory: Any = None)
 
 
 def _classify_fleet_request_llm(question: str, analyst_memory: Any = None) -> Dict[str, str]:
-    """Single Haiku call that classifies BOTH intent and collection strategy.
-
-    Replaces two serial Haiku calls (_classify_question_intent_llm +
-    _classify_collection_strategy_llm), cutting pre-flight LLM time roughly in half.
+    """Single Haiku call that classifies intent, collection strategy, and query intent type.
 
     Returns a dict with:
-      intent   — "general_conversation" | "telemetry_analysis"
-      strategy — "completeness_first" | "balanced"
+      intent      — "general_conversation" | "telemetry_analysis"
+      strategy    — "completeness_first" | "balanced"
+      intent_type — "summary" | "listing" | "analysis"
     """
     q = str(question or "").strip()
     if not q:
-        return {"intent": "telemetry_analysis", "strategy": "balanced"}
+        return {"intent": "telemetry_analysis", "strategy": "balanced", "intent_type": "analysis"}
 
     system_prompt = (
         "Classify the user message for a telemetry analysis dashboard. "
-        "Return ONLY JSON with two keys:\n"
-        "  intent:   'general_conversation' (greeting/small-talk, no logs needed) OR 'telemetry_analysis' (traces/sessions/latency/errors)\n"
-        "  strategy: 'completeness_first' (user explicitly wants to LIST every SESSION by ID, or wants an EXACT total count of SESSIONS — NOT for user/username queries) "
+        "Return ONLY JSON with three keys:\n"
+        "  intent:      'general_conversation' (greeting/small-talk) OR 'telemetry_analysis' (traces/sessions/latency/errors)\n"
+        "  strategy:    'completeness_first' (user explicitly wants to LIST every SESSION by its ID, or needs an EXACT total SESSION count) "
         "OR 'balanced' (summaries, overviews, highlights, patterns, slowest/fastest analysis, issue diagnosis, "
-        "ANY user/username/who-used listing — even when the words 'list', 'all', or 'every' appear in a user-focused query)"
+        "ANY user/username/who-used listing — even when the words list/all/every appear in a user-focused query)\n"
+        "  intent_type: 'summary' (user asks for an overview, summary, highlight of issues, or analysis of the whole window — "
+        "even if they say 'all sessions'; the key is they want INSIGHTS not an ENUMERATION) "
+        "OR 'listing' (user explicitly wants to enumerate/list items by ID) "
+        "OR 'analysis' (targeted analysis of a specific user, session, error pattern, etc.)\n"
+        "IMPORTANT: 'Give me a summary', 'overview', 'highlight issues', 'what happened', 'any issues' → intent_type=summary, strategy=balanced. "
+        "NEVER let recent conversation history change a summary/overview request into completeness_first or listing."
     )
     memory_block = _format_analyst_memory(analyst_memory)
     user_content = "".join(
@@ -642,21 +646,27 @@ def _classify_fleet_request_llm(question: str, analyst_memory: Any = None) -> Di
             modelId="anthropic.claude-3-haiku-20240307-v1:0",
             system=[{"text": system_prompt}],
             messages=[{"role": "user", "content": [{"text": user_content}]}],
-            inferenceConfig={"maxTokens": 80, "temperature": 0.0},
+            inferenceConfig={"maxTokens": 100, "temperature": 0.0},
         )
         text = str(response["output"]["message"]["content"][0]["text"] or "").strip()
         parsed = json.loads(text)
         intent = str((parsed or {}).get("intent", "")).strip().lower()
         strategy = str((parsed or {}).get("strategy", "")).strip().lower()
+        intent_type = str((parsed or {}).get("intent_type", "")).strip().lower()
         if intent not in {"general_conversation", "telemetry_analysis"}:
             intent = "telemetry_analysis"
         if strategy not in {"completeness_first", "balanced"}:
             strategy = "balanced"
-        return {"intent": intent, "strategy": strategy}
+        if intent_type not in {"summary", "listing", "analysis"}:
+            intent_type = "analysis"
+        # Summaries are never completeness_first — guard against model error
+        if intent_type == "summary":
+            strategy = "balanced"
+        return {"intent": intent, "strategy": strategy, "intent_type": intent_type}
     except Exception:
         pass
 
-    return {"intent": "telemetry_analysis", "strategy": "balanced"}
+    return {"intent": "telemetry_analysis", "strategy": "balanced", "intent_type": "analysis"}
 
 
 def _build_general_conversation_reply(question: str, analyst_memory: Any = None) -> str:
@@ -1814,6 +1824,10 @@ def _fetch_runtime_records_window(
             _append_runtime_event(row, "backfill")
 
     # Primary fixed-stream path populated by runtime.
+    # IMPORTANT: startFromHead=False reads the NEWEST events first (from the end of the stream).
+    # startFromHead=True reads oldest-first, which on large windows fills the cap with old records
+    # and drops all recent users from the user index — exactly the bug where larger timeframes
+    # show fewer users than shorter ones.
     if RUNTIME_LOG_STREAM and len(records) < limit:
         try:
             next_token = None
@@ -1825,8 +1839,8 @@ def _fetch_runtime_records_window(
                     "logGroupName": resolved_group,
                     "logStreamName": RUNTIME_LOG_STREAM,
                     "startTime": start_ms,
-                    "startFromHead": True,
-                    "limit": min(1000, max(100, limit)),
+                    "startFromHead": False,  # Newest first — large windows must not miss recent users
+                    "limit": min(10000, max(100, limit)),
                 }
                 if next_token:
                     kwargs["nextToken"] = next_token
@@ -1835,7 +1849,8 @@ def _fetch_runtime_records_window(
                     if isinstance(row, dict):
                         row["_log_stream_name"] = RUNTIME_LOG_STREAM
                     _append_runtime_event(row, "fixed_stream")
-                new_token = response.get("nextForwardToken") or response.get("nextToken")
+                # Use backward token to paginate toward older events (correct direction for startFromHead=False)
+                new_token = response.get("nextBackwardToken") or response.get("nextToken")
                 pages += 1
                 if not new_token or new_token == next_token:
                     break
@@ -2342,25 +2357,34 @@ def _build_discovery_diagnosis(
     window_minutes = int((merged.get("window") or {}).get("duration_minutes", 0) or 0)
     system_prompt = (
         "You are a telemetry analyst. Understand what the user is asking and respond naturally. "
-        "The context has two scopes: sessions/users for current page details, and all_pages_session_index/all_pages_user_index for whole-window awareness. "
-        "USERNAME/USER LISTING REQUESTS ('who used the system', 'list all users', 'list usernames', 'give me usernames', 'what users', 'show users'): "
-        "ALWAYS answer using all_pages_user_index ONLY — it already contains ALL users across the entire window. "
-        "List every user from all_pages_user_index, then say 'These are all users in the window — no more pages needed.' DO NOT mention pagination for user-only requests. "
-        "SESSION LISTING REQUESTS ('list sessions', 'show all sessions', 'what sessions exist'): "
-        "list ONLY the sessions present in the current page 'sessions' data. DO NOT enumerate from all_pages_session_index. "
-        "CRITICAL LISTING FORMAT: When listing sessions, format EACH session on its own numbered line EXACTLY as: "
-        "{session_id} | {user_name} | {trace_count} traces | average latency {avg_e2e_ms} ms | maximum latency {max_e2e_ms} ms | latest {latest_trace_timestamp_utc} "
-        "Use that exact pipe-separated format for EVERY session — no deviations, no markdown, no extra fields. "
-        "If pagination_context indicates more pages exist for sessions, mention that after the list. "
-        "If the user asks for trace IDs for a session, use all_pages_session_index.trace_id_sample when available. "
-        "For summary/analysis requests ('Give me a summary', 'Overview'): give a short, crisp, high-level overview. "
-        "CRITICAL FOR SUMMARIES: Keep the summary strictly under 150 words. Focus only on fleet averages, total counts, and the top 2-3 anomalies. DO NOT list out individual sessions. DO NOT mention pagination, 'next page', or that more sessions are available. This is vital to prevent UI pagination loops. "
-        "CRITICAL FOR ALL RESPONSES: You are operating behind a strict 29-second AWS API Gateway hard timeout limit. Keep EVERY single response concise and strictly under 250 words. Never list more than 5 distinct items (sessions/traces/issues) under any circumstances. Rambling or exhaustively listing items WILL crash the system! "
-        "CRITICAL: When asked to list out items, never enumerate from the all_pages_session_index as it causes timeouts. Only list the subset provided in the current page 'sessions' block. "
+        "The context has these data scopes: "
+        "  (a) 'sessions_by_user' — CURRENT PAGE sessions PRE-GROUPED by user. "
+        "      Each entry: {user_name: {user_id, session_count_total, total_traces_total, page_sessions: [...]}}. "
+        "      page_sessions fields: session_id, trace_count, avg_latency_ms, max_latency_ms, "
+        "      latest_trace_timestamp_utc, error_rate, delayed_rate. "
+        "  (b) 'sessions' — flat dict of current page sessions. Use ONLY for session-only listing queries. "
+        "  (c) 'all_pages_user_index' — user-level aggregates across ALL pages (counts/totals only). "
+        "  (d) 'all_pages_session_index' — DO NOT enumerate from here. Use ONLY for trace_id_sample lookup. "
+        "USER-ONLY LISTING ('who used the system', 'list all users', 'list usernames'): "
+        "  Use all_pages_user_index. List every user with their session_count and total_traces. "
+        "  End with: 'These are all users in the window — no more pages needed.' Never mention pagination here. "
+        "USER + SESSION LISTING ('list all users and their sessions', 'show users with sessions', 'list sessions per user'): "
+        "  Iterate sessions_by_user directly — do NOT touch the flat 'sessions' dict or all_pages_user_index for session rows. "
+        "  For each user in sessions_by_user: print header '{user_name} — {session_count_total} sessions total, {total_traces_total} traces total'. "
+        "  Then list each item in page_sessions using the LISTING FORMAT below. "
+        "  If sessions_pagination_context says more pages exist, end with a single line summarising remaining pages. "
+        "SESSION LISTING ('list sessions', 'show all sessions', 'list all session IDs'): "
+        "  ONLY enumerate sessions in the current 'sessions' block — NEVER from all_pages_session_index. "
+        "  List them in order. At the end note the page number and total if sessions_pagination_context says more pages exist. "
+        "LISTING FORMAT: For each session line use EXACTLY: "
+        "{session_id} | {user_name} | {trace_count} traces | average latency {avg_latency_ms} ms | maximum latency {max_latency_ms} ms | latest {latest_trace_timestamp_utc} "
+        "No markdown. No --- separator lines. No bold. No bullet points. Plain text only. Full IDs only. "
+        "SUMMARY/ANALYSIS requests ('Give me a summary', 'Overview', 'which is slowest'): "
+        "  Give a short, crisp overview — under 150 words. Don't enumerate sessions. Don't mention pagination. "
         "For user-specific requests: focus only on that user's sessions and metrics. "
         "Always include timestamps in UTC when available in the data. "
         "Use 'average latency' and 'maximum latency' — never abbreviate as avg/max. "
-        "If completeness_note is present in the context, mention it at the end of your response briefly. "
+        "If completeness_note is present in the context, mention it at the end briefly. "
         "Plain text. Full IDs. No markdown."
     )
 
@@ -2825,13 +2849,33 @@ def _detect_query_mode(
         "Classify the user question into a query mode for telemetry analysis. "
         "Return ONLY JSON with keys: mode, session_id, user_id, requested_user. "
         "mode must be deep_dive or discovery. "
-        "Choose deep_dive only when the question targets one specific session ID from session_candidates. "
-        "If the message uses references like 'it', 'that session', 'this user', resolve them using recent_conversation. "
-        "When a prior turn discussed exactly one session and the user asks for details such as trace IDs, choose deep_dive with that session_id. "
-        "Choose discovery for everything else: listing sessions, listing users, asking about a user, fleet summaries, general queries. "
-        "For user-specific discovery: if the user mentions a person's name or username, match it against known_user_candidates (case-insensitive, partial match ok) and set user_id. "
-        "If the name does not match any known candidate, set requested_user to that name and leave user_id empty. "
-        "If the question asks for all users / all sessions / a fleet overview with no specific user, leave user_id and requested_user empty."
+        "FLEET ENUMERATION OVERRIDE (checked first, takes precedence over everything): "
+        "  If the question asks for a view across the WHOLE FLEET — e.g. lists/shows/enumerates all users, "
+        "  all sessions, all users and their sessions, fleet summary, fleet overview, all users' issues, etc. — "
+        "  ALWAYS return mode=discovery with empty session_id, user_id, and requested_user. "
+        "  This applies even when a specific session or user was discussed in the immediately prior turn. "
+        "  Phrases like 'issues they faced', 'problems they had', 'their sessions', 'their issues' in the context "
+        "  of a fleet listing question refer to the fleet, NOT to a previously seen session. "
+        "RULES FOR deep_dive: "
+        "  Choose deep_dive ONLY when (a) the question already names or the user clearly implies exactly one specific session_id "
+        "  from session_candidates AND (b) the user is asking for details ABOUT that session — not asking to FIND or COMPARE sessions. "
+        "  NEVER choose deep_dive for comparative or identification questions such as 'which session took more time', "
+        "  'which had the most errors', 'which is slowest/fastest/worst', 'show me the one that X'. Those belong to discovery. "
+        "  When in doubt, default to discovery. "
+        "PRONOUN RESOLUTION using recent_conversation (most recent turns take priority over older turns): "
+        "  If 'those', 'they', 'their', 'in those', 'among those' refers to a user's MULTIPLE sessions discussed in the prior turn, "
+        "  set mode=discovery and set user_id to that user — do NOT choose deep_dive. "
+        "  If 'it' or 'that session' unambiguously refers to exactly ONE specific session discussed in the immediately preceding assistant turn, "
+        "  and the new question asks for more detail about that same session, then deep_dive is allowed with that session_id. "
+        "  Never promote a session to deep_dive solely because it appeared in an older memory turn — "
+        "  the CURRENT question must unambiguously target that specific session. "
+        "RULES FOR discovery: "
+        "  Use discovery for listing sessions, listing users, asking about a user, fleet summaries, general queries, "
+        "  and any comparative or analytical question that requires searching or comparing across sessions. "
+        "USER MATCHING: For user-specific discovery, if the user mentions a person's name or username, "
+        "  match it against known_user_candidates (case-insensitive, partial match ok) and set user_id. "
+        "  If the name does not match any known candidate, set requested_user to that name and leave user_id empty. "
+        "  If the question asks for all users / all sessions / a fleet overview with no specific user, leave user_id and requested_user empty."
     )
     memory_block = _format_analyst_memory(analyst_memory)
     user_content = json.dumps(
@@ -3062,6 +3106,34 @@ def _build_discovery_context(merged: Dict[str, Any], query_intent: Dict[str, Any
     llm_session_rows = all_session_rows[:LLM_DISCOVERY_MAX_SESSIONS]
     sessions_truncated = sessions_on_page_count > LLM_DISCOVERY_MAX_SESSIONS
 
+    # Pre-group current-page sessions by user so the LLM never has to do the
+    # grouping itself — manual LLM grouping from a flat sessions dict causes
+    # misattribution bugs (e.g. "Wait — that session belongs to...").
+    # Structure: {user_name: {user_id, session_count_total, total_traces_total, page_sessions: [...]}}
+    _sessions_by_user: Dict[str, Any] = {}
+    for _sid, _srow in llm_session_rows:
+        _u = (_srow.get("user") or {})
+        _uname = str(_u.get("user_name") or _u.get("user_id") or "unknown").strip()
+        _uid = str(_u.get("user_id") or "").strip()
+        if _uname not in _sessions_by_user:
+            _idx_entry = all_pages_user_index.get(_uid) or {}
+            _sessions_by_user[_uname] = {
+                "user_id": _uid,
+                "user_name": _uname,
+                "session_count_total": int(_idx_entry.get("session_count") or 0),
+                "total_traces_total": int(_idx_entry.get("total_traces") or 0),
+                "page_sessions": [],
+            }
+        _sessions_by_user[_uname]["page_sessions"].append({
+            "session_id": _sid,
+            "trace_count": _srow.get("trace_count"),
+            "avg_latency_ms": _srow.get("avg_latency_ms"),
+            "max_latency_ms": _srow.get("max_latency_ms"),
+            "latest_trace_timestamp_utc": _srow.get("latest_trace_timestamp_utc"),
+            "error_rate": _srow.get("error_rate"),
+            "delayed_rate": _srow.get("delayed_rate"),
+        })
+
     # Data completeness signal: tell the LLM when runtime logs were unavailable
     # (only X-Ray data collected), which causes unknown-session / unknown-user entries.
     runtime_events_scanned = int(
@@ -3121,6 +3193,7 @@ def _build_discovery_context(merged: Dict[str, Any], query_intent: Dict[str, Any
             "quality_indicators": merged.get("quality_indicators", {}),
             "users": filtered_users,
             "sessions": dict(llm_session_rows),
+            "sessions_by_user": _sessions_by_user,
             "bottleneck_ranking": merged.get("bottleneck_ranking", [])[:10],
             "top_anomalies": [
                 {
@@ -3417,6 +3490,7 @@ def _handle_fleet_insights(
     page_size: int = 15,
     analyst_memory: Any = None,
     query_profile: str = "balanced",
+    intent_type: str = "analysis",
 ) -> Dict[str, Any]:
     handler_start = time.perf_counter()
     analysis_id = str(uuid.uuid4())[:8]
@@ -3466,7 +3540,9 @@ def _handle_fleet_insights(
     # to prevent session-building + LLM from exceeding the 29s API Gateway timeout.
     medium_mode = (window_minutes > 5 * 24 * 60) and (not fast_mode) and (not is_analytical_overall) and (not completeness_first)
     if medium_mode:
-        runtime_limit = min(runtime_limit, 1200)
+        # runtime_limit is intentionally NOT capped here — time budgets (runtime_budget_seconds)
+        # already prevent timeouts, and capping events causes user/session counts in listing
+        # queries to be inconsistently lower than completeness_first count queries on the same window.
         runtime_max_candidate_streams = min(runtime_max_candidate_streams, 2400)
         runtime_fixed_stream_pages = min(runtime_fixed_stream_pages, 20)
         runtime_budget_seconds = min(runtime_budget_seconds, 5.0)
@@ -3475,6 +3551,14 @@ def _handle_fleet_insights(
         evaluator_budget_seconds = min(evaluator_budget_seconds, 3.0)
         xray_max_traces = min(xray_max_traces, 180)
         xray_budget_seconds = min(xray_budget_seconds, 3.0)
+
+    if is_analytical_overall and not completeness_first:
+        # Overall-timeframe = user's broadest data view. Use the same runtime event depth
+        # as completeness_first so session counts in listing/discovery queries are consistent
+        # with direct count queries run against the same window.
+        runtime_limit = max(runtime_limit, 8000)
+        runtime_max_candidate_streams = max(runtime_max_candidate_streams, 8000)
+        runtime_fixed_stream_pages = max(runtime_fixed_stream_pages, 100)
 
     if completeness_first:
         # For enumeration/count/superset-sensitive queries, favor broader collection
@@ -3490,12 +3574,14 @@ def _handle_fleet_insights(
         xray_max_traces = max(xray_max_traces, 700)
         xray_budget_seconds = max(xray_budget_seconds, 4.0)
 
-    # For continuation pages (page > 1), use tighter collection so more budget
-    # remains for the LLM — the user already saw the full dataset on page 1.
+    # For continuation pages (page > 1), use much tighter collection to prevent
+    # cumulative multi-page timeout (29s API Gateway hard limit × multiple back-to-back calls).
+    # The data corpus is the same window — reduced budgets still return the full dataset.
     if page > 1:
-        runtime_budget_seconds = min(runtime_budget_seconds, 5.0)
-        evaluator_budget_seconds = min(evaluator_budget_seconds, 3.0)
-        xray_budget_seconds = min(xray_budget_seconds, 3.0)
+        runtime_budget_seconds = min(runtime_budget_seconds, 3.5)
+        evaluator_budget_seconds = min(evaluator_budget_seconds, 2.0)
+        xray_budget_seconds = min(xray_budget_seconds, 2.0)
+        runtime_fixed_stream_pages = min(runtime_fixed_stream_pages, 10)
 
     # ── Emit start trace (Strands-style structured logging) ────────────────────
     _emit_analyzer_trace({
@@ -3530,7 +3616,7 @@ def _handle_fleet_insights(
             max_seconds=runtime_budget_seconds,
             max_candidate_streams=runtime_max_candidate_streams,
             max_fixed_stream_pages=runtime_fixed_stream_pages,
-            force_backfill_insights=completeness_first,
+            force_backfill_insights=completeness_first or is_analytical_overall,
         )
         evaluator_future = _data_executor.submit(
             _fetch_evaluator_records_window,
@@ -3982,6 +4068,15 @@ def _handle_fleet_insights(
     missing_trace_ids = [trace_id for trace_id in requested_trace_ids if trace_id not in traces_by_id]
     trace_lookup_supplemental: List[Dict[str, Any]] = []
     _is_trace_lookup = bool(requested_trace_ids)
+
+    # Propagate fleet-level intent_type (summary/listing/analysis) so downstream
+    # code can skip session-level pagination for overview/summary queries.
+    if intent_type == "summary" and not _is_deep_dive and not _is_trace_lookup:
+        query_intent["intent_type"] = "summary"
+    else:
+        query_intent.setdefault("intent_type", intent_type)
+
+    _is_summary_query = query_intent.get("intent_type") == "summary"
     should_paginate = _should_paginate_trace_context(
         question=question,
         traces_total=len(all_traces),
@@ -4240,7 +4335,7 @@ def _handle_fleet_insights(
 
     # ── Session pagination ────────────────────────────────────────────────────
     total_sessions = len((merged if not _is_deep_dive else merged_for_llm).get("sessions", {}))
-    should_paginate_sessions_flag = (not _is_trace_lookup) and (not _is_deep_dive) and _should_paginate_sessions(
+    should_paginate_sessions_flag = (not _is_trace_lookup) and (not _is_deep_dive) and (not _is_summary_query) and _should_paginate_sessions(
         question=question,
         sessions_total=total_sessions,
         page_size=page_size,
@@ -4602,6 +4697,7 @@ def _handle_fleet_insights(
     _auto_paginate_recommended = (
         (not _is_trace_lookup)
         and (not _is_deep_dive)
+        and (not _is_summary_query)
         and bool(_active_pagination)
         and _has_next_page
         # Token cap alone must NOT trigger pagination for analysis queries — that would repeat
@@ -4625,10 +4721,7 @@ def _handle_fleet_insights(
             if not _line_complete and len(lines) > 1:
                 lines = lines[:-1]
         answer = "\n".join(lines).rstrip()
-        if _has_next_page:
-            answer += "\n\n(Response reached the output limit. Remaining sessions are on the next page.)"
-        else:
-            answer += "\n\n(Response reached the output limit. Some details may be omitted.)"
+        # Do not append any user-visible note — the frontend pagination UI handles continuation.
 
     response_body = json.dumps(
         {
@@ -4765,6 +4858,7 @@ def _handle_session_insights(event: Dict[str, Any]) -> Dict[str, Any]:
                 page_size=pagination_page_size,
                 analyst_memory=analyst_memory,
                 query_profile=query_profile,
+                intent_type=fleet_classify.get("intent_type", "analysis"),
             )
             elapsed = round(time.perf_counter() - request_start, 2)
             # Log successful completion

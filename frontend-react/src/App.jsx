@@ -267,6 +267,7 @@ function App({ signOut, user }) {
   const [controlsOpen, setControlsOpen] = useState(true);
   const [viewportWidth, setViewportWidth] = useState(() => window.innerWidth);
   const [copiedId, setCopiedId] = useState("");
+  const [traceIdInvalid, setTraceIdInvalid] = useState("");
   const [profile, setProfile] = useState({ name: user?.username || "User", department: "", role: "" });
   const chatAbortRef = useRef(null);
   const analystAbortRef = useRef(null);
@@ -560,19 +561,9 @@ function App({ signOut, user }) {
         return;
       }
 
-      if (isUuidLike(candidateTraceId) && !isXrayTraceIdLike(candidateTraceId)) {
-        setLogMessages((prev) => [
-          ...prev,
-          makeMessage("system", `That looks like a session ID, not an X-Ray trace ID. Paste the trace ID instead, for example ${autoAnchors.xray_trace_id || "1-xxxxxxxx-xxxxxxxxxxxxxxxxxxxxxxxx"}.`, "metric"),
-        ]);
-        return;
-      }
-
-      if (!isXrayTraceIdLike(candidateTraceId)) {
-        setLogMessages((prev) => [
-          ...prev,
-          makeMessage("system", "That does not look like a valid X-Ray trace ID. Use either the 32-character hex ID or the AWS X-Ray format 1-xxxxxxxx-xxxxxxxxxxxxxxxxxxxxxxxx.", "metric"),
-        ]);
+      if ((isUuidLike(candidateTraceId) && !isXrayTraceIdLike(candidateTraceId)) || !isXrayTraceIdLike(candidateTraceId)) {
+        // Show the red-border visual error on the field instead of a chat message.
+        setTraceIdInvalid(isUuidLike(candidateTraceId) ? "uuid" : "invalid");
         return;
       }
     }
@@ -955,15 +946,37 @@ function App({ signOut, user }) {
                       <span>X-Ray Trace ID</span>
                       <input
                         value={analystAnchors.xray_trace_id || ""}
-                        onChange={(e) =>
-                          setAnalystAnchors((prev) => ({
-                            ...prev,
-                            xray_trace_id: e.target.value.trim(),
-                          }))
-                        }
+                        className={traceIdInvalid ? "invalid" : ""}
+                        onChange={(e) => {
+                          const val = e.target.value.trim();
+                          setAnalystAnchors((prev) => ({ ...prev, xray_trace_id: val }));
+                          if (!val) {
+                            setTraceIdInvalid("");
+                          } else if (isUuidLike(val) && !isXrayTraceIdLike(val)) {
+                            setTraceIdInvalid("uuid");
+                          } else if (!isXrayTraceIdLike(val)) {
+                            setTraceIdInvalid("invalid");
+                          } else {
+                            setTraceIdInvalid("");
+                          }
+                        }}
                         placeholder={autoAnchors.xray_trace_id || "send a chat message to capture trace ID"}
                       />
-                      <small className="field-hint">Use an X-Ray trace ID, not a session ID.</small>
+                      {traceIdInvalid === "uuid" && (
+                        <small className="trace-id-invalid-hint">
+                          <span className="invalid-icon" aria-hidden="true">&#9888;</span>
+                          That looks like a session ID — paste an X-Ray trace ID instead.
+                        </small>
+                      )}
+                      {traceIdInvalid === "invalid" && (
+                        <small className="trace-id-invalid-hint">
+                          <span className="invalid-icon" aria-hidden="true">&#9888;</span>
+                          Invalid trace ID. Use 32-char hex or 1-xxxxxxxx-xxxxxxxxxxxxxxxxxxxxxxxx.
+                        </small>
+                      )}
+                      {!traceIdInvalid && (
+                        <small className="field-hint">Use an X-Ray trace ID, not a session ID.</small>
+                      )}
                     </label>
                   )}
                 </div>

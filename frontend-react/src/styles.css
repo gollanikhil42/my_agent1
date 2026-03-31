@@ -263,8 +263,8 @@ textarea {
   padding: 12px 8px 8px;
   display: grid;
   gap: 8px;
-  scrollbar-width: none;
-  -ms-overflow-style: none;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(170, 213, 255, 0.35) transparent;
 }
 
 .left-menu.collapsed .left-menu-scroll > * {
@@ -273,9 +273,8 @@ textarea {
 
 .left-menu-scroll::-webkit-scrollbar,
 .messages::-webkit-scrollbar {
-  width: 0;
-  height: 0;
-  display: none;
+  width: 4px;
+  height: 4px;
 }
 
 .left-menu-scroll::-webkit-scrollbar-track,
@@ -285,8 +284,14 @@ textarea {
 
 .left-menu-scroll::-webkit-scrollbar-thumb,
 .messages::-webkit-scrollbar-thumb {
-  background: transparent;
+  background: rgba(170, 213, 255, 0.4);
+  border-radius: 4px;
   border: 0;
+}
+
+.left-menu-scroll::-webkit-scrollbar-thumb:hover,
+.messages::-webkit-scrollbar-thumb:hover {
+  background: rgba(170, 213, 255, 0.7);
 }
 
 .menu-suggestions {
@@ -368,6 +373,28 @@ textarea {
   flex: 1;
 }
 
+.trace-id-field input.invalid {
+  border-color: #e05252 !important;
+  box-shadow: 0 0 0 2px rgba(224, 82, 82, 0.28);
+  background: rgba(255, 235, 235, 0.92) !important;
+}
+
+.trace-id-invalid-hint {
+  display: flex;
+  align-items: flex-start;
+  gap: 4px;
+  font-size: 0.72rem;
+  line-height: 1.35;
+  color: #e05252;
+  font-weight: 500;
+}
+
+.invalid-icon {
+  font-size: 0.82rem;
+  flex-shrink: 0;
+  margin-top: 0.05em;
+}
+
 .chat-feed {
   width: 100%;
   flex: 1 1 auto;
@@ -384,8 +411,8 @@ textarea {
   align-content: start;
   gap: 12px;
   padding: 8px 4px 4px;
-  scrollbar-width: none;
-  -ms-overflow-style: none;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(170, 213, 255, 0.45) transparent;
 }
 
 .message {
