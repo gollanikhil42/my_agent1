@@ -44,7 +44,7 @@ DIAGNOSIS_MODEL_ID = os.environ.get("DIAGNOSIS_MODEL_ID", "")
 DIAGNOSIS_SESSION_MAX_TOKENS = int(os.environ.get("DIAGNOSIS_SESSION_MAX_TOKENS", "1000"))
 DIAGNOSIS_PROMPT_UPGRADE_MAX_TOKENS = int(os.environ.get("DIAGNOSIS_PROMPT_UPGRADE_MAX_TOKENS", "920"))
 DIAGNOSIS_FLEET_SUMMARY_MAX_TOKENS = int(os.environ.get("DIAGNOSIS_FLEET_SUMMARY_MAX_TOKENS", "2000"))
-DIAGNOSIS_FLEET_DISCOVERY_MAX_TOKENS = int(os.environ.get("DIAGNOSIS_FLEET_DISCOVERY_MAX_TOKENS", "5000"))
+DIAGNOSIS_FLEET_DISCOVERY_MAX_TOKENS = int(os.environ.get("DIAGNOSIS_FLEET_DISCOVERY_MAX_TOKENS", "3000"))
 DIAGNOSIS_TRACE_LOOKUP_MAX_TOKENS = int(os.environ.get("DIAGNOSIS_TRACE_LOOKUP_MAX_TOKENS", "1000"))
 DIAGNOSIS_FLEET_DEEP_DIVE_MAX_TOKENS = int(os.environ.get("DIAGNOSIS_FLEET_DEEP_DIVE_MAX_TOKENS", "1400"))
 DIAGNOSIS_SESSION_DEEP_DIVE_MAX_TOKENS = int(os.environ.get("DIAGNOSIS_SESSION_DEEP_DIVE_MAX_TOKENS", "1400"))
@@ -3663,9 +3663,9 @@ def _handle_fleet_insights(
         # For enumeration/count/superset-sensitive queries, favor broader collection
         # across all windows so longer lookbacks are less likely to drop entities.
         # Budget capped at 7s (parallel max, not sum) to always leave ≥14s for LLM.
-        runtime_limit = max(runtime_limit, 8000)
-        runtime_max_candidate_streams = max(runtime_max_candidate_streams, 8000)
-        runtime_fixed_stream_pages = max(runtime_fixed_stream_pages, 100)
+        runtime_limit = max(runtime_limit, 4000)
+        runtime_max_candidate_streams = max(runtime_max_candidate_streams, 4000)
+        runtime_fixed_stream_pages = max(runtime_fixed_stream_pages, 50)
         runtime_budget_seconds = max(runtime_budget_seconds, 7.0)
         evaluator_max_groups = max(evaluator_max_groups, min(20, FLEET_EVALUATOR_MAX_GROUPS * 2))
         evaluator_per_group_limit = max(evaluator_per_group_limit, 400)
@@ -4654,7 +4654,7 @@ def _handle_fleet_insights(
         llm_builder = _build_session_deep_dive_diagnosis
         llm_builder_args = (question, llm_context, analyst_memory)
     else:
-        discovery_primary_tokens = min(DIAGNOSIS_FLEET_DISCOVERY_MAX_TOKENS, 900)
+        discovery_primary_tokens = min(DIAGNOSIS_FLEET_DISCOVERY_MAX_TOKENS, 450)
         llm_builder = _build_discovery_diagnosis
         llm_builder_args = (question, llm_context, analyst_memory, discovery_primary_tokens)
 
@@ -4674,7 +4674,7 @@ def _handle_fleet_insights(
 
     try:
         if (not _is_trace_lookup) and (not _is_deep_dive):
-            first_attempt_timeout = min(llm_timeout_seconds, 20.0)
+            first_attempt_timeout = min(llm_timeout_seconds, 15.0)
         else:
             first_attempt_timeout = llm_timeout_seconds
         raw_answer = _run_llm_attempt(llm_builder, llm_builder_args, first_attempt_timeout)
@@ -4689,7 +4689,7 @@ def _handle_fleet_insights(
             elapsed_so_far = time.perf_counter() - handler_start
             retry_budget = max(0.0, 28.2 - elapsed_so_far)
             if retry_budget >= 4.0:
-                retry_tokens = min(DIAGNOSIS_FLEET_DISCOVERY_MAX_TOKENS, 600)
+                retry_tokens = min(DIAGNOSIS_FLEET_DISCOVERY_MAX_TOKENS, 300)
                 _emit_analyzer_trace({
                     "phase": "llm_retry_start",
                     "analysis_id": analysis_id,
