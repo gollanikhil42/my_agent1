@@ -122,7 +122,6 @@ npm run build
 For detailed information, see the [docs/](docs/) directory:
 
 - **[docs/WORKFLOW.md](docs/WORKFLOW.md)** - Detailed workflow, modes, and architecture
-- **[docs/KT_DEMO_SCRIPT.md](docs/KT_DEMO_SCRIPT.md)** - Demo script for knowledge transfer
 - **[docs/DEPLOYMENT_GUIDE.md](docs/DEPLOYMENT_GUIDE.md)** - Deployment instructions
 - **[docs/STRUCTURE.md](docs/STRUCTURE.md)** - Project structure and organization
 - **[docs/ANALYSER_PROMPTS.md](docs/ANALYSER_PROMPTS.md)** - Analyzer prompt templates
