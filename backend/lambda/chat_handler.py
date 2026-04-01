@@ -669,6 +669,58 @@ def _classify_fleet_request_llm(question: str, analyst_memory: Any = None) -> Di
     return {"intent": "telemetry_analysis", "strategy": "balanced", "intent_type": "analysis"}
 
 
+def _detect_timeframe_change_llm(question: str, current_timeframe_hours: float, analyst_memory: Any = None) -> float:
+    """
+    Detects if user wants to change the timeframe and returns the new timeframe in hours.
+    Uses LLM to understand natural language timeframe expressions.
+    
+    Returns the new timeframe in hours, or the current timeframe if no change is requested.
+    """
+    q = str(question or "").strip()
+    if not q:
+        return current_timeframe_hours
+
+    system_prompt = (
+        "Analyze the user message to detect if they want to change the analysis timeframe. "
+        "Return ONLY JSON with one key:\n"
+        "  new_hours: null (if no timeframe change requested) OR a number (hours to analyze)\n"
+        "Examples:\n"
+        "  'change to 5 days' → 120\n"
+        "  'switch to 3 hours' → 3\n"
+        "  'last 2 weeks' → 336\n"
+        "  'today' → 24\n"
+        "  'last month' → 720\n"
+        "  'analyze the last 30 minutes' → 0.5\n"
+        "  'what about errors in general?' → null (no timeframe change)\n"
+        f"Current timeframe: {int(current_timeframe_hours)} hours"
+    )
+    memory_block = _format_analyst_memory(analyst_memory)
+    user_content = "".join(
+        [
+            f"Recent conversation:\n{memory_block}\n\n" if memory_block else "",
+            f"Message: {q}",
+        ]
+    )
+
+    try:
+        response = BEDROCK_CLIENT.converse(
+            modelId="anthropic.claude-3-haiku-20240307-v1:0",
+            system=[{"text": system_prompt}],
+            messages=[{"role": "user", "content": [{"text": user_content}]}],
+            inferenceConfig={"maxTokens": 50, "temperature": 0.0},
+        )
+        text = str(response["output"]["message"]["content"][0]["text"] or "").strip()
+        parsed = json.loads(text)
+        new_hours = parsed.get("new_hours")
+        if new_hours is not None:
+            # Clamp between 0.5 hours (30 min) and 8760 hours (1 year)
+            return max(0.5, min(8760, float(new_hours)))
+    except Exception:
+        pass
+
+    return current_timeframe_hours
+
+
 def _build_general_conversation_reply(question: str, analyst_memory: Any = None) -> str:
     system_prompt = (
         "You are a friendly assistant for an operations dashboard. "
@@ -1568,18 +1620,15 @@ def _build_diagnosis_fallback(merged: Dict[str, Any], error: str) -> str:
 def _build_diagnosis(question: str, merged: Dict[str, Any], analyst_memory: Any = None) -> str:
     system_prompt = (
         "You are a session log analyst for an AWS Bedrock AgentCore application. "
-        "You have access to structured diagnostics data for a single agent session, "
-        "including runtime metadata, granular X-Ray trace step timings (segments/subsegments), "
-        "and evaluator quality metric scores. "
-        "Answer the user's question with a technical yet readable focus. "
-        "Provide a granular, step-by-step breakdown of the X-Ray subsegments if they are present in the diagnostics. "
-        "Identify exact bottlenecks (e.g. S3 GetObject, Bedrock ConverseStream, log creation latency). "
+        "Answer in simple, non-technical language first, while keeping the key facts accurate. "
+        "Keep the response short: at most 3 short paragraphs. "
+        "Start with the plain-English takeaway, then mention the main bottleneck, latency, and whether errors or delays happened. "
+        "Only describe detailed X-Ray subsegments if the user explicitly asks for a deep technical breakdown. "
+        "If model_invocation prompt/answer excerpts are present, briefly summarize what the user asked and what the model replied. "
         "FORMATTING RULES: Plain text only. No emojis, no markdown, no tables, no bullet points. "
-        "Short paragraphs and professional tone. Prefer 3-5 short paragraphs. "
-        "Format numbers readably (e.g. '8.1 seconds' or '3.4 seconds'). "
-        "Do not mention request IDs, session IDs, trace IDs, or internal anchor values unless user explicitly asks. "
-        "If you mention any identifier, always print the full value exactly as provided. Never shorten or abbreviate it. "
-        "Do not fabricate values."
+        "Use readable wording such as 'slow', 'healthy', 'delayed', 'error-free'. "
+        "Do not mention request IDs, session IDs, trace IDs, or internal anchors unless the user explicitly asks. "
+        "If you mention an identifier, print the full value exactly as provided. Do not fabricate values."
     )
 
     llm_context = _build_llm_analysis_context(merged, max_diag_traces=12)
@@ -1614,13 +1663,50 @@ def _to_float(value: Any) -> float:
         return 0.0
 
 
-def _resolve_lookback_hours(body: Dict[str, Any], default_hours: int = 24) -> int:
+def _resolve_lookback_hours(body: Dict[str, Any], default_hours: int = 24) -> float:
     lookback_mode = str(body.get("lookback_mode", "")).strip().lower()
     lookback_raw = body.get("lookback_hours", default_hours)
+    lookback_value = str(body.get("lookback_value", "")).strip()
+    lookback_unit = str(body.get("lookback_unit", "")).strip().lower()
     max_hours = max(1, int(MAX_ANALYSIS_LOOKBACK_HOURS))
 
     if lookback_mode == "overall" or str(lookback_raw).strip().lower() == "overall":
         return min(max(1, OVERALL_LOOKBACK_HOURS), max_hours)
+
+    if lookback_unit == "overall":
+        return min(max(1, OVERALL_LOOKBACK_HOURS), max_hours)
+
+    if lookback_value and lookback_unit:
+        explicit_text = f"{lookback_value}{lookback_unit}"
+        unit_match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*(m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days|w|week|weeks)\s*", explicit_text)
+        if unit_match:
+            amount = float(unit_match.group(1))
+            unit = unit_match.group(2)
+            if unit in {"m", "min", "mins", "minute", "minutes"}:
+                hours = max(1.0 / 60.0, amount / 60.0)
+            elif unit in {"h", "hr", "hrs", "hour", "hours"}:
+                hours = max(1.0 / 60.0, amount)
+            elif unit in {"d", "day", "days"}:
+                hours = max(1.0 / 60.0, amount * 24.0)
+            else:
+                hours = max(1.0 / 60.0, amount * 24.0 * 7.0)
+            return min(hours, float(max_hours))
+
+    raw_text = str(lookback_raw).strip().lower()
+    if raw_text:
+        unit_match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*(m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days|w|week|weeks)\s*", raw_text)
+        if unit_match:
+            amount = float(unit_match.group(1))
+            unit = unit_match.group(2)
+            if unit in {"m", "min", "mins", "minute", "minutes"}:
+                hours = max(1.0 / 60.0, amount / 60.0)
+            elif unit in {"h", "hr", "hrs", "hour", "hours"}:
+                hours = max(1.0 / 60.0, amount)
+            elif unit in {"d", "day", "days"}:
+                hours = max(1.0 / 60.0, amount * 24.0)
+            else:
+                hours = max(1.0 / 60.0, amount * 24.0 * 7.0)
+            return min(hours, float(max_hours))
 
     try:
         return min(max(1, int(lookback_raw)), max_hours)
@@ -2286,13 +2372,14 @@ def _build_fleet_summary_with_llm(question: str, merged: Dict[str, Any]) -> str:
         "You are a session log analyst for an AWS Bedrock AgentCore system. "
         "Answer the user's question using ONLY the provided diagnostics payload. "
         "Plain text only: no emojis, no tables, no markdown, no bullet points. "
+        "Keep the answer short, crisp, and easy for non-technical users to read. "
         "Professional and minimal tone. Round latencies to nearest 100ms. "
         "If the user asks to list traces or trace IDs, use trace_index as the source of truth and preserve the exact order. "
         "Keep responses transport-safe: if a response may exceed about 1200 tokens, prioritize concise output and explicitly state truncation. "
         "For very long trace lists, return the first 150 trace IDs in order, then state exactly how many were omitted. "
         "If delayed traces are requested: list each on a new line as 'Trace [id], Latency [time]ms, Runtime [time]ms'. "
         "Do NOT enumerate or list out every individual session ID or trace ID in your response unless explicitly asked. "
-        "Provide a high-level summary of aggregated metrics, overall fleet health, and only highlight anomalous or delayed traces. "
+        "Provide a high-level summary of overall fleet health and only highlight the most important issues. "
         "If no traces meet the filter, say so clearly, then offer the top anomalies. "
         f"Dataset has {traces_total} total traces."
     )
@@ -2429,9 +2516,13 @@ def _build_discovery_diagnosis(
 
 def _build_trace_lookup_diagnosis(question: str, merged: Dict[str, Any], analyst_memory: Any = None) -> str:
     system_prompt = (
-        "Analyze matched traces. Answer in 3-5 short paragraphs. "
-        "Provide a granular, step-by-step breakdown of the X-Ray subsegments and timings. "
-        "Identify exactly which sub-step (e.g. Bedrock ConverseStream, S3 GetObject, log creation) dominated the latency. "
+        "Analyze matched traces. Answer in at most 3 short paragraphs. "
+        "Make it easy for a non-technical user to understand. "
+        "Start with: what the trace was doing, how long it took, and whether that is normal or slow. "
+        "Then mention the main bottleneck and whether there were errors or delays. "
+        "Only give a detailed X-Ray step-by-step breakdown if the user explicitly asks for technical details. "
+        "If model_invocation prompt/answer excerpts exist, briefly say what the user asked and what the model responded. "
+        "Identify the main slow step when possible, for example BedrockRuntime, S3, or logging. "
         "If evaluator_scores exist for a matched trace, report those scores and do not claim they are missing. "
         "Include trace timestamp/date in UTC whenever available. "
         "Use full phrases 'average latency' and 'maximum latency' instead of avg/max. "
@@ -3334,9 +3425,11 @@ def _build_deep_dive_context(merged: Dict[str, Any], session_id: str) -> Dict[st
 
 def _build_session_deep_dive_diagnosis(question: str, merged: Dict[str, Any], analyst_memory: Any = None) -> str:
     system_prompt = (
-        "Analyze this session in detail. Answer in 3-5 short paragraphs. Plain text. "
-        "Provide a granular, step-by-step breakdown of the X-Ray subsegments and timings. "
-        "Highlight exactly which sub-step dominated the latency. "
+        "Analyze this session in detail. Answer in at most 3 short paragraphs. Plain text. "
+        "Keep it understandable for non-technical users while preserving the key facts. "
+        "Start with the main takeaway, then mention the main bottleneck, delays/errors, and whether this session looks healthy or problematic. "
+        "Only provide a granular X-Ray subsegment breakdown if the user explicitly asks for technical detail. "
+        "If prompt/answer excerpts are present, briefly explain what the user asked and what the model replied. "
         "Include trace/session timestamp and date in UTC when available. "
         "Use full phrases 'average latency' and 'maximum latency' instead of avg/max."
     )
@@ -3417,6 +3510,12 @@ def _build_llm_analysis_context(merged: Dict[str, Any], max_diag_traces: int = 2
             "user": tr.get("user", {}),
             "evaluator_scores": _slim_eval(tr.get("evaluator_scores") or tr.get("evaluator_metrics") or {}),
             "xray": _slim_xray(tr.get("xray") or {}),
+            "model_invocation": {
+                "prompt_excerpt": _truncate_text(((tr.get("model_invocation") or {}).get("prompt_excerpt", "")), 180),
+                "answer_excerpt": _truncate_text(((tr.get("model_invocation") or {}).get("answer_excerpt", "")), 180),
+                "model_id": str((tr.get("model_invocation") or {}).get("model_id", "")),
+            },
+            "tool_trace": tr.get("tool_trace", {}),
         }
 
     # Sessions: keep ALL session IDs + ALL trace IDs, lightweight per-trace refs
@@ -4779,6 +4878,11 @@ def _build_trace_payload(runtime_record: Dict[str, Any], otel_session_id: str = 
 
 
 def _handle_session_insights(event: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Analysis handler - always uses fleet mode for aggregated multi-session analysis.
+    Supports dynamic timeframe changes based on user intent understood by the LLM.
+    Single trace analysis is no longer supported; all analysis uses fleet window aggregation.
+    """
     request_start = time.perf_counter()
     analysis_id = str(uuid.uuid4())[:8]
     
@@ -4792,15 +4896,10 @@ def _handle_session_insights(event: Dict[str, Any]) -> Dict[str, Any]:
         }
 
     question = str(body.get("question", "")).strip()
-    request_id = str(body.get("request_id", "")).strip()
     header_session_id = _extract_session_id_header(event)
     session_id = header_session_id or str(body.get("session_id", "")).strip()
-    evaluator_session_id = str(body.get("evaluator_session_id", "")).strip()
-    xray_trace_id = str(body.get("xray_trace_id", "")).strip()
-    client_request_id = str(body.get("client_request_id", "")).strip()
     lookback_hours = _resolve_lookback_hours(body, default_hours=24)
     lookback_mode = str(body.get("lookback_mode", "")).strip().lower()
-    analysis_mode = str(body.get("analysis_mode", "single_trace")).strip().lower()
     analyst_memory = _normalize_analyst_memory(body.get("analyst_memory", []))
 
     # Extract pagination parameters for trace listing queries
@@ -4815,472 +4914,111 @@ def _handle_session_insights(event: Dict[str, Any]) -> Dict[str, Any]:
     # Clamp page_size between 5 and 50
     pagination_page_size = max(5, min(50, pagination_page_size))
 
-    if analysis_mode in {"fleet_1h", "all_traces_1h", "fleet", "fleet_window", "multi_session_window"}:
-        # Single merged Haiku call for both intent + strategy — halves pre-flight LLM latency.
-        fleet_classify = _classify_fleet_request_llm(question, analyst_memory)
-        if fleet_classify["intent"] == "general_conversation":
-            answer = _build_general_conversation_reply(question, analyst_memory)
-            return {
-                "statusCode": 200,
-                "headers": CORS_HEADERS,
-                "body": json.dumps(
-                    {
-                        "answer": _sanitize_analysis_answer(answer, traces_total=0),
-                        "merged": {
-                            "analysis_mode": "general_conversation",
-                            "note": "No telemetry data was collected for this conversational turn.",
-                        },
-                        "pagination": None,
-                        "sessions_pagination": None,
-                        "query_mode": "general_conversation",
-                        "auto_paginate_recommended": False,
-                        "auto_paginate_reason": "none",
-                        "anchors": {
-                            "request_id": "",
-                            "client_request_id": "",
-                            "session_id": "",
-                            "evaluator_session_id": "",
-                            "xray_trace_id": "",
-                        },
-                    }
-                ),
-            }
-
-        # Fleet mode ignores anchors and aggregates all traces in the requested timeframe.
-        fleet_hours = _resolve_lookback_hours(body, default_hours=1)
-        query_profile = fleet_classify["strategy"]
-        try:
-            result = _handle_fleet_insights(
-                question=question, 
-                lookback_hours=fleet_hours, 
-                lookback_mode=lookback_mode,
-                page=pagination_page,
-                page_size=pagination_page_size,
-                analyst_memory=analyst_memory,
-                query_profile=query_profile,
-                intent_type=fleet_classify.get("intent_type", "analysis"),
-            )
-            elapsed = round(time.perf_counter() - request_start, 2)
-            # Log successful completion
-            _emit_analyzer_trace({
-                "phase": "request_complete",
-                "analysis_id": analysis_id,
-                "session_id": session_id,
-                "total_elapsed_seconds": elapsed,
-                "status": "success",
-            })
-            return result
-        except TimeoutError as exc:
-            elapsed = round(time.perf_counter() - request_start, 2)
-            error_msg = f"Fleet analysis timed out after {elapsed}s. LLM generation phase exceeded the internal response budget."
-            _emit_analyzer_trace({
-                "phase": "request_timeout",
-                "analysis_id": analysis_id,
-                "session_id": session_id,
-                "elapsed_seconds": elapsed,
-                "error": error_msg,
-                "question_excerpt": question[:120] if question else "",
-                "lookback_hours": fleet_hours,
-            })
-            return {
-                "statusCode": 504,
-                "headers": CORS_HEADERS,
-                "body": json.dumps({
-                    "error": error_msg,
-                    "debug_info": {
-                        "analysis_id": analysis_id,
-                        "elapsed_seconds": elapsed,
-                        "reason": "Request exceeded API Gateway timeout limit (~29s). LLM generation for large trace lists can take 30-70 seconds.",
-                        "suggestion": "Please try: (1) Shorter time window (48h instead of 168h), (2) Fewer traces in result, or (3) Wait for system optimization",
-                    }
-                }),
-            }
-        except Exception as exc:
-            elapsed = round(time.perf_counter() - request_start, 2)
-            error_msg = str(exc)
-            _emit_analyzer_trace({
-                "phase": "request_error",
-                "analysis_id": analysis_id,
-                "session_id": session_id,
-                "elapsed_seconds": elapsed,
-                "error": error_msg,
-                "error_type": type(exc).__name__,
-                "question_excerpt": question[:120] if question else "",
-            })
-            return {
-                "statusCode": 500,
-                "headers": CORS_HEADERS,
-                "body": json.dumps({
-                    "error": f"Fleet analysis failed: {error_msg}",
-                    "debug_info": {
-                        "analysis_id": analysis_id,
-                        "elapsed_seconds": elapsed,
-                        "error_type": type(exc).__name__,
-                    }
-                }),
-            }
-
-    # Validate: if xray_trace_id looks like a session UUID, reject early with a helpful message.
-    # X-Ray trace IDs have format: 1-HHHHHHHH-HHHHHHHHHHHHHHHHHHHHHHHH
-    # Session IDs are plain UUIDs: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
-    if xray_trace_id and _is_uuid(xray_trace_id):
-        return {
-            "statusCode": 400,
-            "headers": CORS_HEADERS,
-            "body": json.dumps({
-                "error": (
-                    f"The value '{xray_trace_id}' looks like a session ID, not an X-Ray trace ID. "
-                    "X-Ray trace IDs have the format: 1-HHHHHHHH-HHHHHHHHHHHHHHHHHHHHHHHH. "
-                    "To analyze a specific session, switch to Fleet Window mode and ask about that session ID."
-                ),
-                "hint": "session_id_in_trace_field",
-            }),
-        }
-
-    terms = {
-        "request_id": request_id,
-        "session_id": session_id,
-        "evaluator_session_id": evaluator_session_id,
-        "xray_trace_id": xray_trace_id,
-        "client_request_id": client_request_id,
-    }
-    if not any(terms.values()):
-        return {
-            "statusCode": 400,
-            "headers": CORS_HEADERS,
-            "body": json.dumps({"error": "Provide at least one of request_id, session_id, evaluator_session_id, xray_trace_id, client_request_id"}),
-        }
-
-    # Intent gate for single-trace mode: route general conversation before any I/O.
-    # This prevents prompt injection from triggering a full trace analysis.
-    _single_intent = _classify_question_intent_llm(question, analyst_memory)
-    if _single_intent == "general_conversation":
-        answer = _build_general_conversation_reply(question, analyst_memory)
-        return {
-            "statusCode": 200,
-            "headers": CORS_HEADERS,
-            "body": json.dumps({
-                "answer": _sanitize_analysis_answer(answer, traces_total=0),
-                "merged": {
-                    "analysis_mode": "general_conversation",
-                    "note": "No telemetry data was collected for this conversational turn.",
-                },
-                "pagination": None,
-                "sessions_pagination": None,
-                "query_mode": "general_conversation",
-                "auto_paginate_recommended": False,
-                "auto_paginate_reason": "none",
-                "anchors": {
-                    "request_id": request_id,
-                    "client_request_id": client_request_id,
-                    "session_id": session_id,
-                    "evaluator_session_id": evaluator_session_id,
-                    "xray_trace_id": xray_trace_id,
-                },
-            }),
-        }
-
-    trace_start = time.perf_counter()
-    trace_analysis_id = str(uuid.uuid4())[:8]
+    # Fleet mode: always aggregate all traces in the requested timeframe.
+    # The LLM understands user intent and can suggest timeframe changes mid-conversation.
+    # Classify user intent and strategy using LLM
+    fleet_classify = _classify_fleet_request_llm(question, analyst_memory)
     
-    try:
-        # Trace-first correlation: use xray_trace_id as the primary key whenever available.
-        runtime_terms: Dict[str, str] = {}
-        if xray_trace_id:
-            runtime_terms["xray_trace_id"] = xray_trace_id
-        else:
-            runtime_terms = {
-                "request_id": request_id,
-                "client_request_id": client_request_id,
-            }
-            if not any(runtime_terms.values()):
-                runtime_terms["session_id"] = session_id
-
-        runtime_groups = _resolve_runtime_log_groups()
-        # Explicit single-trace lookups: use a 7-day floor so old traces are always reachable.
-        lookup_lookback = min(max(lookback_hours or 1, 168), MAX_ANALYSIS_LOOKBACK_HOURS)
-
-        # ── Parallel I/O ─────────────────────────────────────────────────
-        # The evaluator window scan and X-Ray fetch are independent of the runtime log fetch.
-        # Run them concurrently so total data-collection time = max(each) instead of sum(each).
-        _parallel_executor = ThreadPoolExecutor(max_workers=4)
-        _eval_future = _parallel_executor.submit(
-            _fetch_evaluator_records_window,
-            lookback_hours=lookup_lookback,
-            max_groups=5,
-            per_group_limit=500,
-            max_seconds=6.0,  # tighter cap: frees more budget for the LLM
-        )
-        # X-Ray can start now if we already have the trace ID; re-fetched below if ID changes.
-        _xray_future = (
-            _parallel_executor.submit(
-                lambda tid: _summarize_xray(_denormalize_trace_id(tid)), xray_trace_id
-            )
-            if xray_trace_id else None
-        )
-
-        # Runtime log fetch (sequential per group — usually just one group)
-        runtime_records = []
-        for group in runtime_groups:
-            runtime_events = _fetch_log_events(group, runtime_terms, lookback_hours=lookup_lookback, limit=50)
-            for re in runtime_events:
-                p = _json_from_log_message(re.get("message", ""))
-                if p and _is_runtime_trace_payload(p) and _record_matches_terms(p, re.get("message", ""), runtime_terms):
-                    p["_cloudwatch_timestamp"] = re.get("timestamp")
-                    p["_source_stream"] = re.get("@logStream", "")
-                    runtime_records.append(p)
-
-        runtime_records.sort(key=lambda row: row.get("_cloudwatch_timestamp", 0), reverse=True)
-        latest_runtime = runtime_records[0] if runtime_records else {}
-
-        # Update IDs from the freshly fetched runtime record.
-        if latest_runtime:
-            request_id = str(latest_runtime.get("request_id", request_id))
-            if not session_id:
-                session_id = str(latest_runtime.get("session_id", session_id))
-            updated_trace_id = str(latest_runtime.get("xray_trace_id", xray_trace_id))
-            if updated_trace_id and updated_trace_id != xray_trace_id:
-                # Runtime gave us a better/corrected trace ID — re-fetch X-Ray with the new one.
-                xray_trace_id = updated_trace_id
-                _xray_future = _parallel_executor.submit(
-                    lambda tid: _summarize_xray(_denormalize_trace_id(tid)), xray_trace_id
-                )
-            client_request_id = str(latest_runtime.get("client_request_id", client_request_id))
-
-        # ── Collect parallel results ──────────────────────────────────────
-        eval_budget_left = max(1.0, 20.0 - (time.perf_counter() - trace_start))
-        try:
-            eval_window = _eval_future.result(timeout=eval_budget_left)
-        except Exception:
-            eval_window = {"records": [], "groups_used": []}
-
-        xray_summary = {}
-        xray_error = ""
-        if _xray_future is not None:
-            xray_budget_left = max(1.0, 22.0 - (time.perf_counter() - trace_start))
-            try:
-                xray_summary = _xray_future.result(timeout=xray_budget_left)
-            except Exception as exc:
-                xray_error = str(exc)
-                xray_summary = {"trace_id": xray_trace_id, "steps": [], "totals_by_name": {}, "error": str(exc)}
-        elif xray_trace_id:
-            # xray_trace_id was not known at start; fetch now.
-            try:
-                xray_summary = _summarize_xray(_denormalize_trace_id(xray_trace_id))
-            except Exception as exc:
-                xray_error = str(exc)
-                xray_summary = {"trace_id": xray_trace_id, "steps": [], "totals_by_name": {}, "error": str(exc)}
-
-        _parallel_executor.shutdown(wait=False, cancel_futures=True)
-
-        # ── Process evaluator records ─────────────────────────────────────
-        evaluator_records = []
-        evaluations: Dict[str, Dict[str, Any]] = {}
-        evaluator_session_candidates = []
-        evaluator_groups_used = list(eval_window.get("groups_used", []))
-        runtime_session_id = str(latest_runtime.get("session_id", "")).strip() if latest_runtime else ""
-
-        def _add_evaluator_session_candidate(value: str) -> None:
-            v = str(value or "").strip()
-            if v and v not in evaluator_session_candidates:
-                evaluator_session_candidates.append(v)
-
-        target_trace_normalized = _normalize_trace_id(xray_trace_id) if xray_trace_id else ""
-        target_trace_denorm = _denormalize_trace_id(xray_trace_id) if xray_trace_id else ""
-        for rec in eval_window.get("records", []):
-            anchors = _extract_record_anchors(rec)
-            rec_trace_id = _normalize_trace_id(str(anchors.get("xray_trace_id", "")))
-            rec_session_id = str(anchors.get("session_id", "")).strip()
-            raw_message = str(rec.get("_cloudwatch_message", ""))
-
-            trace_match = bool(
-                target_trace_normalized and (
-                    rec_trace_id == target_trace_normalized
-                    # Evaluator logs often embed the trace ID only in the raw log text,
-                    # not in structured OTEL fields — check both compact and X-Ray formats.
-                    or (target_trace_normalized and target_trace_normalized in _normalize_trace_id(raw_message))
-                    or (target_trace_denorm and target_trace_denorm in raw_message)
-                )
-            )
-            session_match = bool(
-                rec_session_id and (
-                    rec_session_id == str(evaluator_session_id or "").strip()
-                    or rec_session_id == str(session_id or "").strip()
-                )
-            )
-
-            if trace_match or session_match:
-                evaluator_records.append(rec)
-                _collect_evaluations(rec, evaluations)
-                for sid in _extract_session_ids_deep(rec):
-                    _add_evaluator_session_candidate(sid)
-                for sid in _extract_session_ids_from_message(rec.get("_cloudwatch_message", "")):
-                    _add_evaluator_session_candidate(sid)
-
-        # otel_session_id is only for anchor echo-back; not worth a 4-6s sequential CW Insights
-        # call that eats directly into the LLM budget — derive from evaluator candidates instead.
-        otel_session_id = ""
-
-        # Prefer evaluator/OTEL session.id for anchor echo-back when available.
-        evaluator_session_id = ""
-        for value in evaluator_session_candidates:
-            if value and value != runtime_session_id:
-                evaluator_session_id = value
-                break
-        if not evaluator_session_id:
-            for value in evaluator_session_candidates:
-                if value:
-                    evaluator_session_id = value
-                    break
-
-        xray_error = xray_summary.get("error", "")
-
-        # If xray_trace_id was explicitly provided but X-Ray and runtime logs found nothing, return 404.
-        # Evaluator records are fetched by time-window and are NOT anchored to the specific trace ID,
-        # so their presence does not confirm the trace exists — exclude them from this check.
-        if xray_trace_id and not runtime_records and xray_error == "trace_not_found":
-            return {
-                "statusCode": 404,
-                "headers": CORS_HEADERS,
-                "body": json.dumps({
-                    "error": (
-                        f"Trace not found. The X-Ray trace ID '{xray_trace_id}' was not found in X-Ray "
-                        "or runtime logs. Please verify the trace ID is correct. "
-                        "Note: X-Ray traces are retained for 30 days."
-                    ),
-                    "hint": "trace_not_found",
-                }),
-            }
-
-        request = {
-            "prompt": latest_runtime.get("request_payload", {}).get("prompt", ""),
-            "answer": latest_runtime.get("response_payload", {}).get("answer", ""),
-            "latency_ms": latest_runtime.get("metrics", {}).get("latency_ms") or xray_summary.get("total_latency_ms"),
-            "tokens": {
-                "input": latest_runtime.get("metrics", {}).get("input_tokens"),
-                "output": latest_runtime.get("metrics", {}).get("output_tokens"),
-                "total": latest_runtime.get("metrics", {}).get("total_tokens"),
-            },
-            "request_id": request_id,
-            "client_request_id": client_request_id,
-            "session_id": session_id,
-            "evaluator_session_id": otel_session_id or evaluator_session_id,
-            "trace_id": xray_trace_id,
-            "tools_used": latest_runtime.get("metrics", {}).get("tools_used", []),
-            "status": latest_runtime.get("response_payload", {}).get("status", ""),
-            "error": latest_runtime.get("response_payload", {}).get("error", ""),
-            # ── User identity ─────────────────────────────────────────────
-            "user": {
-                "user_id":    str(latest_runtime.get("user_id", "")),
-                "user_name":  str(latest_runtime.get("user_name", "")),
-                "user_email": str(latest_runtime.get("user_email", "")),
-                "name":       str(latest_runtime.get("name", "")),
-                "department": str(latest_runtime.get("department", "")),
-                "user_role":  str(latest_runtime.get("user_role", "")),
-                "auth_type":  str(latest_runtime.get("auth_type", "")),
-            },
-            # ── Model invocation detail ───────────────────────────────────
-            "model_invocation": {
-                "model_id": str(
-                    latest_runtime.get("model_id")
-                    or latest_runtime.get("request_payload", {}).get("model_id")
-                    or ""
-                ),
-                "max_tokens": latest_runtime.get("request_payload", {}).get("max_tokens"),
-                "temperature": latest_runtime.get("request_payload", {}).get("temperature"),
-                "retrieval_evidence": latest_runtime.get("request_payload", {}).get("retrieval_evidence") or {},
-                "jwt_present": latest_runtime.get("request_payload", {}).get("jwt_present"),
-            },
-        }
-
-        merged = {
-            "analysis_mode": "single_trace",
-            "request": request,
-            "evaluations": evaluations,
-            "xray": xray_summary,
-            "runtime_records_found": len(runtime_records),
-            "evaluator_records_found": len(evaluator_records),
-            "evaluator_groups_used": evaluator_groups_used,
-            "xray_error": xray_error,
-        }
-
-        # Emit pre-model trace
-        pre_model_elapsed = round(time.perf_counter() - trace_start, 2)
-        _emit_analyzer_trace({
-            "phase": "trace_data_collection_complete",
-            "analysis_id": trace_analysis_id,
-            "elapsed_seconds": pre_model_elapsed,
-            "runtime_records": len(runtime_records),
-            "evaluator_records": len(evaluator_records),
-        })
-        
-        # Invoke LLM to generate analysis — hard-cap at 22s so we never blow the API GW timeout.
-        llm_start = time.perf_counter()
-        pre_llm_elapsed = round(time.perf_counter() - trace_start, 2)
-        llm_hard_timeout = max(4.0, 28.0 - pre_llm_elapsed)
-        _llm_executor = ThreadPoolExecutor(max_workers=1)
-        try:
-            _llm_future = _llm_executor.submit(_build_diagnosis, question, merged, analyst_memory)
-            try:
-                raw_llm = _llm_future.result(timeout=llm_hard_timeout)
-            except FutureTimeoutError:
-                _llm_future.cancel()
-                raw_llm = "[Analysis timed out. Data collection completed but LLM response exceeded the time budget. Try asking again.]"
-        finally:
-            _llm_executor.shutdown(wait=False, cancel_futures=True)
-        answer = _sanitize_analysis_answer(raw_llm, traces_total=0)
-        llm_elapsed = round(time.perf_counter() - llm_start, 2)
-        total_elapsed = round(time.perf_counter() - trace_start, 2)
-        
-        # Emit completion trace
-        _emit_analyzer_trace({
-            "phase": "trace_analysis_complete",
-            "analysis_id": trace_analysis_id,
-            "total_elapsed_seconds": total_elapsed,
-            "llm_elapsed_seconds": llm_elapsed,
-            "data_collection_seconds": pre_model_elapsed,
-        })
-        
+    if fleet_classify["intent"] == "general_conversation":
+        answer = _build_general_conversation_reply(question, analyst_memory)
         return {
             "statusCode": 200,
             "headers": CORS_HEADERS,
             "body": json.dumps(
                 {
-                    "answer": answer,
-                    "merged": merged,
-                    "anchors": {
-                        "request_id": request_id,
-                        "client_request_id": client_request_id,
-                        "session_id": session_id,
-                        "evaluator_session_id": otel_session_id or evaluator_session_id,
-                        "xray_trace_id": xray_trace_id,
+                    "answer": _sanitize_analysis_answer(answer, traces_total=0),
+                    "merged": {
+                        "analysis_mode": "general_conversation",
+                        "note": "No telemetry data was collected for this conversational turn.",
                     },
-                    "debug_info": {
-                        "analysis_id": trace_analysis_id,
-                        "total_elapsed_seconds": total_elapsed,
-                        "llm_generation_seconds": llm_elapsed,
-                        "data_collection_seconds": pre_model_elapsed,
+                    "pagination": None,
+                    "sessions_pagination": None,
+                    "query_mode": "general_conversation",
+                    "auto_paginate_recommended": False,
+                    "auto_paginate_reason": "none",
+                    "anchors": {
+                        "request_id": "",
+                        "client_request_id": "",
+                        "session_id": "",
+                        "evaluator_session_id": "",
+                        "xray_trace_id": "",
                     },
                 }
             ),
         }
+
+    # Detect if user wants to change the timeframe mid-conversation
+    # The LLM understands natural language like "switch to 5 days" or "analyze last 3 hours"
+    detected_timeframe_hours = _detect_timeframe_change_llm(question, lookback_hours, analyst_memory)
+    
+    # Fleet mode ignores anchors and aggregates all traces in the requested timeframe.
+    fleet_hours = detected_timeframe_hours
+    query_profile = fleet_classify["strategy"]
+    try:
+        result = _handle_fleet_insights(
+            question=question, 
+            lookback_hours=fleet_hours, 
+            lookback_mode=lookback_mode,
+            page=pagination_page,
+            page_size=pagination_page_size,
+            analyst_memory=analyst_memory,
+            query_profile=query_profile,
+            intent_type=fleet_classify.get("intent_type", "analysis"),
+        )
+        elapsed = round(time.perf_counter() - request_start, 2)
+        # Log successful completion
+        _emit_analyzer_trace({
+            "phase": "request_complete",
+            "analysis_id": analysis_id,
+            "session_id": session_id,
+            "total_elapsed_seconds": elapsed,
+            "status": "success",
+        })
+        return result
+    except TimeoutError as exc:
+        elapsed = round(time.perf_counter() - request_start, 2)
+        error_msg = f"Fleet analysis timed out after {elapsed}s. LLM generation phase exceeded the internal response budget."
+        _emit_analyzer_trace({
+            "phase": "request_timeout",
+            "analysis_id": analysis_id,
+            "session_id": session_id,
+            "elapsed_seconds": elapsed,
+            "error": error_msg,
+            "question_excerpt": question[:120] if question else "",
+            "lookback_hours": fleet_hours,
+        })
+        return {
+            "statusCode": 504,
+            "headers": CORS_HEADERS,
+            "body": json.dumps({
+                "error": error_msg,
+                "debug_info": {
+                    "analysis_id": analysis_id,
+                    "elapsed_seconds": elapsed,
+                    "reason": "Request exceeded API Gateway timeout limit (~29s). LLM generation for large trace lists can take 30-70 seconds.",
+                    "suggestion": "Please try: (1) Shorter time window (48h instead of 168h), (2) Fewer traces in result, or (3) Wait for system optimization",
+                }
+            }),
+        }
     except Exception as exc:
-        elapsed = round(time.perf_counter() - trace_start, 2)
+        elapsed = round(time.perf_counter() - request_start, 2)
         error_msg = str(exc)
         _emit_analyzer_trace({
-            "phase": "trace_analysis_error",
-            "analysis_id": trace_analysis_id,
+            "phase": "request_error",
+            "analysis_id": analysis_id,
+            "session_id": session_id,
             "elapsed_seconds": elapsed,
             "error": error_msg,
             "error_type": type(exc).__name__,
+            "question_excerpt": question[:120] if question else "",
         })
         return {
             "statusCode": 500,
             "headers": CORS_HEADERS,
             "body": json.dumps({
-                "error": f"Single-trace analysis failed: {error_msg}",
+                "error": f"Fleet analysis failed: {error_msg}",
                 "debug_info": {
-                    "analysis_id": trace_analysis_id,
+                    "analysis_id": analysis_id,
                     "elapsed_seconds": elapsed,
                     "error_type": type(exc).__name__,
                 }

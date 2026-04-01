@@ -1,0 +1,72 @@
+.suggestionsContainer {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  padding: 1rem 0;
+  width: 100%;
+}
+
+.suggestionsInline {
+  flex-direction: row;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  padding: 0.5rem 0;
+}
+
+.suggestionButton {
+  background-color: white;
+  border: 1px solid #d0d0d0;
+  border-radius: 0.5rem;
+  padding: 0.75rem 1rem;
+  font-size: 0.875rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.2s;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  min-height: 40px;
+}
+
+.suggestionButton:hover:not(:disabled) {
+  border-color: #0066cc;
+  background-color: #f0f7ff;
+  color: #0066cc;
+}
+
+.suggestionButton:active:not(:disabled) {
+  background-color: #e8f0fe;
+}
+
+.suggestionButton:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.suggestionIcon {
+  font-size: 1rem;
+}
+
+.suggestionText {
+  flex: 1;
+  text-align: left;
+}
+
+.inlineSuggestionButton {
+  padding: 0.5rem 0.75rem;
+  font-size: 0.8125rem;
+  min-height: 32px;
+}
+
+.emptyState {
+  text-align: center;
+  color: #999;
+  font-size: 0.875rem;
+  padding: 1rem;
+}
+
+@media (max-width: 640px) {
+  .suggestionsInline {
+    flex-direction: column;
+  }
+}

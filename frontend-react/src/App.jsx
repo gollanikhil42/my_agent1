@@ -1,5 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { fetchAuthSession, fetchUserAttributes } from "aws-amplify/auth";
+import { AnalyzerSetup } from "./components/AnalyzerSetup/AnalyzerSetup";
+import { Topbar } from "./components/Topbar/Topbar";
+import { HelpPanel } from "./components/HelpPanel/HelpPanel";
+import { MessageList } from "./components/MessageList/MessageList";
+import { Composer } from "./components/Composer/Composer";
 
 const SESSION_STORAGE_KEY = "session_id";
 
@@ -8,30 +13,21 @@ const ANALYSIS_MAX_RETRIES = 2;
 const ANALYST_MEMORY_LIMIT = 6;
 const RETRYABLE_STATUS = new Set([429, 502, 503]);
 const DEFAULT_FLEET_PAGE_SIZE = 20;
-const FLEET_SUGGESTIONS = [
-  "Give me a summary of all sessions in this time window and highlight any issues.",
-  "Which sessions are the slowest and what is causing the latency?",
-  "Which sessions had the most errors and what patterns do you see?",
-  "List all users and show their sessions along with any issues they faced.",
-  "Analyze the most problematic session in detail and explain what went wrong.",
-];
+const ANALYZER_HELP_DISMISSED_KEY = "analyzer_help_dismissed";
 
-const SINGLE_TRACE_SUGGESTIONS = [
-  "Break down the latency for this trace and identify the slowest sub-segment.",
-  "Check for any service errors, faults, or throttles in this X-Ray trace.",
-  "Are there any specific S3 or Bedrock sub-segments causing delays?",
-  "Show me the evaluator scores and quality metrics for this trace.",
-  "Provide a full technical summary of all X-Ray segments in this trace.",
-];
-const LOOKBACK_OPTIONS = [
-  { value: "1", label: "1 hour" },
-  { value: "6", label: "6 hours" },
-  { value: "12", label: "12 hours" },
-  ...Array.from({ length: 30 }, (_, idx) => {
-    const day = idx + 1;
-    return { value: String(day * 24), label: `${day} day${day === 1 ? "" : "s"}` };
-  }),
-  { value: "overall", label: "Overall" },
+const ANALYZER_HELP_SECTIONS = [
+  {
+    title: "Fleet Mode",
+    text: "All analysis uses fleet mode—we analyze patterns, summaries, and issues across many sessions in your selected timeframe.",
+  },
+  {
+    title: "Timeframes",
+    text: "You choose an initial timeframe (30m, 1h, 4h, 1d, or overall). You can change it anytime mid-conversation just by asking (e.g., 'switch to 5 days' or 'analyze last 3 hours').",
+  },
+  {
+    title: "What to ask",
+    text: "Ask about patterns, affected users, slow sessions, error distributions, bottlenecks, and what can be improved. The analyzer uses logs, evaluator data, and X-Ray traces to answer. Ask for suggestions when you need them—the model will provide examples.",
+  },
 ];
 
 function sleep(ms) {
@@ -89,44 +85,6 @@ function getOrCreateSessionId() {
   return created;
 }
 
-function isTraceListingQuestion(question) {
-  const text = String(question || "").trim().toLowerCase();
-  if (!text) {
-    return false;
-  }
-
-  return [
-    "list trace",
-    "show trace",
-    "all trace",
-    "trace id",
-    "traceid",
-    "trace ids",
-    "traceids",
-    "list out",
-    "list all trace",
-    "list all traces",
-    "enumerate trace",
-    "print trace",
-    "which trace",
-    "what trace",
-    "get all trace",
-    "retrieve trace",
-    "find trace",
-    "search trace",
-    "each trace",
-  ].some((keyword) => text.includes(keyword));
-}
-
-function isUuidLike(value) {
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(value || "").trim());
-}
-
-function isXrayTraceIdLike(value) {
-  const text = String(value || "").trim().toLowerCase();
-  return /^1-[0-9a-f]{8}-[0-9a-f]{24}$/.test(text) || /^[0-9a-f]{32}$/.test(text.replace(/-/g, ""));
-}
-
 function normalizeMessageText(input) {
   if (input && typeof input === "object") {
     if (typeof input.explanation === "string") {
@@ -176,7 +134,7 @@ function compactMessageForMemory(text, limit = 420) {
   return `${normalized.slice(0, limit).trim()}...`;
 }
 
-function buildAnalystMemory(logMessages, latestMerged, analystMode, anchors, totalFleetTraces) {
+function buildAnalystMemory(logMessages, latestMerged, anchors, totalFleetTraces) {
   const recentTurns = logMessages
     .filter((msg) => msg.role === "user" || msg.role === "assistant")
     .slice(-(ANALYST_MEMORY_LIMIT - 1))
@@ -186,7 +144,8 @@ function buildAnalystMemory(logMessages, latestMerged, analystMode, anchors, tot
     }));
 
   const contextLines = [];
-  if (analystMode === "single_trace") {
+  const hasTraceContext = Boolean(anchors.xray_trace_id || latestMerged?.request?.trace_id || latestMerged?.xray);
+  if (hasTraceContext) {
     const sessionId = anchors.session_id || latestMerged?.request?.session_id || "";
     const traceId = anchors.xray_trace_id || latestMerged?.request?.trace_id || "";
     const slowestStep = latestMerged?.xray?.slowest_step?.name || "";
@@ -199,7 +158,9 @@ function buildAnalystMemory(logMessages, latestMerged, analystMode, anchors, tot
     if (slowestStep) {
       contextLines.push(`Latest slowest X-Ray step: ${slowestStep}.`);
     }
-  } else if (latestMerged) {
+  }
+
+  if (!hasTraceContext && latestMerged) {
     const bottleneck = latestMerged?.bottleneck_ranking?.[0]?.component || "n/a";
     const avgLatency = latestMerged?.fleet_metrics?.e2e_ms?.avg || 0;
     contextLines.push(`Current window covers ${totalFleetTraces || 0} traces.`);
@@ -214,14 +175,24 @@ function buildAnalystMemory(logMessages, latestMerged, analystMode, anchors, tot
   return [...contextEntry, ...recentTurns];
 }
 
-function TypingIndicator() {
-  return (
-    <div className="typing" aria-live="polite" aria-label="Assistant is typing">
-      <span />
-      <span />
-      <span />
-    </div>
-  );
+function makeAnalystWelcomeMessage() {
+  return {
+    id: crypto.randomUUID(),
+    role: "system",
+    text: "Welcome to the analyzer. I'll help you analyze trace data. Let's get started by choosing a timeframe.",
+    variant: "metric",
+    timestamp: stamp(),
+  };
+}
+
+function makeAnalystTimeframeQuestion() {
+  return {
+    id: crypto.randomUUID(),
+    role: "system",
+    text: "Which timeframe? Examples: 30m, 1h, 4h, 1d, overall. Just say the timeframe. You can change it anytime.",
+    variant: "metric",
+    timestamp: stamp(),
+  };
 }
 
 function App({ signOut, user }) {
@@ -238,7 +209,10 @@ function App({ signOut, user }) {
     },
   ]);
   const [logQuestion, setLogQuestion] = useState("");
-  const [logMessages, setLogMessages] = useState([]);
+  const [logMessages, setLogMessages] = useState([makeAnalystWelcomeMessage(), makeAnalystTimeframeQuestion()]);
+  const [analyzerTimeframe, setAnalyzerTimeframe] = useState(null);
+  const [analyzerSetupStep, setAnalyzerSetupStep] = useState("awaiting_timeframe");
+  const [analyzerSetupComplete, setAnalyzerSetupComplete] = useState(false);
   const [autoAnchors, setAutoAnchors] = useState({
     request_id: "",
     client_request_id: "",
@@ -257,17 +231,13 @@ function App({ signOut, user }) {
   const [latestMerged, setLatestMerged] = useState(null);
   const [busyChat, setBusyChat] = useState(false);
   const [busyLog, setBusyLog] = useState(false);
-  const [analystMode, setAnalystMode] = useState("fleet_window");
-  const [logLookbackHours, setLogLookbackHours] = useState("1");
   const [fleetPage, setFleetPage] = useState(1);
   const [lastFleetQuestion, setLastFleetQuestion] = useState("");
   const [latestPagination, setLatestPagination] = useState(null);
   const [latestSessionsPagination, setLatestSessionsPagination] = useState(null);
   const [autoPageProgress, setAutoPageProgress] = useState(null);
-  const [controlsOpen, setControlsOpen] = useState(true);
-  const [viewportWidth, setViewportWidth] = useState(() => window.innerWidth);
   const [copiedId, setCopiedId] = useState("");
-  const [traceIdInvalid, setTraceIdInvalid] = useState("");
+  const [helpOpen, setHelpOpen] = useState(false);
   const [profile, setProfile] = useState({ name: user?.username || "User", department: "", role: "" });
   const chatAbortRef = useRef(null);
   const analystAbortRef = useRef(null);
@@ -285,26 +255,20 @@ function App({ signOut, user }) {
     [analystAnchors, autoAnchors],
   );
 
-  const selectedLookbackLabel = useMemo(() => {
-    const found = LOOKBACK_OPTIONS.find((opt) => opt.value === logLookbackHours);
-    return found?.label || `${logLookbackHours} hours`;
-  }, [logLookbackHours]);
-
-  const isFleetMode = analystMode !== "single_trace";
-  const isOverlayViewport = viewportWidth <= 640;
   const totalFleetTraces = latestPagination?.total_traces || latestMerged?.fleet_metrics?.traces_total || 0;
   const analystMemory = useMemo(
-    () => buildAnalystMemory(logMessages, latestMerged, analystMode, effectiveAnchors, totalFleetTraces),
-    [logMessages, latestMerged, analystMode, effectiveAnchors, totalFleetTraces],
+    () => buildAnalystMemory(logMessages, latestMerged, effectiveAnchors, totalFleetTraces),
+    [logMessages, latestMerged, effectiveAnchors, totalFleetTraces],
   );
   const analystMetricCards = useMemo(() => {
     if (!latestMerged) {
       return [];
     }
 
-    if (isFleetMode) {
+    const hasTraceContext = Boolean(latestMerged?.xray || latestMerged?.request?.trace_id || effectiveAnchors.xray_trace_id);
+    if (!hasTraceContext) {
       return [
-        { label: "Traces in view", value: String(totalFleetTraces || 0), hint: selectedLookbackLabel },
+        { label: "Traces in view", value: String(totalFleetTraces || 0), hint: "Auto-selected timeframe" },
         { label: "Average latency", value: `${latestMerged?.fleet_metrics?.e2e_ms?.avg || 0} ms`, hint: "End-to-end" },
         { label: "Top bottleneck", value: latestMerged?.bottleneck_ranking?.[0]?.component || "n/a", hint: "Primary delay source" },
       ];
@@ -315,7 +279,7 @@ function App({ signOut, user }) {
       { label: "Evaluator records", value: String(latestMerged.evaluator_records_found || 0), hint: "Metrics matched" },
       { label: "Slowest X-Ray step", value: latestMerged?.xray?.slowest_step?.name || "n/a", hint: `${latestMerged?.xray?.slowest_step?.duration_ms || 0} ms` },
     ];
-  }, [isFleetMode, latestMerged, selectedLookbackLabel, totalFleetTraces]);
+  }, [effectiveAnchors.xray_trace_id, latestMerged, totalFleetTraces]);
   const assistantContextRows = useMemo(
     () => [
       { label: "Chat session ID", value: chatSessionId, copyKey: "chat-session" },
@@ -352,25 +316,13 @@ function App({ signOut, user }) {
   }, [user]);
 
   useEffect(() => {
-    function handleResize() {
-      const nextWidth = window.innerWidth;
-      setViewportWidth(nextWidth);
-      if (nextWidth <= 640) {
-        setControlsOpen(false);
-      }
-    }
-
-    window.addEventListener("resize", handleResize);
-    handleResize();
-    return () => window.removeEventListener("resize", handleResize);
-  }, []);
-
-  useEffect(() => {
-    if (!isOverlayViewport || mode === "assistant") {
+    if (mode !== "session") {
       return;
     }
-    setControlsOpen(false);
-  }, [isOverlayViewport, mode]);
+    if (!sessionStorage.getItem(ANALYZER_HELP_DISMISSED_KEY)) {
+      setHelpOpen(true);
+    }
+  }, [mode]);
 
   function copyToClipboard(value, key) {
     if (!value) {
@@ -396,12 +348,18 @@ function App({ signOut, user }) {
   function handleComposerKeyDown(event) {
     if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault();
-      if (mode === "assistant") {
-        sendPrompt(event);
-      } else {
-        sendLogQuestion(event);
+      const form = event.target.closest('form');
+      if (form) {
+        form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
       }
     }
+  }
+
+  // Fleet-only: directly select timeframe (no mode selection needed)
+  function handleSelectAnalyzerTimeframe(timeframe) {
+    setAnalyzerTimeframe(timeframe);
+    setAnalyzerSetupComplete(true);
+    setLogQuestion("");
   }
 
   function resetToNewSession() {
@@ -431,13 +389,17 @@ function App({ signOut, user }) {
         timestamp: stamp(),
       },
     ]);
-    setLogMessages([]);
+    setLogMessages([makeAnalystWelcomeMessage(), makeAnalystTimeframeQuestion()]);
+    setAnalyzerTimeframe(null);
+    setAnalyzerSetupStep("awaiting_timeframe");
+    setAnalyzerSetupComplete(false);
     setLatestMerged(null);
     setLastFleetQuestion("");
     setFleetPage(1);
     setLatestPagination(null);
     setLatestSessionsPagination(null);
     setAutoPageProgress(null);
+    setAnalyzerSetupComplete(false);
     setAnalystAnchors({
       request_id: "",
       client_request_id: "",
@@ -471,11 +433,15 @@ function App({ signOut, user }) {
   }
 
   async function sendPrompt(event) {
-    event.preventDefault();
+    if (event) {
+      event.preventDefault();
+    }
     const trimmed = prompt.trim();
     if (!trimmed || busyChat) {
+      console.log('[sendPrompt] Early return:', { emptyPrompt: !trimmed, busy: busyChat });
       return;
     }
+    console.log('[sendPrompt] Sending:', trimmed.substring(0, 50));
 
     setPrompt("");
     setBusyChat(true);
@@ -544,47 +510,119 @@ function App({ signOut, user }) {
     }
   }
 
+  // Helper functions for analyzer setup (fleet-only)
+  function parseTimeframe(text) {
+    const trimmed = text.toLowerCase().trim();
+    // Handle standalone "overall"
+    if (trimmed === "overall") return "overall";
+    // Handle numeric + unit patterns: "1h", "2d", "30m", etc.
+    const match = trimmed.match(/^(\d+)\s*(m|min|h|hr|d|days?|w|weeks?)$/);
+    if (!match) return null;
+    const num = match[1];
+    const unit = match[2];
+    if (["m", "min"].includes(unit)) return `${num}m`;
+    if (["h", "hr"].includes(unit)) return `${num}h`;
+    if (["d", "day", "days"].includes(unit)) return `${num}d`;
+    if (["w", "week", "weeks"].includes(unit)) return `${num}w`;
+    return null;
+  }
+
+  function timeframeToHours(timeframeStr) {
+    // Convert "1h", "2d", "30m", "overall" to numeric hours
+    if (!timeframeStr) return 24; // default
+    if (timeframeStr === "overall") return 87600; // ~10 years
+    
+    const match = timeframeStr.match(/^(\d+)([mhdw])$/);
+    if (!match) return 24;
+    
+    const [, num, unit] = match;
+    const amount = parseInt(num, 10);
+    
+    switch (unit) {
+      case "m": return Math.max(1, amount / 60);
+      case "h": return amount;
+      case "d": return amount * 24;
+      case "w": return amount * 24 * 7;
+      default: return 24;
+    }
+  }
+
+  function handleChangeAnalyzerMode() {
+    // Reset to timeframe selection (no mode selection anymore)
+    setAnalyzerSetupStep("awaiting_timeframe");
+    setAnalyzerSetupComplete(false);
+    setAnalyzerTimeframe(null);
+    setLogMessages((prev) => [...prev, makeAnalystTimeframeQuestion()]);
+  }
+
+  // Helper to detect if input looks like a general question vs setup attempt
+  function isLikelySetupAttempt(text) {
+    const lower = text.toLowerCase();
+    // Check for setup keywords
+    if (/fleet|single|trace|overall|^\d+\s*(m|min|h|hr|d|days?|w|weeks?)$/i.test(lower)) {
+      return true;
+    }
+    // Very short responses or single words that could be commands
+    if (text.trim().length <= 3) return true;
+    return false;
+  }
+
   async function sendLogQuestion(event) {
-    event.preventDefault();
+    if (event) {
+      event.preventDefault();
+    }
     const trimmed = logQuestion.trim();
     if (!trimmed || busyLog) {
+      console.log('[sendLogQuestion] Early return:', { emptyQuestion: !trimmed, busy: busyLog });
       return;
     }
+    console.log('[sendLogQuestion] Sending:', trimmed.substring(0, 50));
 
-    if (analystMode === "single_trace") {
-      const candidateTraceId = String(analystAnchors.xray_trace_id || autoAnchors.xray_trace_id || "").trim();
-      if (!candidateTraceId) {
-        setLogMessages((prev) => [
-          ...prev,
-          makeMessage("system", "No trace ID available yet. Paste an X-Ray trace ID, or send one assistant prompt first so a trace ID is captured automatically.", "metric"),
-        ]);
+    // SETUP STATE MACHINE — Fleet mode only: ask for timeframe
+    if (analyzerSetupStep === "awaiting_timeframe") {
+      const detected = parseTimeframe(trimmed);
+      if (!detected) {
+        if (!isLikelySetupAttempt(trimmed)) {
+          // It's a general question - show friendly prompt
+          setLogMessages((prev) => [
+            ...prev,
+            makeMessage("user", trimmed),
+            makeMessage("system", "Please specify a timeframe for the analysis. Try: **30m**, **1h**, **1d**, **overall**, etc.", "info"),
+          ]);
+        } else {
+          // It's clearly a setup attempt but didn't parse
+          setLogMessages((prev) => [
+            ...prev,
+            makeMessage("system", "I didn't recognize that timeframe. Try: 30m, 1h, 1d, or 'overall'.", "error"),
+          ]);
+        }
+        setLogQuestion("");
         return;
       }
-
-      if ((isUuidLike(candidateTraceId) && !isXrayTraceIdLike(candidateTraceId)) || !isXrayTraceIdLike(candidateTraceId)) {
-        // Show the red-border visual error on the field instead of a chat message.
-        setTraceIdInvalid(isUuidLike(candidateTraceId) ? "uuid" : "invalid");
-        return;
-      }
-    }
-
-    if (analystMode === "single_trace" && !effectiveAnchors.xray_trace_id) {
+      // Valid timeframe detected
+      setAnalyzerTimeframe(detected);
       setLogMessages((prev) => [
         ...prev,
-        makeMessage("system", "No trace ID available yet. Send one assistant prompt first to capture a trace ID.", "metric"),
+        makeMessage("user", trimmed),
       ]);
+      setAnalyzerSetupStep("complete");
+      setAnalyzerSetupComplete(true);
+      setLogMessages((prev) => [
+        ...prev,
+        makeMessage("system", `Ready! Analyzing fleet data for the last ${detected}. Ask any questions.`, "success"),
+      ]);
+      setLogQuestion("");
       return;
     }
 
-    if (isFleetMode) {
-      setLastFleetQuestion(trimmed);
-      setFleetPage(1);
-    }
+    // NORMAL QUESTION FLOW (if setup is complete)
+    setLastFleetQuestion(trimmed);
+    setFleetPage(1);
 
     await requestLogAnalysis(trimmed, {
       page: 1,
       addUserMessage: true,
-      autoPaginate: isFleetMode,
+      autoPaginate: true,
     });
   }
 
@@ -625,28 +663,17 @@ function App({ signOut, user }) {
           },
           body: JSON.stringify({
             question: questionText,
-            analysis_mode: analystMode,
+            analysis_mode: "fleet_window",
+            lookback_hours: timeframeToHours(analyzerTimeframe),
             analyst_memory: analystMemory,
             auto_paginate_requested: autoPaginate,
-            request_id: analystMode === "single_trace" ? effectiveAnchors.request_id : "",
-            client_request_id: analystMode === "single_trace" ? effectiveAnchors.client_request_id : "",
-            session_id: analystMode === "single_trace" ? effectiveAnchors.session_id : "",
-            evaluator_session_id: analystMode === "single_trace" ? effectiveAnchors.evaluator_session_id : "",
-            xray_trace_id: analystMode === "single_trace" ? effectiveAnchors.xray_trace_id : "",
+            request_id: effectiveAnchors.request_id,
+            client_request_id: effectiveAnchors.client_request_id,
+            session_id: effectiveAnchors.session_id,
+            evaluator_session_id: effectiveAnchors.evaluator_session_id,
+            xray_trace_id: effectiveAnchors.xray_trace_id,
             page: targetPage,
             page_size: DEFAULT_FLEET_PAGE_SIZE,
-            lookback_hours:
-              analystMode === "single_trace"
-                ? 48
-                : logLookbackHours === "overall"
-                  ? "overall"
-                  : Number(logLookbackHours),
-            lookback_mode:
-              analystMode === "single_trace"
-                ? "window"
-                : logLookbackHours === "overall"
-                  ? "overall"
-                  : "window",
             user_context: {
               user_id: user?.username || "anonymous",
               user_name: profile.name || user?.username || "anonymous",
@@ -676,16 +703,21 @@ function App({ signOut, user }) {
       const firstMergedPagination = firstResult.data?.merged?.pagination_context || null;
       const firstPageInfo = firstSessionsPagination || firstPagination || firstMergedSessionsPagination || firstMergedPagination;
       const autoPaginateRecommended = Boolean(firstResult.data?.auto_paginate_recommended);
-      const firstPrefix = isFleetMode && Number(firstPageInfo?.page || page) > 1 && Number(firstPageInfo?.total_pages || 1) > 1
+      const firstPrefix = Number(firstPageInfo?.page || page) > 1 && Number(firstPageInfo?.total_pages || 1) > 1
         ? `Page ${firstPageInfo.page} of ${firstPageInfo.total_pages}`
         : "";
 
+      const msgContext = {};
+      if (analyzerTimeframe) {
+        msgContext.modeLabel = "Fleet window";
+        msgContext.timeframeLabel = analyzerTimeframe;
+      }
       setLogMessages((prev) => [
         ...prev,
-        makeMessage("assistant", firstPrefix ? `${firstPrefix}\n\n${firstResult.answer}` : firstResult.answer),
+        makeMessage("assistant", firstPrefix ? `${firstPrefix}\n\n${firstResult.answer}` : firstResult.answer, "", msgContext),
       ]);
 
-      if (firstResult.response.ok && analystMode !== "single_trace") {
+      if (firstResult.response.ok) {
         setFleetPage(Number(firstPagination?.page || page || 1));
         setLatestPagination(firstPagination);
         setLatestSessionsPagination(firstResult.data?.sessions_pagination || null);
@@ -694,7 +726,7 @@ function App({ signOut, user }) {
         setLatestSessionsPagination(null);
       }
 
-      if (firstResult.response.ok && firstResult.data?.anchors && analystMode === "single_trace") {
+      if (firstResult.response.ok && firstResult.data?.anchors) {
         setAnalystAnchors((prev) => ({
           request_id: firstResult.data.anchors.request_id || prev.request_id,
           client_request_id: firstResult.data.anchors.client_request_id || prev.client_request_id,
@@ -752,7 +784,7 @@ function App({ signOut, user }) {
           setAutoPageProgress({ loadedPages, totalPages: nextTotalPages });
           setLogMessages((prev) => [
             ...prev,
-            makeMessage("assistant", `Page ${loadedPages} of ${nextTotalPages}\n\n${nextResult.answer}`),
+            makeMessage("assistant", `Page ${loadedPages} of ${nextTotalPages}\n\n${nextResult.answer}`, "", msgContext),
           ]);
 
           if (!hasNextPage && loadedPages >= nextTotalPages) {
@@ -774,7 +806,7 @@ function App({ signOut, user }) {
   }
 
   async function goToFleetPage(nextPage) {
-    if (!lastFleetQuestion || !isFleetMode || busyLog) {
+    if (!lastFleetQuestion || busyLog) {
       return;
     }
     if (nextPage < 1) {
@@ -804,46 +836,8 @@ function App({ signOut, user }) {
     return () => window.cancelAnimationFrame(raf);
   }, [messages, logMessages, busyChat, busyLog, mode]);
 
-  function renderMessages(items, loading, viewportRef, onScroll) {
-    return (
-      <div className="messages" ref={viewportRef} onScroll={onScroll}>
-        {items.map((msg) => (
-          <article key={msg.id} className={`message ${msg.role} ${msg.variant || ""}`}>
-            <div className="bubble-wrap">
-              <div className="bubble-header">
-                <span className="who">{msg.role === "assistant" ? "Assistant" : msg.role === "user" ? "You" : "System"}</span>
-                <span className="time">{msg.timestamp}</span>
-              </div>
-              <div className="bubble">{msg.text}</div>
-              {msg.role === "assistant" && (
-                <button
-                  className="copy-btn"
-                  type="button"
-                  onClick={() => copyToClipboard(msg.text, msg.id)}
-                  title="Copy message"
-                >
-                  {copiedId === msg.id ? "Copied" : "Copy"}
-                </button>
-              )}
-            </div>
-          </article>
-        ))}
-        {loading && (
-          <article className="message assistant typing-row">
-            <div className="bubble-wrap">
-              <div className="bubble-header">
-                <span className="who">Assistant</span>
-                <span className="time">{stamp()}</span>
-              </div>
-              <div className="bubble">
-                <TypingIndicator />
-              </div>
-            </div>
-          </article>
-        )}
-      </div>
-    );
-  }
+  // Component rendering is now handled by extracted components
+  // All state management and handlers remain in App.jsx
 
   const isAssistantMode = mode === "assistant";
   const activeMessages = isAssistantMode ? messages : logMessages;
@@ -856,179 +850,96 @@ function App({ signOut, user }) {
     "chat-shell",
     isAssistantMode ? "assistant-only" : "",
     !isAssistantMode ? "analyst-shell" : "",
-    !isAssistantMode && !controlsOpen ? "menu-collapsed" : "",
-    !isAssistantMode && isOverlayViewport ? "compact-shell" : "",
   ].filter(Boolean).join(" ");
-  const menuClassName = [
-    "left-menu",
-    controlsOpen ? "open" : "collapsed",
-    isOverlayViewport ? "compact" : "",
-  ].filter(Boolean).join(" ");
-  const menuToggleClassName = "menu-toggle";
 
   return (
     <main className="sensei-shell">
-      <header className="sensei-topbar">
-        <div className="sensei-brand">
-          <strong>PHILIPS</strong>
-          <span>SENSEI</span>
-        </div>
-
-        <nav className="sensei-nav" role="tablist" aria-label="Console mode">
-          <button
-            type="button"
-            className={`nav-tab ${isAssistantMode ? "active" : ""}`}
-            onClick={() => setMode("assistant")}
-          >
-            Assistant chat
-          </button>
-          <button
-            type="button"
-            className={`nav-tab ${!isAssistantMode ? "active" : ""}`}
-            onClick={() => setMode("session")}
-          >
-            Analyser chat
-          </button>
-        </nav>
-
-        <div className="sensei-user">
-          <span>{(profile.name || user?.username || "JD").slice(0, 2).toUpperCase()}</span>
-          <button className="new-session" onClick={resetToNewSession} type="button">New session</button>
-          <button className="signout" onClick={signOut} type="button">Sign out</button>
-        </div>
-      </header>
+      <Topbar
+        isAssistantMode={isAssistantMode}
+        onModeChange={setMode}
+        profile={profile}
+        user={user}
+        onNewSession={resetToNewSession}
+        onSignOut={signOut}
+      />
 
       <section className={shellClassName}>
         {!isAssistantMode && (
           <>
-            {controlsOpen && isOverlayViewport && (
-              <button
-                type="button"
-                className="menu-backdrop"
-                aria-label="Close analyser menu"
-                onClick={() => setControlsOpen(false)}
-              />
-            )}
             <button
               type="button"
-              className={menuToggleClassName}
-              onClick={() => setControlsOpen((prev) => !prev)}
-              aria-expanded={controlsOpen}
+              className="help-button help-button-shell"
+              onClick={() => {
+                const nextOpen = !helpOpen;
+                setHelpOpen(nextOpen);
+                if (!nextOpen) {
+                  sessionStorage.setItem(ANALYZER_HELP_DISMISSED_KEY, "1");
+                }
+              }}
             >
-              {controlsOpen ? "Hide menu" : "Show menu"}
+              {helpOpen ? "Close" : "Help"}
             </button>
-
-            <aside className={menuClassName}>
-              <div className="left-menu-scroll">
-                <div className="analysis-toolbar">
-                  <label>
-                    <span>Mode</span>
-                    <select value={analystMode} onChange={(e) => setAnalystMode(e.target.value)}>
-                      <option value="fleet_window">Fleet window</option>
-                      <option value="single_trace">Single trace</option>
-                    </select>
-                  </label>
-                  {isFleetMode && (
-                    <label>
-                      <span>Time</span>
-                      <select
-                        value={logLookbackHours}
-                        onChange={(e) => setLogLookbackHours(e.target.value || "1")}
-                      >
-                        {LOOKBACK_OPTIONS.map((opt) => (
-                          <option key={opt.value} value={opt.value}>{opt.label}</option>
-                        ))}
-                      </select>
-                    </label>
-                  )}
-                  {analystMode === "single_trace" && (
-                    <label className="trace-id-field">
-                      <span>X-Ray Trace ID</span>
-                      <input
-                        value={analystAnchors.xray_trace_id || ""}
-                        className={traceIdInvalid ? "invalid" : ""}
-                        onChange={(e) => {
-                          const val = e.target.value.trim();
-                          setAnalystAnchors((prev) => ({ ...prev, xray_trace_id: val }));
-                          if (!val) {
-                            setTraceIdInvalid("");
-                          } else if (isUuidLike(val) && !isXrayTraceIdLike(val)) {
-                            setTraceIdInvalid("uuid");
-                          } else if (!isXrayTraceIdLike(val)) {
-                            setTraceIdInvalid("invalid");
-                          } else {
-                            setTraceIdInvalid("");
-                          }
-                        }}
-                        placeholder={autoAnchors.xray_trace_id || "send a chat message to capture trace ID"}
-                      />
-                      {traceIdInvalid === "uuid" && (
-                        <small className="trace-id-invalid-hint">
-                          <span className="invalid-icon" aria-hidden="true">&#9888;</span>
-                          That looks like a session ID — paste an X-Ray trace ID instead.
-                        </small>
-                      )}
-                      {traceIdInvalid === "invalid" && (
-                        <small className="trace-id-invalid-hint">
-                          <span className="invalid-icon" aria-hidden="true">&#9888;</span>
-                          Invalid trace ID. Use 32-char hex or 1-xxxxxxxx-xxxxxxxxxxxxxxxxxxxxxxxx.
-                        </small>
-                      )}
-                      {!traceIdInvalid && (
-                        <small className="field-hint">Use an X-Ray trace ID, not a session ID.</small>
-                      )}
-                    </label>
-                  )}
-                </div>
-
-                <div className="menu-suggestions">
-                  <p>Suggestions</p>
-                  {(isFleetMode ? FLEET_SUGGESTIONS : SINGLE_TRACE_SUGGESTIONS).map((suggestion, index) => (
-                    <button
-                      key={suggestion}
-                      type="button"
-                      className="suggestion-chip"
-                      onClick={() => setLogQuestion(suggestion)}
-                      disabled={busyLog}
-                    >
-                      <span className="suggestion-index">0{index + 1}</span>
-                      <span className="suggestion-text">{suggestion}</span>
-                    </button>
-                  ))}
-                </div>
-              </div>
-            </aside>
           </>
         )}
 
         <div className="chat-center">
+          <HelpPanel
+            sections={ANALYZER_HELP_SECTIONS}
+            isVisible={helpOpen && !isAssistantMode}
+            onClose={() => setHelpOpen(false)}
+          />
+
           <div className="chat-feed">
-            {renderMessages(activeMessages, activeBusy, messagesViewportRef, handleMessagesScroll)}
+            <MessageList
+              messages={activeMessages}
+              isLoading={activeBusy}
+              viewportRef={messagesViewportRef}
+              onScroll={handleMessagesScroll}
+              onCopy={copyToClipboard}
+              copiedId={copiedId}
+            />
+            {!isAssistantMode && !analyzerSetupComplete && (
+              <AnalyzerSetup
+                setupStep={analyzerSetupStep}
+                selectedTimeframe={analyzerTimeframe}
+                onSelectTimeframe={handleSelectAnalyzerTimeframe}
+                onChangeMode={handleChangeAnalyzerMode}
+                isProcessing={busyLog}
+              />
+            )}
           </div>
 
-          <form className="floating-composer" onSubmit={isAssistantMode ? sendPrompt : sendLogQuestion}>
-            <textarea
-              value={activeQuestion}
-              onChange={(e) => (isAssistantMode ? setPrompt(e.target.value) : setLogQuestion(e.target.value))}
-              onKeyDown={handleComposerKeyDown}
-              placeholder="Ask anything"
-              maxLength={4000}
-              disabled={activeBusy}
-            />
-            <div className="composer-row">
-              <p className="char-count">{activeCharCount}/4000</p>
-              <div className="composer-actions">
-                {activeBusy && (
-                  <button className="stop" type="button" onClick={stopCurrentGeneration}>
-                    {activeStopLabel}
-                  </button>
-                )}
-                <button className="send" type="submit" disabled={activeBusy} title="Send" aria-label="Send">
-                  <span className="plane" aria-hidden="true">&#10148;</span>
-                </button>
-              </div>
-            </div>
-          </form>
+          <Composer
+            value={activeQuestion}
+            onChange={(e) => {
+              if (isAssistantMode) {
+                setPrompt(e.target.value);
+                return;
+              }
+              setLogQuestion(e.target.value);
+              if (suggestionsOpen) {
+                setSuggestionsOpen(false);
+              }
+            }}
+            onKeyDown={handleComposerKeyDown}
+            onSubmit={isAssistantMode ? sendPrompt : sendLogQuestion}
+            placeholder={
+              isAssistantMode
+                ? "Ask anything"
+                : analyzerSetupComplete
+                ? "Ask your analysis question..."
+                : "Answer the setup questions..."
+            }
+            disabled={activeBusy}
+            charCount={activeCharCount}
+            maxLength={4000}
+            isAnalyzerMode={!isAssistantMode}
+            showChangeMode={analyzerSetupComplete}
+            onChangeMode={handleChangeAnalyzerMode}
+            isBusy={activeBusy}
+            stopLabel={activeStopLabel}
+            onStop={stopCurrentGeneration}
+          />
         </div>
       </section>
     </main>
