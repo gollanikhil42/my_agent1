@@ -30,6 +30,16 @@ const ANALYZER_HELP_SECTIONS = [
   },
 ];
 
+const FLEET_MODE_SUGGESTIONS = [
+  "Summarize the top performance issues in this window",
+  "Which users experienced the most errors?",
+  "What are the main bottlenecks affecting latency?",
+  "List the slowest sessions and their characteristics",
+  "How many traces had errors vs. success?",
+];
+
+const ENABLE_SUGGESTIONS_BUTTON = true;
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -132,6 +142,29 @@ function compactMessageForMemory(text, limit = 420) {
     return normalized;
   }
   return `${normalized.slice(0, limit).trim()}...`;
+}
+
+function formatResponseForReadability(text) {
+  if (!text || typeof text !== "string") {
+    return text;
+  }
+
+  // Preserve the original text structure but improve spacing
+  let formatted = text;
+
+  // Add extra space after periods that end sentences followed by a capital letter
+  formatted = formatted.replace(/(\.\s+)([A-Z])/g, "$1\n\n$2");
+
+  // Ensure consistent line spacing for bullet points and numbered lists
+  formatted = formatted.replace(/\n(-|\d+\.)\s+/g, "\n$1 ");
+
+  // Add spacing after colons that introduce content (if followed by bullet points)
+  formatted = formatted.replace(/:\n(-|\d+\.)/g, ":\n$1");
+
+  // Ensure double line breaks between paragraphs (collapse excessive spacing)
+  formatted = formatted.replace(/\n{3,}/g, "\n\n");
+
+  return formatted.trim();
 }
 
 function buildAnalystMemory(logMessages, latestMerged, anchors, totalFleetTraces) {
@@ -238,6 +271,7 @@ function App({ signOut, user }) {
   const [autoPageProgress, setAutoPageProgress] = useState(null);
   const [copiedId, setCopiedId] = useState("");
   const [helpOpen, setHelpOpen] = useState(false);
+  const [suggestionsOpen, setSuggestionsOpen] = useState(false);
   const [profile, setProfile] = useState({ name: user?.username || "User", department: "", role: "" });
   const chatAbortRef = useRef(null);
   const analystAbortRef = useRef(null);
@@ -335,10 +369,12 @@ function App({ signOut, user }) {
   }
 
   function makeMessage(role, text, variant = "", extra = {}) {
+    const normalized = normalizeMessageText(text);
+    const formatted = role === "assistant" ? formatResponseForReadability(normalized) : normalized;
     return {
       id: crypto.randomUUID(),
       role,
-      text: normalizeMessageText(text),
+      text: formatted,
       variant,
       timestamp: stamp(),
       ...extra,
@@ -353,6 +389,15 @@ function App({ signOut, user }) {
         form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
       }
     }
+  }
+
+  function applySuggestion(suggestion) {
+    if (isAssistantMode) {
+      setPrompt(suggestion);
+    } else {
+      setLogQuestion(suggestion);
+    }
+    setSuggestionsOpen(false);
   }
 
   // Fleet-only: directly select timeframe (no mode selection needed)
@@ -515,15 +560,33 @@ function App({ signOut, user }) {
     const trimmed = text.toLowerCase().trim();
     // Handle standalone "overall"
     if (trimmed === "overall") return "overall";
-    // Handle numeric + unit patterns: "1h", "2d", "30m", etc.
-    const match = trimmed.match(/^(\d+)\s*(m|min|h|hr|d|days?|w|weeks?)$/);
+    // Handle variations like "to 14 days", "change to 7d", "switch to 1h", etc.
+    const variantMatch = trimmed.match(/(?:to|for|in)\s+(\d+)\s*(m|min|h|hr|d|days?|w|weeks?)/i);
+    const directMatch = trimmed.match(/^(\d+)\s*(m|min|h|hr|d|days?|w|weeks?)$/);
+    const match = variantMatch || directMatch;
     if (!match) return null;
-    const num = match[1];
+    const num = parseInt(match[1], 10);
     const unit = match[2];
-    if (["m", "min"].includes(unit)) return `${num}m`;
-    if (["h", "hr"].includes(unit)) return `${num}h`;
-    if (["d", "day", "days"].includes(unit)) return `${num}d`;
-    if (["w", "week", "weeks"].includes(unit)) return `${num}w`;
+    
+    // Enforce 30-day maximum
+    let days = 0;
+    if (["m", "min"].includes(unit)) {
+      if (num > 30 * 24 * 60) return null; // More than 30 days in minutes
+      return `${num}m`;
+    }
+    if (["h", "hr"].includes(unit)) {
+      if (num > 30 * 24) return null; // More than 30 days in hours
+      return `${num}h`;
+    }
+    if (["d", "day", "days"].includes(unit)) {
+      if (num > 30) return null; // More than 30 days
+      return `${num}d`;
+    }
+    if (["w", "week", "weeks"].includes(unit)) {
+      days = num * 7;
+      if (days > 30) return null; // More than 30 days
+      return `${num}w`;
+    }
     return null;
   }
 
@@ -582,7 +645,13 @@ function App({ signOut, user }) {
     if (analyzerSetupStep === "awaiting_timeframe") {
       const detected = parseTimeframe(trimmed);
       if (!detected) {
-        if (!isLikelySetupAttempt(trimmed)) {
+        if (/^\d+\s*(m|min|h|hr|d|days?|w|weeks?)$/i.test(trimmed)) {
+          // Looks like a timeframe but exceeds 30-day limit
+          setLogMessages((prev) => [
+            ...prev,
+            makeMessage("system", "We can only analyze data from the last 30 days. Please choose a timeframe within that window (e.g., 1d, 7d, 30d, or overall for available data).", "error"),
+          ]);
+        } else if (!isLikelySetupAttempt(trimmed)) {
           // It's a general question - show friendly prompt
           setLogMessages((prev) => [
             ...prev,
@@ -616,6 +685,24 @@ function App({ signOut, user }) {
     }
 
     // NORMAL QUESTION FLOW (if setup is complete)
+    // Check if user is trying to change timeframe mid-conversation
+    const detectedNewTimeframe = parseTimeframe(trimmed);
+    if (detectedNewTimeframe && detectedNewTimeframe !== analyzerTimeframe) {
+      // User changed timeframe mid-conversation - reset analysis state and update bubble context
+      setAnalyzerTimeframe(detectedNewTimeframe);
+      setFleetPage(1);
+      setLatestPagination(null);
+      setLatestSessionsPagination(null);
+      setLatestMerged(null);
+      setLogMessages((prev) => [
+        ...prev,
+        makeMessage("user", trimmed),
+        makeMessage("system", `Switched to analyzing the last ${detectedNewTimeframe}. Ask your questions now.`, "success"),
+      ]);
+      setLogQuestion("");
+      return;
+    }
+
     setLastFleetQuestion(trimmed);
     setFleetPage(1);
 
@@ -917,9 +1004,6 @@ function App({ signOut, user }) {
                 return;
               }
               setLogQuestion(e.target.value);
-              if (suggestionsOpen) {
-                setSuggestionsOpen(false);
-              }
             }}
             onKeyDown={handleComposerKeyDown}
             onSubmit={isAssistantMode ? sendPrompt : sendLogQuestion}
@@ -934,8 +1018,12 @@ function App({ signOut, user }) {
             charCount={activeCharCount}
             maxLength={4000}
             isAnalyzerMode={!isAssistantMode}
-            showChangeMode={analyzerSetupComplete}
+            showChangeMode={false}
             onChangeMode={handleChangeAnalyzerMode}
+            suggestions={analyzerSetupComplete && ENABLE_SUGGESTIONS_BUTTON ? FLEET_MODE_SUGGESTIONS : []}
+            suggestionsOpen={suggestionsOpen && ENABLE_SUGGESTIONS_BUTTON}
+            onToggleSuggestions={ENABLE_SUGGESTIONS_BUTTON ? () => setSuggestionsOpen((prev) => !prev) : undefined}
+            onApplySuggestion={ENABLE_SUGGESTIONS_BUTTON ? applySuggestion : undefined}
             isBusy={activeBusy}
             stopLabel={activeStopLabel}
             onStop={stopCurrentGeneration}
