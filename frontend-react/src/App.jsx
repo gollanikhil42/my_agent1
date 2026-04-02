@@ -38,7 +38,7 @@ const FLEET_MODE_SUGGESTIONS = [
   "How many traces had errors vs. success?",
 ];
 
-const ENABLE_SUGGESTIONS_BUTTON = true;
+const ENABLE_SUGGESTIONS_BUTTON = false;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -212,7 +212,7 @@ function makeAnalystWelcomeMessage() {
   return {
     id: crypto.randomUUID(),
     role: "system",
-    text: "Welcome to the analyzer. I'll help you analyze trace data. Let's get started by choosing a timeframe.",
+    text: "Welcome to the analyzer! I'm here to help you analyze your trace data. You can ask questions about your fleet, and I'll analyze a default 30-day window. Want to change the timeframe? Just say 'switch to 7 days' or 'show last week'.",
     variant: "metric",
     timestamp: stamp(),
   };
@@ -242,10 +242,10 @@ function App({ signOut, user }) {
     },
   ]);
   const [logQuestion, setLogQuestion] = useState("");
-  const [logMessages, setLogMessages] = useState([makeAnalystWelcomeMessage(), makeAnalystTimeframeQuestion()]);
-  const [analyzerTimeframe, setAnalyzerTimeframe] = useState(null);
-  const [analyzerSetupStep, setAnalyzerSetupStep] = useState("awaiting_timeframe");
-  const [analyzerSetupComplete, setAnalyzerSetupComplete] = useState(false);
+  const [logMessages, setLogMessages] = useState([makeAnalystWelcomeMessage()]);
+  const [analyzerTimeframe, setAnalyzerTimeframe] = useState("30d"); // Default to 30 days for general conversation
+  const [analyzerSetupStep, setAnalyzerSetupStep] = useState("complete");
+  const [analyzerSetupComplete, setAnalyzerSetupComplete] = useState(true);
   const [autoAnchors, setAutoAnchors] = useState({
     request_id: "",
     client_request_id: "",
@@ -558,56 +558,93 @@ function App({ signOut, user }) {
   // Helper functions for analyzer setup (fleet-only)
   function parseTimeframe(text) {
     const trimmed = text.toLowerCase().trim();
-    // Handle standalone "overall"
-    if (trimmed === "overall") return "overall";
-    // Handle variations like "to 14 days", "change to 7d", "switch to 1h", etc.
-    const variantMatch = trimmed.match(/(?:to|for|in)\s+(\d+)\s*(m|min|h|hr|d|days?|w|weeks?)/i);
-    const directMatch = trimmed.match(/^(\d+)\s*(m|min|h|hr|d|days?|w|weeks?)$/);
-    const match = variantMatch || directMatch;
-    if (!match) return null;
-    const num = parseInt(match[1], 10);
-    const unit = match[2];
+    // Handle standalone "overall" - limited to 30 days max
+    if (trimmed === "overall") return "30d"; // Cap overall to 30 days
     
-    // Enforce 30-day maximum
-    let days = 0;
-    if (["m", "min"].includes(unit)) {
-      if (num > 30 * 24 * 60) return null; // More than 30 days in minutes
-      return `${num}m`;
+    // Enhanced regex to handle multiple formats: "1min", "7minutes", "6hrs", "8hours", "27days", "to 1h", "set timeframe to 30 days", etc.
+    const patterns = [
+      // Match: "set timeframe to 30 days", "change to 30 days", "switch to 7 days", etc.
+      /(?:set\s+timeframe\s+)?(?:to|for|in|switch\s+to|change\s+to)?\s*(\d+)\s*(minute|minutes|min|m|hour|hours|hr|h|day|days|d|week|weeks|w)\b/i,
+      /^(\d+)\s*(minute|minutes|min|m|hour|hours|hr|h|day|days|d|week|weeks|w)$/, // Direct format
+    ];
+    
+    let match = null;
+    for (const pattern of patterns) {
+      match = trimmed.match(pattern);
+      if (match) break;
     }
-    if (["h", "hr"].includes(unit)) {
-      if (num > 30 * 24) return null; // More than 30 days in hours
-      return `${num}h`;
+    
+    if (!match) return null;
+    
+    const num = parseInt(match[1], 10);
+    const unit = match[2].toLowerCase();
+    
+    // Normalize unit to single letter and check 30-day limit
+    let normalizedUnit = '';
+    let daysEquivalent = 0;
+    
+    if (['minute', 'minutes', 'min', 'm'].includes(unit)) {
+      daysEquivalent = num / (24 * 60);
+      if (daysEquivalent > 30) return null; // Exceeds 30 days
+      normalizedUnit = 'm';
+    } else if (['hour', 'hours', 'hr', 'h'].includes(unit)) {
+      daysEquivalent = num / 24;
+      if (daysEquivalent > 30) return null; // Exceeds 30 days
+      normalizedUnit = 'h';
+    } else if (['day', 'days', 'd'].includes(unit)) {
+      daysEquivalent = num;
+      if (daysEquivalent > 30) return null; // Exceeds 30 days
+      normalizedUnit = 'd';
+    } else if (['week', 'weeks', 'w'].includes(unit)) {
+      daysEquivalent = num * 7;
+      if (daysEquivalent > 30) return null; // Exceeds 30 days
+      normalizedUnit = 'w';
+    } else {
+      return null; // Unknown unit
     }
-    if (["d", "day", "days"].includes(unit)) {
-      if (num > 30) return null; // More than 30 days
-      return `${num}d`;
-    }
-    if (["w", "week", "weeks"].includes(unit)) {
-      days = num * 7;
-      if (days > 30) return null; // More than 30 days
-      return `${num}w`;
-    }
-    return null;
+    
+    return `${num}${normalizedUnit}`;
   }
 
   function timeframeToHours(timeframeStr) {
-    // Convert "1h", "2d", "30m", "overall" to numeric hours
-    if (!timeframeStr) return 24; // default
-    if (timeframeStr === "overall") return 87600; // ~10 years
+    // Convert "1h", "2d", "30m" to numeric hours (max 30 days = 720 hours)
+    // Always ensure we have a timeframe - fallback to 30d if missing
+    const safeTimeframe = timeframeStr || "30d";
+    if (safeTimeframe === "overall") return 720; // 30 days max
     
-    const match = timeframeStr.match(/^(\d+)([mhdw])$/);
-    if (!match) return 24;
+    const match = safeTimeframe.match(/^(\d+)([mhdw])$/);
+    if (!match) return 720; // Fallback to 30 days if pattern doesn't match
     
     const [, num, unit] = match;
     const amount = parseInt(num, 10);
+    const hours = (() => {
+      switch (unit) {
+        case "m": return Math.max(1, amount / 60);
+        case "h": return amount;
+        case "d": return amount * 24;
+        case "w": return amount * 24 * 7;
+        default: return 720;
+      }
+    })();
     
-    switch (unit) {
-      case "m": return Math.max(1, amount / 60);
-      case "h": return amount;
-      case "d": return amount * 24;
-      case "w": return amount * 24 * 7;
-      default: return 24;
+    // Enforce 30-day max (720 hours)
+    return Math.min(hours, 720);
+  }
+
+  function hoursToTimeframe(hours) {
+    // Convert numeric hours back to "Xd", "Xh", "Xm" format
+    if (!hours || hours <= 0) return "1d";
+    if (hours >= 720) return "30d"; // max 30 days
+    if (hours >= 24) {
+      const days = Math.round(hours / 24);
+      return `${days}d`;
     }
+    if (hours >= 1) {
+      const h = Math.round(hours);
+      return `${h}h`;
+    }
+    const minutes = Math.round(hours * 60);
+    return `${minutes}m`;
   }
 
   function handleChangeAnalyzerMode() {
@@ -616,18 +653,6 @@ function App({ signOut, user }) {
     setAnalyzerSetupComplete(false);
     setAnalyzerTimeframe(null);
     setLogMessages((prev) => [...prev, makeAnalystTimeframeQuestion()]);
-  }
-
-  // Helper to detect if input looks like a general question vs setup attempt
-  function isLikelySetupAttempt(text) {
-    const lower = text.toLowerCase();
-    // Check for setup keywords
-    if (/fleet|single|trace|overall|^\d+\s*(m|min|h|hr|d|days?|w|weeks?)$/i.test(lower)) {
-      return true;
-    }
-    // Very short responses or single words that could be commands
-    if (text.trim().length <= 3) return true;
-    return false;
   }
 
   async function sendLogQuestion(event) {
@@ -641,9 +666,34 @@ function App({ signOut, user }) {
     }
     console.log('[sendLogQuestion] Sending:', trimmed.substring(0, 50));
 
-    // SETUP STATE MACHINE — Fleet mode only: ask for timeframe
+    // SETUP STATE MACHINE — Fleet mode only: ask for timeframe, but allow "General Mode" skip
     if (analyzerSetupStep === "awaiting_timeframe") {
+      const trimmedLower = trimmed.toLowerCase();
+      // Allow user to skip timeframe with "general" or "skip" command
+      if (trimmedLower === "general" || trimmedLower === "skip" || trimmedLower === "general mode") {
+        setAnalyzerTimeframe("30d"); // Default to 30 days for general mode
+        setLogMessages((prev) => [
+          ...prev,
+          makeMessage("user", trimmed),
+          makeMessage("system", "General mode enabled! Using default 30-day window. You can change the timeframe anytime by saying 'switch to 7 days', 'show last week', etc.", "success"),
+        ]);
+        setAnalyzerSetupStep("complete");
+        setAnalyzerSetupComplete(true);
+        setLogQuestion("");
+        return;
+      }
+
       const detected = parseTimeframe(trimmed);
+      // Check if timeframe exceeded 30-day limit
+      if (/^\d+\s*(minute|minutes|min|m|hour|hours|hr|h|day|days|d|week|weeks|w)\b/i.test(trimmed) && !detected) {
+        // Looks like a timeframe attempt but exceeded 30-day limit
+        setLogMessages((prev) => [
+          ...prev,
+          makeMessage("system", "We can only analyze data from the last 30 days. Please choose a timeframe within 1-30 days (e.g., 1min, 7h, 15d, 4w) or 'overall' for available data.", "error"),
+        ]);
+        setLogQuestion("");
+        return;
+      }
       if (!detected) {
         if (/^\d+\s*(m|min|h|hr|d|days?|w|weeks?)$/i.test(trimmed)) {
           // Looks like a timeframe but exceeds 30-day limit
@@ -651,19 +701,18 @@ function App({ signOut, user }) {
             ...prev,
             makeMessage("system", "We can only analyze data from the last 30 days. Please choose a timeframe within that window (e.g., 1d, 7d, 30d, or overall for available data).", "error"),
           ]);
-        } else if (!isLikelySetupAttempt(trimmed)) {
-          // It's a general question - show friendly prompt
+        } else {
+          // Anything else is treated as a general question - auto-enter general mode with 30d default
+          setAnalyzerTimeframe("30d");
           setLogMessages((prev) => [
             ...prev,
             makeMessage("user", trimmed),
-            makeMessage("system", "Please specify a timeframe for the analysis. Try: **30m**, **1h**, **1d**, **overall**, etc.", "info"),
+            makeMessage("system", "Got it! Analyzing with default 30-day window. You can change the timeframe by saying 'switch to 7 days', 'show last week', etc.", "success"),
           ]);
-        } else {
-          // It's clearly a setup attempt but didn't parse
-          setLogMessages((prev) => [
-            ...prev,
-            makeMessage("system", "I didn't recognize that timeframe. Try: 30m, 1h, 1d, or 'overall'.", "error"),
-          ]);
+          setAnalyzerSetupStep("complete");
+          setAnalyzerSetupComplete(true);
+          setLogQuestion("");
+          return;
         }
         setLogQuestion("");
         return;
@@ -685,24 +734,9 @@ function App({ signOut, user }) {
     }
 
     // NORMAL QUESTION FLOW (if setup is complete)
-    // Check if user is trying to change timeframe mid-conversation
-    const detectedNewTimeframe = parseTimeframe(trimmed);
-    if (detectedNewTimeframe && detectedNewTimeframe !== analyzerTimeframe) {
-      // User changed timeframe mid-conversation - reset analysis state and update bubble context
-      setAnalyzerTimeframe(detectedNewTimeframe);
-      setFleetPage(1);
-      setLatestPagination(null);
-      setLatestSessionsPagination(null);
-      setLatestMerged(null);
-      setLogMessages((prev) => [
-        ...prev,
-        makeMessage("user", trimmed),
-        makeMessage("system", `Switched to analyzing the last ${detectedNewTimeframe}. Ask your questions now.`, "success"),
-      ]);
-      setLogQuestion("");
-      return;
-    }
-
+    // Don't try to detect timeframe changes locally - let backend LLM handle it
+    // Backend will return timeframe_change if user asked to change it
+    
     setLastFleetQuestion(trimmed);
     setFleetPage(1);
 
@@ -794,14 +828,28 @@ function App({ signOut, user }) {
         ? `Page ${firstPageInfo.page} of ${firstPageInfo.total_pages}`
         : "";
 
-      const msgContext = {};
-      if (analyzerTimeframe) {
-        msgContext.modeLabel = "Fleet window";
-        msgContext.timeframeLabel = analyzerTimeframe;
+      // ALWAYS sync timeframe from backend response (source of truth for current window)
+      let currentTimeframe = analyzerTimeframe;
+      if (firstResult.response.ok && firstResult.data?.detected_lookback_hours !== undefined) {
+        const detectedHours = firstResult.data.detected_lookback_hours;
+        const detectedTimeframe = hoursToTimeframe(detectedHours);
+        // Always update to detected timeframe to stay in sync with backend
+        if (detectedTimeframe !== analyzerTimeframe) {
+          setAnalyzerTimeframe(detectedTimeframe);
+          currentTimeframe = detectedTimeframe;
+        }
       }
+
+      // Create fresh msgContext with CURRENT timeframe (post-sync)
+      const firstMsgContext = {};
+      if (currentTimeframe) {
+        firstMsgContext.modeLabel = "Fleet window";
+        firstMsgContext.timeframeLabel = currentTimeframe;
+      }
+      
       setLogMessages((prev) => [
         ...prev,
-        makeMessage("assistant", firstPrefix ? `${firstPrefix}\n\n${firstResult.answer}` : firstResult.answer, "", msgContext),
+        makeMessage("assistant", firstPrefix ? `${firstPrefix}\n\n${firstResult.answer}` : firstResult.answer, "", firstMsgContext),
       ]);
 
       if (firstResult.response.ok) {
@@ -869,9 +917,27 @@ function App({ signOut, user }) {
           setLatestSessionsPagination(nextSessionsPagination);
           setLatestMerged(nextResult.data?.merged || null);
           setAutoPageProgress({ loadedPages, totalPages: nextTotalPages });
+          
+          // Sync timeframe from backend response for each page  
+          let nextPageTimeframe = currentTimeframe;
+          if (nextResult.data?.detected_lookback_hours !== undefined) {
+            const detectedHours = nextResult.data.detected_lookback_hours;
+            const detectedTimeframe = hoursToTimeframe(detectedHours);
+            if (detectedTimeframe !== currentTimeframe) {
+              nextPageTimeframe = detectedTimeframe;
+              setAnalyzerTimeframe(detectedTimeframe);
+            }
+          }
+          
+          // Use synced timeframe for message context
+          const nextMsgContext = {};
+          if (nextPageTimeframe) {
+            nextMsgContext.modeLabel = "Fleet window";
+            nextMsgContext.timeframeLabel = nextPageTimeframe;
+          }
           setLogMessages((prev) => [
             ...prev,
-            makeMessage("assistant", `Page ${loadedPages} of ${nextTotalPages}\n\n${nextResult.answer}`, "", msgContext),
+            makeMessage("assistant", `Page ${loadedPages} of ${nextTotalPages}\n\n${nextResult.answer}`, "", nextMsgContext),
           ]);
 
           if (!hasNextPage && loadedPages >= nextTotalPages) {
@@ -1020,13 +1086,14 @@ function App({ signOut, user }) {
             isAnalyzerMode={!isAssistantMode}
             showChangeMode={false}
             onChangeMode={handleChangeAnalyzerMode}
-            suggestions={analyzerSetupComplete && ENABLE_SUGGESTIONS_BUTTON ? FLEET_MODE_SUGGESTIONS : []}
-            suggestionsOpen={suggestionsOpen && ENABLE_SUGGESTIONS_BUTTON}
-            onToggleSuggestions={ENABLE_SUGGESTIONS_BUTTON ? () => setSuggestionsOpen((prev) => !prev) : undefined}
-            onApplySuggestion={ENABLE_SUGGESTIONS_BUTTON ? applySuggestion : undefined}
+            suggestions={[]}
+            suggestionsOpen={false}
+            onToggleSuggestions={undefined}
+            onApplySuggestion={undefined}
             isBusy={activeBusy}
             stopLabel={activeStopLabel}
             onStop={stopCurrentGeneration}
+            enableSuggestionsButton={ENABLE_SUGGESTIONS_BUTTON}
           />
         </div>
       </section>

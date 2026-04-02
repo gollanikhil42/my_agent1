@@ -17,10 +17,11 @@ export function Composer({
   isBusy,
   stopLabel,
   onStop,
+  enableSuggestionsButton = false,
 }) {
   return (
     <>
-      {isAnalyzerMode && (
+      {isAnalyzerMode && enableSuggestionsButton && (
         <div className="composer-suggestions-shell">
           {showChangeMode && (
             <button
@@ -83,7 +84,7 @@ export function Composer({
               onClick={isBusy ? onStop : undefined}
               title={isBusy ? stopLabel : "Send"}
               aria-label={isBusy ? stopLabel : "Send"}
-              disabled={disabled}
+              disabled={isBusy ? false : disabled}
             >
               <span className="plane" aria-hidden="true">
                 {isBusy ? "■" : "➤"}

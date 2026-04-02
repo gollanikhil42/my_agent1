@@ -621,17 +621,18 @@ def _classify_fleet_request_llm(question: str, analyst_memory: Any = None) -> Di
 
     system_prompt = (
         "Classify the user message for a telemetry analysis dashboard. "
-        "Return ONLY JSON with three keys:\n"
-        "  intent:      'general_conversation' (greeting/small-talk) OR 'telemetry_analysis' (traces/sessions/latency/errors)\n"
-        "  strategy:    'completeness_first' (user explicitly wants to LIST every SESSION by its ID, or needs an EXACT total SESSION count) "
-        "OR 'balanced' (summaries, overviews, highlights, patterns, slowest/fastest analysis, issue diagnosis, "
-        "ANY user/username/who-used listing — even when the words list/all/every appear in a user-focused query)\n"
-        "  intent_type: 'summary' (user asks for an overview, summary, highlight of issues, or analysis of the whole window — "
-        "even if they say 'all sessions'; the key is they want INSIGHTS not an ENUMERATION) "
-        "OR 'listing' (user explicitly wants to enumerate/list items by ID) "
-        "OR 'analysis' (targeted analysis of a specific user, session, error pattern, etc.)\n"
-        "IMPORTANT: 'Give me a summary', 'overview', 'highlight issues', 'what happened', 'any issues' → intent_type=summary, strategy=balanced. "
-        "NEVER let recent conversation history change a summary/overview request into completeness_first or listing."
+        "Return ONLY JSON with these keys:\n"
+        "  intent:      'general_conversation' OR 'telemetry_analysis'\n"
+        "  strategy:    'completeness_first' OR 'balanced'\n"
+        "  intent_type: 'summary' OR 'listing' OR 'analysis'\n"
+        "  timeframe_change: null (if no timeframe change requested) OR a timeframe string like '7d', '30d', '1h', '6days', 'overall', etc.\n"
+        "CRITICAL RULES:\n"
+        "1. 'Give me a summary', 'overview' → intent_type=summary, strategy=balanced, timeframe_change=null.\n"
+        "2. 'list out all session ids', 'show me all sessions' → intent_type=listing, strategy=completeness_first, timeframe_change=null.\n"
+        "3. 'set timeframe to 30 days', 'go back to 7 days', 'change to 6 days' → intent=general_conversation, timeframe_change='30d' (or '7d', '6d').\n"
+        "4. 'show for last 7 days' or 'analyze 7 days' → depends on context: if ONLY setting timeframe = general_conversation + timeframe_change='7d'; if ALSO asking analysis = telemetry_analysis + analysis request + timeframe_change='7d'.\n"
+        "5. NEVER let conversation history override explicit timeframe requests.\n"
+        "6. Extract ANY timeframe mention (days, hours, weeks, minutes) and normalize it. Examples: '6 days'→'6d', '7 days'→'7d', '30days'→'30d', '1 hour'→'1h', '2 weeks'→'2w'."
     )
     memory_block = _format_analyst_memory(analyst_memory)
     user_content = "".join(
@@ -646,27 +647,57 @@ def _classify_fleet_request_llm(question: str, analyst_memory: Any = None) -> Di
             modelId="anthropic.claude-3-haiku-20240307-v1:0",
             system=[{"text": system_prompt}],
             messages=[{"role": "user", "content": [{"text": user_content}]}],
-            inferenceConfig={"maxTokens": 100, "temperature": 0.0},
+            inferenceConfig={"maxTokens": 150, "temperature": 0.0},
         )
         text = str(response["output"]["message"]["content"][0]["text"] or "").strip()
         parsed = json.loads(text)
         intent = str((parsed or {}).get("intent", "")).strip().lower()
         strategy = str((parsed or {}).get("strategy", "")).strip().lower()
         intent_type = str((parsed or {}).get("intent_type", "")).strip().lower()
+        timeframe_change = str((parsed or {}).get("timeframe_change", "")).strip().lower()
         if intent not in {"general_conversation", "telemetry_analysis"}:
             intent = "telemetry_analysis"
         if strategy not in {"completeness_first", "balanced"}:
             strategy = "balanced"
         if intent_type not in {"summary", "listing", "analysis"}:
             intent_type = "analysis"
+        if timeframe_change and timeframe_change != "null" and not re.match(r'^\d+[mhdw]?$|^overall$', timeframe_change):
+            timeframe_change = ""  # Invalid timeframe format, ignore
         # Summaries are never completeness_first — guard against model error
         if intent_type == "summary":
             strategy = "balanced"
-        return {"intent": intent, "strategy": strategy, "intent_type": intent_type}
+        
+        # KEYWORD FALLBACK: Correct intent_type based on explicit keywords
+        # This catches cases where the LLM misclassifies queries
+        
+        # Summary keyword detection (highest priority - catches "summary", "overview", "give me a summary")
+        summary_keywords = [
+            r'\b(summary|overview|summarize|recap|at\s+a\s+glance)\b',  # "give me a summary", "overview"
+            r'\bhow\s+(are\s+)?things\b',  # "how are things", "how are things going"
+        ]
+        is_summary_keywords = any(re.search(pattern, q, re.IGNORECASE) for pattern in summary_keywords)
+        if is_summary_keywords and intent_type != "summary":
+            intent_type = "summary"
+            strategy = "balanced"
+        
+        # Listing keyword detection (catches "list", "show all", "enumerate")
+        listing_keywords = [
+            r'list.*(all\s+)?(session|id|user|trace)',  # "list all sessions", "list session ids"
+            r'show.*(all\s+)?(session|id|user|trace)',  # "show all sessions"
+            r'(enumerate|display|get|retrieve|show).*(all|every)\s+(session|id|user|trace)',  # general enumerate
+            r'(session|user|trace)\s+id',  # "session ids", "user ids"
+            r'all\s+(session|user|trace)s?',  # "all sessions", "all users"
+        ]
+        listing_match = any(re.search(pattern, q, re.IGNORECASE) for pattern in listing_keywords)
+        if listing_match and intent_type != "listing":
+            intent_type = "listing"
+            strategy = "completeness_first"
+        
+        return {"intent": intent, "strategy": strategy, "intent_type": intent_type, "timeframe_change": timeframe_change or None}
     except Exception:
         pass
 
-    return {"intent": "telemetry_analysis", "strategy": "balanced", "intent_type": "analysis"}
+    return {"intent": "telemetry_analysis", "strategy": "balanced", "intent_type": "analysis", "timeframe_change": None}
 
 
 def _detect_timeframe_change_llm(question: str, current_timeframe_hours: float, analyst_memory: Any = None) -> float:
@@ -684,14 +715,21 @@ def _detect_timeframe_change_llm(question: str, current_timeframe_hours: float, 
         "Analyze the user message to detect if they want to change the analysis timeframe. "
         "Return ONLY JSON with one key:\n"
         "  new_hours: null (if no timeframe change requested) OR a number (hours to analyze)\n"
-        "Examples:\n"
+        "Examples of TIMEFRAME CHANGES:\n"
         "  'change to 5 days' → 120\n"
+        "  'set to 14 days' → 336\n"
         "  'switch to 3 hours' → 3\n"
         "  'last 2 weeks' → 336\n"
         "  'today' → 24\n"
         "  'last month' → 720\n"
         "  'analyze the last 30 minutes' → 0.5\n"
-        "  'what about errors in general?' → null (no timeframe change)\n"
+        "  'go to 7d' → 168\n"
+        "  'make it 1 week' → 168\n"
+        "  'timeframe to 5days' → 120\n"
+        "Examples of NO TIMEFRAME CHANGE:\n"
+        "  'what about errors in general?' → null\n"
+        "  'who is the slowest user?' → null\n"
+        "  'any patterns?' → null\n"
         f"Current timeframe: {int(current_timeframe_hours)} hours"
     )
     memory_block = _format_analyst_memory(analyst_memory)
@@ -902,7 +940,14 @@ def _should_paginate_sessions(
     page_size: int,
     pre_llm_elapsed: float,
     remaining_budget_seconds: float,
+    query_intent: Dict[str, Any] = None,
 ) -> bool:
+    # For listing queries, send all data but cap at reasonable limit to prevent extreme cases
+    if query_intent and query_intent.get("intent_type") == "listing":
+        if sessions_total > 500:  # Safety limit for extreme datasets
+            return True  # Apply gentle pagination for safety
+        return False  # No pagination for normal listing queries
+    
     effective_safe_page_size = min(max(1, int(page_size)), LLM_DISCOVERY_MAX_SESSIONS)
     # In discovery mode, always paginate when session volume exceeds the LLM-safe
     # session cap. This preserves the two-mode architecture and avoids forcing a
@@ -1663,7 +1708,7 @@ def _to_float(value: Any) -> float:
         return 0.0
 
 
-def _resolve_lookback_hours(body: Dict[str, Any], default_hours: int = 24) -> float:
+def _resolve_lookback_hours(body: Dict[str, Any], default_hours: int = 720) -> float:
     lookback_mode = str(body.get("lookback_mode", "")).strip().lower()
     lookback_raw = body.get("lookback_hours", default_hours)
     lookback_value = str(body.get("lookback_value", "")).strip()
@@ -2442,37 +2487,76 @@ def _build_discovery_diagnosis(
     max_tokens_override: int | None = None,
 ) -> Dict[str, Any]:
     window_minutes = int((merged.get("window") or {}).get("duration_minutes", 0) or 0)
+    timeframe_was_changed = merged.get("timeframe_was_changed", False)
+    detected_label = merged.get("detected_timeframe_label", "")
+    timeframe_acknowledgment = ""
+    if timeframe_was_changed and detected_label:
+        timeframe_acknowledgment = (
+            f"NOTE: The user requested a timeframe change. You are now analyzing the {detected_label} window. "
+            "If this is your first message about the new window, acknowledge it briefly at the start of your response. "
+            "Example: 'Switching to the {detected_label} window...' or 'Now analyzing the last {detected_label}...'\n\n"
+        )
+    
     system_prompt = (
-        "You are a telemetry analyst. Understand what the user is asking and respond naturally. "
-        "The context has these data scopes: "
-        "  (a) 'sessions_by_user' — CURRENT PAGE sessions PRE-GROUPED by user. "
+        "You are a telemetry analyst. Your responses must be accurate, clear, and based ONLY on the data provided. "
+        "Never make assumptions about data not explicitly in the context. "
+        f"{timeframe_acknowledgment}"
+        "The context has these data scopes:"
+        "  (a) 'aggregations' — GLOBAL statistics computed from ALL sessions in the entire timeframe. "
+        "      Fields: total_sessions, total_unique_users, slowest_session_id, slowest_session_latency_ms, "
+        "      fastest_session_id, fastest_session_latency_ms, average_error_rate, sessions_with_errors, "
+        "      top_error_users, user_distribution. "
+        "      USE THIS for answering global questions like 'Which is the slowest session?', "
+        "      'Give me a summary', 'What is the error rate?', etc. "
+        "      These aggregations represent the COMPLETE dataset for the timeframe. "
+        "  (b) 'sessions_by_user' — CURRENT PAGE sessions PRE-GROUPED by user. "
         "      Each entry: {user_name: {user_id, session_count_total, total_traces_total, page_sessions: [...]}}. "
         "      page_sessions fields: session_id, trace_count, avg_latency_ms, max_latency_ms, "
         "      latest_trace_timestamp_utc, error_rate, delayed_rate. "
-        "  (b) 'sessions' — flat dict of current page sessions. Use ONLY for session-only listing queries. "
-        "  (c) 'all_pages_user_index' — user-level aggregates across ALL pages (counts/totals only). "
-        "  (d) 'all_pages_session_index' — DO NOT enumerate from here. Use ONLY for trace_id_sample lookup. "
+        "  (c) 'sessions' — flat dict of current page sessions. Use ONLY for session-only listing queries. "
+        "  (d) 'all_pages_user_index' — user-level aggregates across ALL pages with real user names. "
+        "      Use this index to ALWAYS show real user names when available (never show UUIDs if user_name is available in this index). "
+        "  (e) 'all_pages_session_index' — DO NOT enumerate from here. Use ONLY for trace_id_sample lookup. "
+        ""
+        "CRITICAL RULES TO FOLLOW:"
+        "  1. Never invent or hallucinate data. If data is missing, say 'data not available'."
+        "  2. IMPORTANT: Always use 'all_pages_user_index' to look up real user names. If a user UUID appears, "
+        "     check if it has a user_name in all_pages_user_index and use the name instead of the UUID."
+        "  3. For GLOBAL aggregate questions, ALWAYS reference the 'aggregations' section — it has the complete picture."
+        "  4. Track pagination state carefully. EVERY response must maintain page count consistency."
+        "  4. For multi-page responses, ALWAYS indicate 'Page X of Y' at the TOP of the response."
+        "  5. Page X and Page Y must NEVER change between consecutive pages — if total is 14, all pages must say 'of 14'."
+        "  6. When mentioning session/trace IDs, use FULL IDs (e.g., 69ccbc510abdc04a143ac87c703c9544 NOT 69ccbc51)."
+        "  7. When displaying user names, include actual user identification from the data (use all_pages_user_index)."
+        "  8. Always include timestamps in UTC when data is available."
+        ""
+        "RESPONSE FORMATTING (CRITICAL):"
+        "  - Write concisely and clearly. Avoid long, dense paragraphs."
+        "  - Use natural language structured with line breaks for readability (like ChatGPT)."
+        "  - For listings: Present one item per line or grouped logically with clear separators."
+        "  - For analysis: Use short sentences and bullet-like structure when listing multiple insights."
+        "  - Between different sections/insights: Use a blank line for visual separation."
+        "  - For metrics: Present them naturally inline (e.g., 'User X had 5 sessions with 10 traces')."
+        "  - NEVER wrap long boring paragraphs together. Keep each insight on separate lines."
+        ""
+        "ABSOLUTELY NO MARKDOWN: Do NOT use ** for bold, # for headers, - for bullet points, or any markdown syntax. Write plain text with natural language only. Use regular words and line breaks for readability."
+        ""
         "USER-ONLY LISTING ('who used the system', 'list all users', 'list usernames'): "
-        "  Use all_pages_user_index. List every user with their session_count and total_traces. "
+        "  Use all_pages_user_index. Describe users naturally with their session and trace counts. "
+        "  Example: 'nikhil had 19 sessions with 36 traces, srivatsa had 10 sessions with 32 traces, and so on.' "
         "  End with: 'These are all users in the window — no more pages needed.' Never mention pagination here. "
         "USER + SESSION LISTING ('list all users and their sessions', 'show users with sessions', 'list sessions per user'): "
         "  Iterate sessions_by_user directly — do NOT touch the flat 'sessions' dict or all_pages_user_index for session rows. "
-        "  For each user in sessions_by_user: print header '{user_name} — {session_count_total} sessions total, {total_traces_total} traces total'. "
-        "  Then list each item in page_sessions using the LISTING FORMAT below. "
-        "  If sessions_pagination_context says more pages exist, end with a single line summarising remaining pages. "
+        "  For each user, describe their sessions naturally. Can also use plain-text tables with ' — ' or ' | ' separators. "
+        "  If sessions_pagination_context says more pages exist, end with a sentence about remaining pages. "
         "SESSION LISTING ('list sessions', 'show all sessions', 'list all session IDs'): "
         "  ONLY enumerate sessions in the current 'sessions' block — NEVER from all_pages_session_index. "
-        "  List them in order. At the end note the page number and total if sessions_pagination_context says more pages exist. "
-        "LISTING FORMAT: For each session line use EXACTLY: "
-        "{session_id} | {user_name} | {trace_count} traces | average latency {avg_latency_ms} ms | maximum latency {max_latency_ms} ms | latest {latest_trace_timestamp_utc} "
-        "No markdown. No --- separator lines. No bold. No bullet points. Plain text only. Full IDs only. "
+        "  Present them clearly. At the end note the page number and total if multiple pages exist. "
         "SUMMARY/ANALYSIS requests ('Give me a summary', 'Overview', 'which is slowest'): "
-        "  Give a short, crisp overview — under 150 words. Don't enumerate sessions. Don't mention pagination. "
-        "For user-specific requests: focus only on that user's sessions and metrics. "
-        "Always include timestamps in UTC when available in the data. "
-        "Use 'average latency' and 'maximum latency' — never abbreviate as avg/max. "
-        "If completeness_note is present in the context, mention it at the end briefly. "
-        "Plain text. Full IDs. No markdown."
+        "  Give a well-structured overview with clear insights. Include key metrics like error rates, "
+        "  latency patterns, affected users, and root causes where identifiable. Write in natural language. "
+        "  Don't just list facts—connect them into a coherent narrative. "
+        "If completeness_note is present in the context, mention it at the end."
     )
 
     context_json = json.dumps(merged, default=str)
@@ -3032,6 +3116,7 @@ def _build_discovery_context(merged: Dict[str, Any], query_intent: Dict[str, Any
     intent = query_intent or {}
     filter_user_id = str(intent.get("user_id", "")).strip()
     requested_user = str(intent.get("requested_user", "")).strip()
+    is_listing_query = (intent or {}).get("intent_type") == "listing"
 
     filtered_sessions = sessions
     filtered_users = users
@@ -3113,7 +3198,10 @@ def _build_discovery_context(merged: Dict[str, Any], query_intent: Dict[str, Any
     all_pages_user_index = dict(list(users_from_all_pages.items())[:120])
 
     paged_sessions = filtered_sessions
-    if sessions_pagination_context:
+    # For listing queries, NEVER paginate sessions - provide full dataset to LLM
+    # For summary queries, NEVER paginate - only fleet metrics needed
+    # For other queries, apply pagination if context indicates it
+    if sessions_pagination_context and not is_listing_query and not is_summary_query:
         page = int(sessions_pagination_context.get("page", 1) or 1)
         page_size = int(sessions_pagination_context.get("page_size", LLM_DISCOVERY_MAX_SESSIONS) or LLM_DISCOVERY_MAX_SESSIONS)
         paged_sessions, _, _ = _apply_pagination_to_sessions(filtered_sessions, page=page, page_size=page_size)
@@ -3123,11 +3211,13 @@ def _build_discovery_context(merged: Dict[str, Any], query_intent: Dict[str, Any
                 for sess in paged_sessions.values()
                 if isinstance(sess, dict)
             }
-            filtered_users = {
-                user_id: user_obj
-                for user_id, user_obj in filtered_users.items()
-                if str(user_id).strip() in paged_user_ids
-            }
+            # For listing queries, preserve all users (not just those on current page)
+            if not is_listing_query:
+                filtered_users = {
+                    user_id: user_obj
+                    for user_id, user_obj in filtered_users.items()
+                    if str(user_id).strip() in paged_user_ids
+                }
 
             # Keep user-level session lists aligned with the current page so the
             # LLM cannot leak IDs from pages not present in paged_sessions.
@@ -3150,52 +3240,106 @@ def _build_discovery_context(merged: Dict[str, Any], query_intent: Dict[str, Any
                     for sid in (_user_obj.get("sessions") or [])
                     if str(sid).strip() in paged_session_ids
                 ]
-                if not _user_sessions:
+                # For listing queries, include all users (even if no sessions on this page)
+                # For other queries, only include users with sessions on current page
+                if not _user_sessions and not is_listing_query:
                     continue
                 trimmed_users[_uid] = {
                     **_user_obj,
-                    "sessions": _user_sessions,
-                    "session_count": len(_user_sessions),
-                    "total_traces": int(paged_trace_totals_by_user.get(str(_uid).strip(), 0)),
+                    "sessions": _user_sessions if not is_listing_query else (_user_obj.get("sessions") or []),
+                    "session_count": _user_obj.get("session_count", 0),
+                    "total_traces": _user_obj.get("total_traces", 0),
                 }
             filtered_users = trimmed_users
 
     # Build the per-session summary rows for all filtered sessions (used in
-    # the response body / pagination).  For the LLM we only include the top
-    # LLM_DISCOVERY_MAX_SESSIONS entries sorted by error-rate then max-latency
-    # so Bedrock never sees more than ~12KB of input regardless of window size.
-    all_session_rows = [
-        (
-            sid,
-            {
-                "session_id": sid,
-                "user": sess.get("user", {}),
-                "trace_count": sess.get("trace_count", 0),
-                "avg_latency_ms": (sess.get("session_metrics") or {}).get("avg_e2e_ms"),
-                "max_latency_ms": (sess.get("session_metrics") or {}).get("max_e2e_ms"),
-                "latest_trace_epoch_ms": sess.get("latest_trace_ts"),
-                "latest_trace_timestamp_utc": _format_epoch_ms_to_iso_utc(sess.get("latest_trace_ts")),
-                "error_rate": (sess.get("session_metrics") or {}).get("error_rate"),
-                "delayed_rate": (sess.get("session_metrics") or {}).get("delayed_rate"),
-            },
+    # the response body / pagination).  For the LLM we include enough sessions
+    # to ensure all users are represented. When not explicitly paginating,
+    # use a larger limit to give better coverage of user population.
+    
+    # For listing queries, build MINIMAL context (just enumeration data)
+    # For other queries, build DETAILED context (analysis data)
+    if is_listing_query:
+        # Listing queries: lightweight enumeration context to avoid token starvation
+        all_session_rows = [
+            (
+                sid,
+                {
+                    "session_id": sid,
+                    "user_id": str(((sess.get("user") or {}).get("user_id", "")).strip() or "unknown"),
+                    "user_name": str(((sess.get("user") or {}).get("user_name", "")).strip() or "unknown"),
+                    "trace_count": sess.get("trace_count", 0),
+                    "latest_trace_timestamp_utc": _format_epoch_ms_to_iso_utc(sess.get("latest_trace_ts")),
+                },
+            )
+            for sid, sess in paged_sessions.items()
+            if isinstance(sess, dict)
+        ]
+    else:
+        # Other queries: full detail context for analysis
+        all_session_rows = [
+            (
+                sid,
+                {
+                    "session_id": sid,
+                    "user": sess.get("user", {}),
+                    "trace_count": sess.get("trace_count", 0),
+                    "avg_latency_ms": (sess.get("session_metrics") or {}).get("avg_e2e_ms"),
+                    "max_latency_ms": (sess.get("session_metrics") or {}).get("max_e2e_ms"),
+                    "latest_trace_epoch_ms": sess.get("latest_trace_ts"),
+                    "latest_trace_timestamp_utc": _format_epoch_ms_to_iso_utc(sess.get("latest_trace_ts")),
+                    "error_rate": (sess.get("session_metrics") or {}).get("error_rate"),
+                    "delayed_rate": (sess.get("session_metrics") or {}).get("delayed_rate"),
+                },
+            )
+            for sid, sess in paged_sessions.items()
+            if isinstance(sess, dict)
+        ]
+    # Sort: most recent first for listing, or recency + metrics for analysis queries
+    # For listing queries, just sort by recency since other fields aren't available
+    if is_listing_query:
+        # Listing queries: sort by timestamp only (minimal context)
+        all_session_rows.sort(
+            key=lambda item: str((item[1] or {}).get("latest_trace_timestamp_utc", "")),
+            reverse=True
         )
-        for sid, sess in paged_sessions.items()
-        if isinstance(sess, dict)
-    ]
-    # Sort: most recent first, then highest error_rate, then highest max_latency.
-    # Recency-first ensures the newest sessions are always visible to the LLM
-    # regardless of whether they had errors — critical for list/enumeration queries.
-    all_session_rows.sort(
-        key=lambda item: (
-            -_to_float((item[1] or {}).get("latest_trace_epoch_ms")),
-            -_to_float((item[1] or {}).get("error_rate")),
-            -_to_float((item[1] or {}).get("max_latency_ms")),
+    else:
+        # Analysis queries: sort by recency, then error rate, then latency
+        all_session_rows.sort(
+            key=lambda item: (
+                -_to_float((item[1] or {}).get("latest_trace_epoch_ms")),
+                -_to_float((item[1] or {}).get("error_rate")),
+                -_to_float((item[1] or {}).get("max_latency_ms")),
+            )
         )
-    )
     total_sessions_count = len(filtered_sessions)
     sessions_on_page_count = len(all_session_rows)
-    llm_session_rows = all_session_rows[:LLM_DISCOVERY_MAX_SESSIONS]
-    sessions_truncated = sessions_on_page_count > LLM_DISCOVERY_MAX_SESSIONS
+    # CRITICAL: For pagination to work at scale, keep sessions-per-page small
+    # This ensures LLM call time stays <20s even with thousands of sessions.
+    # Pagination dedup prevents duplicates across pages.
+    # Frontend auto-pagination collects all pages for user to see complete dataset.
+    
+    # When paginating, deduplicate: remove sessions already shown on previous pages
+    if sessions_pagination_context and not is_listing_query:
+        current_page = int(sessions_pagination_context.get("page", 1) or 1)
+        current_page_size = int(sessions_pagination_context.get("page_size", LLM_DISCOVERY_MAX_SESSIONS) or LLM_DISCOVERY_MAX_SESSIONS)
+        pages_before_current = max(0, current_page - 1)
+        sessions_already_shown = pages_before_current * current_page_size
+        # For THIS page, show only the current page's worth of sessions (dedup by offset)
+        # This prevents the LLM from re-analyzing sessions already shown on previous pages
+        llm_session_rows = all_session_rows[sessions_already_shown:sessions_already_shown + current_page_size]
+    else:
+        # For listing queries: show ALL sessions to ensure complete enumeration
+        # For first page or non-paginated: show up to page_size sessions to stay fast
+        if is_listing_query:
+            # Listing queries get ALL sessions untruncated
+            llm_session_rows = all_session_rows
+        else:
+            # Never send more than page_size to avoid timeout risk
+            page_size = LLM_DISCOVERY_MAX_SESSIONS  # typically 8
+            llm_session_rows = all_session_rows[:page_size]
+    
+    sessions_truncated = len(all_session_rows) > len(llm_session_rows)
 
     # Pre-group current-page sessions by user so the LLM never has to do the
     # grouping itself — manual LLM grouping from a flat sessions dict causes
@@ -3203,9 +3347,17 @@ def _build_discovery_context(merged: Dict[str, Any], query_intent: Dict[str, Any
     # Structure: {user_name: {user_id, session_count_total, total_traces_total, page_sessions: [...]}}
     _sessions_by_user: Dict[str, Any] = {}
     for _sid, _srow in llm_session_rows:
-        _u = (_srow.get("user") or {})
-        _uname = str(_u.get("user_name") or _u.get("user_id") or "unknown").strip()
-        _uid = str(_u.get("user_id") or "").strip()
+        # Handle both structures: detailed context has full "user" object, listing queries have split user_id/user_name
+        if "user" in _srow:
+            # Detailed context structure
+            _u = (_srow.get("user") or {})
+            _uname = str(_u.get("user_name") or _u.get("user_id") or "unknown").strip()
+            _uid = str(_u.get("user_id") or "").strip()
+        else:
+            # Listing query structure
+            _uid = str(_srow.get("user_id") or "unknown").strip()
+            _uname = str(_srow.get("user_name") or _uid or "unknown").strip()
+        
         if _uname not in _sessions_by_user:
             _idx_entry = all_pages_user_index.get(_uid) or {}
             _sessions_by_user[_uname] = {
@@ -3225,6 +3377,40 @@ def _build_discovery_context(merged: Dict[str, Any], query_intent: Dict[str, Any
             "delayed_rate": _srow.get("delayed_rate"),
         })
 
+    # Compute global aggregations from ALL filtered sessions (used for LLM global answers)
+    def _compute_aggregations_for_context(sessions_dict):
+        """Compute global aggregations from sessions dictionary."""
+        if not sessions_dict:
+            return {}
+        sessions_list = list(sessions_dict.values())
+        slowest = max(sessions_list, key=lambda s: float((s or {}).get("max_latency_ms") or 0), default=None)
+        fastest = min(sessions_list, key=lambda s: float((s or {}).get("avg_latency_ms") or float('inf')), default=None)
+        error_rates = [float((s or {}).get("error_rate") or 0) for s in sessions_list]
+        avg_error = sum(error_rates) / len(error_rates) if error_rates else 0
+        
+        unique_users = set()
+        error_sessions = 0
+        for sess in sessions_list:
+            if isinstance(sess, dict):
+                user_id = str(((sess.get("user") or {}).get("user_id") or "")).strip()
+                if user_id:
+                    unique_users.add(user_id)
+                if float((sess.get("error_rate") or 0)) > 0:
+                    error_sessions += 1
+        
+        return {
+            "total_sessions": len(sessions_list),
+            "total_unique_users": len(unique_users),
+            "slowest_session_id": slowest[0].strip() if slowest and isinstance(slowest, tuple) else None,
+            "slowest_session_latency_ms": round(float((slowest[1] or {}).get("max_latency_ms") or 0), 2) if slowest and isinstance(slowest, tuple) else 0,
+            "fastest_session_id": fastest[0].strip() if fastest and isinstance(fastest, tuple) else None,
+            "fastest_session_latency_ms": round(float((fastest[1] or {}).get("avg_latency_ms") or 0), 2) if fastest and isinstance(fastest, tuple) else 0,
+            "average_error_rate": round(avg_error * 100, 2),
+            "sessions_with_errors": error_sessions,
+        }
+    
+    aggregations = _compute_aggregations_for_context(filtered_sessions)
+    
     # Data completeness signal: tell the LLM when runtime logs were unavailable
     # (only X-Ray data collected), which causes unknown-session / unknown-user entries.
     runtime_events_scanned = int(
@@ -3243,11 +3429,17 @@ def _build_discovery_context(merged: Dict[str, Any], query_intent: Dict[str, Any
             "Try re-running the same query in a few seconds for complete attribution."
         )
 
-    # If the LLM intent is summary, only pass summary metrics and a high-level overview, not the full session index.
+    # ── HYBRID CONTEXT ARCHITECTURE ──────────────────────────────────────────────
+    # SUMMARY queries: high-level metrics only (no sessions)
+    # LISTING queries: minimal enumeration (session_id, user_id, user_name, trace_count, timestamp)
+    # ANALYSIS queries: full session metrics and user/session groupings
+    
     if intent.get("intent_type") == "summary":
+        # SUMMARY MODE: Overview only, no session details
         return {
             "analysis_mode": "discovery",
             "window": merged.get("window", {}),
+            "aggregations": aggregations,
             "fleet_summary": {
                 "total_sessions": total_sessions_count,
                 "total_traces": sum(int((sess or {}).get("trace_count", 0) or 0) for sess in paged_sessions.values()),
@@ -3269,10 +3461,50 @@ def _build_discovery_context(merged: Dict[str, Any], query_intent: Dict[str, Any
             ],
             "completeness_note": completeness_note,
         }
+    elif is_listing_query:
+        # LISTING MODE: Minimal enumeration only - just session IDs and user names for quick enumeration
+        # No metrics, no latencies - keep context ~10-15 KB to ensure fast LLM response
+        minimal_sessions = {}
+        for sid, srow in llm_session_rows:
+            if "user" in srow:
+                # Full session object structure
+                user_info = srow.get("user", {})
+                uid = str(user_info.get("user_id", "")).strip() or "unknown"
+                uname = str(user_info.get("user_name", "")).strip() or uid
+            else:
+                # Already split structure
+                uid = srow.get("user_id", "unknown")
+                uname = srow.get("user_name", uid)
+            
+            minimal_sessions[sid] = {
+                "session_id": sid,
+                "user_id": uid,
+                "user_name": uname,
+                "trace_count": int(srow.get("trace_count", 0) or 0),
+                "latest_timestamp_utc": srow.get("latest_trace_timestamp_utc", ""),
+            }
+        
+        return {
+            "analysis_mode": "discovery",
+            "strategy": "enumeration",  # Signal to LLM this is a list operation
+            "window": merged.get("window", {}),
+            "fleet_summary": {
+                "total_sessions": total_sessions_count,
+                "total_traces": sum(int(s.get("trace_count", 0) or 0) for s in minimal_sessions.values()),
+                "sessions_shown_to_llm": len(minimal_sessions),
+                "sessions_truncated": sessions_truncated,
+            },
+            "sessions": minimal_sessions,  # Minimal: no metrics, no error rates
+            "sessions_by_user": _sessions_by_user,  # User grouping from page
+            "all_pages_user_index": all_pages_user_index,  # Cross-page user summary
+            "completeness_note": completeness_note,
+        }
     else:
+        # ANALYSIS MODE: Full metrics and details for in-depth analysis
         return {
             "analysis_mode": "discovery",
             "window": merged.get("window", {}),
+            "aggregations": aggregations,
             "fleet_summary": {
                 "total_sessions": total_sessions_count,
                 "total_traces": sum(int((sess or {}).get("trace_count", 0) or 0) for sess in paged_sessions.values()),
@@ -3590,6 +3822,7 @@ def _handle_fleet_insights(
     analyst_memory: Any = None,
     query_profile: str = "balanced",
     intent_type: str = "analysis",
+    original_lookback_hours: float = None,
 ) -> Dict[str, Any]:
     handler_start = time.perf_counter()
     analysis_id = str(uuid.uuid4())[:8]
@@ -3637,7 +3870,7 @@ def _handle_fleet_insights(
     # analyst ranges and should prefer completeness so that a longer window remains
     # a superset of shorter windows for user/session discovery.
     # to prevent session-building + LLM from exceeding the 29s API Gateway timeout.
-    medium_mode = (window_minutes > 5 * 24 * 60) and (not fast_mode) and (not is_analytical_overall) and (not completeness_first)
+    medium_mode = (window_minutes > 5 * 24 * 60) and (not fast_mode) and (not is_analytical_overall) and (not completeness_first) and (intent_type != "summary")
     if medium_mode:
         # runtime_limit is intentionally NOT capped here — time budgets (runtime_budget_seconds)
         # already prevent timeouts, and capping events causes user/session counts in listing
@@ -4008,6 +4241,7 @@ def _handle_fleet_insights(
             "timestamp_utc": str((runtime_details_by_trace.get(str(t.get("trace_id", "")), {}) or {}).get("timestamp_utc", "")),
             "user": (runtime_details_by_trace.get(str(t.get("trace_id", "")), {}) or {}).get("user", {}),
             "evaluator_scores": t.get("evaluator_metrics", {}),
+            "model_invocation": (runtime_details_by_trace.get(str(t.get("trace_id", "")), {}) or {}).get("model_invocation", {}),
             "xray": _xray_summary_for_trace(str(t.get("trace_id", ""))),
         }
         for t in sorted(all_traces, key=lambda row: _to_float(row.get("e2e_ms")), reverse=True)
@@ -4440,6 +4674,7 @@ def _handle_fleet_insights(
         page_size=page_size,
         pre_llm_elapsed=pre_llm_elapsed,
         remaining_budget_seconds=remaining_budget,
+        query_intent=query_intent,
     )
     if should_paginate_sessions_flag:
         effective_session_page_size = page_size
@@ -4590,6 +4825,18 @@ def _handle_fleet_insights(
     # DISCOVERY: per-session stats only — tiny context, fast LLM response.
     # TRACE LOOKUP: focused trace diagnostics + xray details for requested IDs.
     # DEEP DIVE: full trace + XRay detail for ONE named session.
+    # Add timeframe change information to merged for LLM awareness
+    original_lb = original_lookback_hours if original_lookback_hours is not None else lookback_hours
+    merged["timeframe_was_changed"] = abs(lookback_hours - original_lb) > 0.01
+    merged["detected_timeframe_hours"] = lookback_hours
+    merged["original_lookback_hours"] = original_lb
+    
+    def _hours_to_label(h: float) -> str:
+        if h < 1: return f"{int(h * 60)}m"
+        elif h < 24: return f"{int(h)}h"
+        else: return f"{int(h / 24)}d" if (h / 24) < 7 else f"{int(h / 168)}w"
+    merged["detected_timeframe_label"] = _hours_to_label(lookback_hours)
+    
     context_build_start = time.perf_counter()
     if _is_deep_dive:
         llm_context = _build_deep_dive_context(merged, query_intent["session_id"])
@@ -4605,7 +4852,15 @@ def _handle_fleet_insights(
             "fleet_metrics": merged.get("fleet_metrics", {}),
         }
     else:
-        llm_context = _build_discovery_context(merged, query_intent=query_intent)
+        # For listing queries, always use full unfiltered data to show all users
+        # For other queries, use paginated data (merged_for_llm) if pagination was applied
+        is_listing = (query_intent or {}).get("intent_type") == "listing"
+        context_source = merged if (should_paginate_sessions_flag and is_listing) else (merged_for_llm if should_paginate_sessions_flag else merged)
+        if should_paginate_sessions_flag:
+            # Remove pagination context so _build_discovery_context uses sessions as-is
+            context_source = context_source.copy()
+            context_source.pop("sessions_pagination_context", None)
+        llm_context = _build_discovery_context(context_source, query_intent=query_intent)
     context_build_elapsed = round(time.perf_counter() - context_build_start, 3)
 
     # ── Measure size of context being sent to LLM ──────────────────────────────
@@ -4631,10 +4886,9 @@ def _handle_fleet_insights(
     llm_start = time.perf_counter()
     elapsed_before_llm = time.perf_counter() - handler_start
     # Use the full remaining safe budget for the LLM call (no fixed 14s/22s cap).
-    # This keeps us under API Gateway timeout while allowing deep trace/session
-    # questions enough time to complete.
-    remaining_llm_budget = max(0.0, 28.2 - elapsed_before_llm)
-    if remaining_llm_budget < 4.0:
+    # Lambda timeout is 30s, so leave 1.5s buffer. This allows ~28.5s for total execution.
+    remaining_llm_budget = max(0.0, 28.5 - elapsed_before_llm)
+    if remaining_llm_budget < 5.0:
         raise TimeoutError(
             f"Fleet analysis aborted before LLM call because only {round(remaining_llm_budget, 2)}s remained in the response budget."
         )
@@ -4674,7 +4928,8 @@ def _handle_fleet_insights(
 
     try:
         if (not _is_trace_lookup) and (not _is_deep_dive):
-            first_attempt_timeout = min(llm_timeout_seconds, 15.0)
+            # Give discovery mode more time (up to 24s) for complex queries
+            first_attempt_timeout = min(llm_timeout_seconds, 24.0)
         else:
             first_attempt_timeout = llm_timeout_seconds
         raw_answer = _run_llm_attempt(llm_builder, llm_builder_args, first_attempt_timeout)
@@ -4687,7 +4942,7 @@ def _handle_fleet_insights(
 
         if (not _is_trace_lookup) and (not _is_deep_dive):
             elapsed_so_far = time.perf_counter() - handler_start
-            retry_budget = max(0.0, 28.2 - elapsed_so_far)
+            retry_budget = max(0.0, 28.5 - elapsed_so_far)
             if retry_budget >= 4.0:
                 retry_tokens = min(DIAGNOSIS_FLEET_DISCOVERY_MAX_TOKENS, 300)
                 _emit_analyzer_trace({
@@ -4769,6 +5024,10 @@ def _handle_fleet_insights(
     compact_merged = _compact_fleet_merged(merged)
     
     response_start = time.perf_counter()
+    
+    # Aggregations are already computed in llm_context from _build_discovery_context
+    # Extract them for the response
+    aggregations = llm_context.get("aggregations", {}) if isinstance(llm_context, dict) else {}
     _active_pagination = sessions_pagination_info if sessions_pagination_info else pagination_info
     _has_next_page = bool((_active_pagination or {}).get("has_next_page"))
     _sessions_on_page = int((_active_pagination or {}).get("sessions_on_this_page") or (_active_pagination or {}).get("page_size") or 0)
@@ -4822,9 +5081,24 @@ def _handle_fleet_insights(
         answer = "\n".join(lines).rstrip()
         # Do not append any user-visible note — the frontend pagination UI handles continuation.
 
+    # Calculate if timeframe was changed by LLM detection
+    original_lb = original_lookback_hours if original_lookback_hours is not None else lookback_hours
+    timeframe_was_changed = abs(lookback_hours - original_lb) > 0.01
+    
+    def _hours_to_timeframe_label(hours: float) -> str:
+        """Convert hours to human-readable timeframe label."""
+        if hours < 1:
+            return f"{int(hours * 60)}m"
+        elif hours < 24:
+            return f"{int(hours)}h"
+        else:
+            days = hours / 24
+            return f"{int(days)}d" if days < 7 else f"{int(days / 7)}w"
+    
     response_body = json.dumps(
         {
             "answer": answer,
+            "aggregations": aggregations,
             "merged": compact_merged,
             "pagination": pagination_info if pagination_info else None,
             "sessions_pagination": sessions_pagination_info if sessions_pagination_info else None,
@@ -4833,6 +5107,10 @@ def _handle_fleet_insights(
             "auto_paginate_reason": (
                 "max_output_tokens" if _token_cap_hit else "too_much_matter" if _matter_too_much else "none"
             ),
+            "detected_lookback_hours": lookback_hours,
+            "detected_timeframe_label": _hours_to_timeframe_label(lookback_hours),
+            "timeframe_was_changed": timeframe_was_changed,
+            "original_lookback_hours": original_lb,
             "anchors": {
                 "request_id": "",
                 "client_request_id": "",
@@ -4898,7 +5176,7 @@ def _handle_session_insights(event: Dict[str, Any]) -> Dict[str, Any]:
     question = str(body.get("question", "")).strip()
     header_session_id = _extract_session_id_header(event)
     session_id = header_session_id or str(body.get("session_id", "")).strip()
-    lookback_hours = _resolve_lookback_hours(body, default_hours=24)
+    lookback_hours = _resolve_lookback_hours(body, default_hours=720)
     lookback_mode = str(body.get("lookback_mode", "")).strip().lower()
     analyst_memory = _normalize_analyst_memory(body.get("analyst_memory", []))
 
@@ -4919,7 +5197,40 @@ def _handle_session_insights(event: Dict[str, Any]) -> Dict[str, Any]:
     # Classify user intent and strategy using LLM
     fleet_classify = _classify_fleet_request_llm(question, analyst_memory)
     
+    # Check if user is requesting a timeframe change (even if it's a general conversation)
+    timeframe_change_str = fleet_classify.get("timeframe_change", "").strip().lower() if fleet_classify.get("timeframe_change") else ""
+    if timeframe_change_str and timeframe_change_str != "null":
+        # Parse timeframe like '30d', '7days', '1h' and convert to hours
+        timeframe_match = re.match(r'^(\d+)\s*([mhdw]?)(?:ay)?s?$|^overall$', timeframe_change_str)
+        if timeframe_match or timeframe_change_str == "overall":
+            if timeframe_change_str == "overall":
+                lookback_hours = 720  # 30 days max
+            else:
+                amount = int(timeframe_match.group(1))
+                unit = timeframe_match.group(2) or 'd'
+                hours_map = {'m': 1/60, 'h': 1, 'd': 24, 'w': 24*7}
+                lookback_hours = min(720, amount * hours_map.get(unit, 24))
+    
     if fleet_classify["intent"] == "general_conversation":
+        # If ONLY changing timeframe (no data request), return confirmation with new timeframe
+        if timeframe_change_str and timeframe_change_str != "null":
+            answer = f"Switched to analyzing the last {timeframe_change_str.replace('d', ' days').replace('h', ' hours').replace('w', ' weeks')}. Ready to help with any questions!"
+            return {
+                "statusCode": 200,
+                "headers": CORS_HEADERS,
+                "body": json.dumps({
+                    "answer": _sanitize_analysis_answer(answer),
+                    "detected_lookback_hours": lookback_hours,
+                    "merged": {"analysis_mode": "timeframe_change", "note": "Timeframe updated."},
+                    "pagination": None,
+                    "sessions_pagination": None,
+                    "query_mode": "general_conversation",
+                    "auto_paginate_recommended": False,
+                    "auto_paginate_reason": "timeframe_change_only",
+                    "anchors": {},
+                }),
+            }
+        # Otherwise, normal general conversation
         answer = _build_general_conversation_reply(question, analyst_memory)
         return {
             "statusCode": 200,
@@ -4964,6 +5275,7 @@ def _handle_session_insights(event: Dict[str, Any]) -> Dict[str, Any]:
             analyst_memory=analyst_memory,
             query_profile=query_profile,
             intent_type=fleet_classify.get("intent_type", "analysis"),
+            original_lookback_hours=lookback_hours,
         )
         elapsed = round(time.perf_counter() - request_start, 2)
         # Log successful completion
