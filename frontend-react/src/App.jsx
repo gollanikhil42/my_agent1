@@ -167,7 +167,7 @@ function formatResponseForReadability(text) {
   return formatted.trim();
 }
 
-function buildAnalystMemory(logMessages, latestMerged, anchors, totalFleetTraces) {
+function buildAnalystMemory(logMessages, latestMerged, anchors, totalFleetTraces, fleetWindowStats) {
   const recentTurns = logMessages
     .filter((msg) => msg.role === "user" || msg.role === "assistant")
     .slice(-(ANALYST_MEMORY_LIMIT - 1))
@@ -194,6 +194,10 @@ function buildAnalystMemory(logMessages, latestMerged, anchors, totalFleetTraces
   }
 
   if (!hasTraceContext && latestMerged) {
+    // Add fleet window stats from state (preserved across conversation)
+    if (fleetWindowStats?.total_sessions > 0) {
+      contextLines.push(`Current window (${fleetWindowStats.timeframe}): ${fleetWindowStats.total_sessions} sessions, ${fleetWindowStats.total_unique_users} users.`);
+    }
     const bottleneck = latestMerged?.bottleneck_ranking?.[0]?.component || "n/a";
     const avgLatency = latestMerged?.fleet_metrics?.e2e_ms?.avg || 0;
     contextLines.push(`Current window covers ${totalFleetTraces || 0} traces.`);
@@ -244,6 +248,11 @@ function App({ signOut, user }) {
   const [logQuestion, setLogQuestion] = useState("");
   const [logMessages, setLogMessages] = useState([makeAnalystWelcomeMessage()]);
   const [analyzerTimeframe, setAnalyzerTimeframe] = useState("30d"); // Default to 30 days for general conversation
+  const [fleetWindowStats, setFleetWindowStats] = useState({
+    timeframe: "30d",
+    total_sessions: 0,
+    total_unique_users: 0,
+  }); // Preserve window stats across conversation
   const [analyzerSetupStep, setAnalyzerSetupStep] = useState("complete");
   const [analyzerSetupComplete, setAnalyzerSetupComplete] = useState(true);
   const [autoAnchors, setAutoAnchors] = useState({
@@ -291,8 +300,8 @@ function App({ signOut, user }) {
 
   const totalFleetTraces = latestPagination?.total_traces || latestMerged?.fleet_metrics?.traces_total || 0;
   const analystMemory = useMemo(
-    () => buildAnalystMemory(logMessages, latestMerged, effectiveAnchors, totalFleetTraces),
-    [logMessages, latestMerged, effectiveAnchors, totalFleetTraces],
+    () => buildAnalystMemory(logMessages, latestMerged, effectiveAnchors, totalFleetTraces, fleetWindowStats),
+    [logMessages, latestMerged, effectiveAnchors, totalFleetTraces, fleetWindowStats],
   );
   const analystMetricCards = useMemo(() => {
     if (!latestMerged) {
@@ -526,14 +535,34 @@ function App({ signOut, user }) {
         ? data.answer || "No answer returned."
         : data.error || data.message || `Request failed (${response.status})`;
       const trace = response.ok ? data.trace || {} : {};
+      const responseMetrics = response.ok ? data.response_metrics || {} : {};
+      const auto_paginate = response.ok && data.auto_paginate_recommended === true;
+      const sessions_pagination = response.ok ? data.sessions_pagination || {} : {};
+
+      // DEBUG: Log what we're getting
+      console.log("=== FRONTEND API RESPONSE DEBUG ===");
+      console.log("Full data object:", data);
+      console.log("response_metrics field exists:", "response_metrics" in data);
+      console.log("response_metrics value:", data.response_metrics);
+      console.log("responseMetrics assigned:", responseMetrics);
+      console.log("Object.keys(responseMetrics):", Object.keys(responseMetrics));
+      console.log("auto_paginate_recommended:", auto_paginate);
+      console.log("sessions_pagination:", sessions_pagination);
 
       setMessages((prev) => {
-        const next = [...prev, makeMessage("assistant", answer)];
+        const msg = makeMessage("assistant", answer);
+        msg.metrics = responseMetrics;
+        msg.pagination = sessions_pagination;
+        console.log("Message metrics being set to:", msg.metrics);
+        const next = [...prev, msg];
 
         // Trace metadata is captured but not displayed in chat to keep UI clean
 
         return next;
       });
+
+      // Note: Auto-pagination for chat mode is NOT implemented (only analyst mode has it).
+      // Chat responses are handled via the assistant, not via listing queries.
 
       if (response.ok && trace) {
         setAutoAnchors((prev) => ({
@@ -633,7 +662,15 @@ function App({ signOut, user }) {
 
   function hoursToTimeframe(hours) {
     // Convert numeric hours back to "Xd", "Xh", "Xm" format
-    if (!hours || hours <= 0) return "1d";
+    // IMPORTANT: Never silently default to "1d" without logging - this causes timeframe loss
+    if (hours === undefined || hours === null) {
+      console.warn("[TIMEFRAME] hoursToTimeframe called with undefined/null hours. Keeping current timeframe.");
+      return null; // Return null to indicate no conversion
+    }
+    if (hours <= 0) {
+      console.warn("[TIMEFRAME] hoursToTimeframe called with hours <= 0:", hours, ". Keeping current timeframe.");
+      return null;
+    }
     if (hours >= 720) return "30d"; // max 30 days
     if (hours >= 24) {
       const days = Math.round(hours / 24);
@@ -804,6 +841,12 @@ function App({ signOut, user }) {
           }),
         }, ANALYSIS_MAX_RETRIES, controller.signal);
 
+        console.log("=== SESSION INSIGHTS REQUEST ===");
+        console.log("analyzerTimeframe:", analyzerTimeframe);
+        console.log("lookback_hours sent:", timeframeToHours(analyzerTimeframe));
+        console.log("question:", questionText);
+        console.log("==========================");
+
         // If we get a 401, force-refresh the token and retry once (handles transient JWT expiry).
         if (response.status === 401 && !forceTokenRefresh) {
           return fetchAnalysisPage(targetPage, true);
@@ -824,6 +867,19 @@ function App({ signOut, user }) {
       const firstMergedPagination = firstResult.data?.merged?.pagination_context || null;
       const firstPageInfo = firstSessionsPagination || firstPagination || firstMergedSessionsPagination || firstMergedPagination;
       const autoPaginateRecommended = Boolean(firstResult.data?.auto_paginate_recommended);
+      
+      // DEBUG: Log pagination trigger decision
+      console.log("[AUTO-PAGINATION DEBUG]", {
+        questionText,
+        autoPaginateRecommended,
+        auto_paginate_reason: firstResult.data?.auto_paginate_reason,
+        firstPageInfo: {
+          page: firstPageInfo?.page,
+          total_pages: firstPageInfo?.total_pages,
+          has_next_page: firstPageInfo?.has_next_page,
+        },
+        will_paginate: autoPaginateRecommended && autoPaginate && firstPageInfo?.total_pages > 1,
+      });
       const firstPrefix = Number(firstPageInfo?.page || page) > 1 && Number(firstPageInfo?.total_pages || 1) > 1
         ? `Page ${firstPageInfo.page} of ${firstPageInfo.total_pages}`
         : "";
@@ -832,12 +888,43 @@ function App({ signOut, user }) {
       let currentTimeframe = analyzerTimeframe;
       if (firstResult.response.ok && firstResult.data?.detected_lookback_hours !== undefined) {
         const detectedHours = firstResult.data.detected_lookback_hours;
+        const detectedLabel = firstResult.data?.detected_timeframe_label || "unknown";
+        console.log("[TIMEFRAME] Backend response:", {
+          detected_hours: detectedHours,
+          detected_label: detectedLabel,
+          current_analyzer_timeframe: analyzerTimeframe,
+          response_status: firstResult.response.status,
+        });
         const detectedTimeframe = hoursToTimeframe(detectedHours);
-        // Always update to detected timeframe to stay in sync with backend
-        if (detectedTimeframe !== analyzerTimeframe) {
+        // Always update to detected timeframe to stay in sync with backend (only if conversion was valid)
+        if (detectedTimeframe && detectedTimeframe !== analyzerTimeframe) {
+          console.log("[TIMEFRAME] ✓ UPDATING STATE from", analyzerTimeframe, "to", detectedTimeframe);
           setAnalyzerTimeframe(detectedTimeframe);
           currentTimeframe = detectedTimeframe;
+        } else if (!detectedTimeframe) {
+          console.log("[TIMEFRAME] ✗ CONVERSION FAILED (hours invalid), keeping current:", analyzerTimeframe);
+        } else {
+          console.log("[TIMEFRAME] = NO CHANGE NEEDED, already at:", analyzerTimeframe);
         }
+      } else {
+        console.log("[TIMEFRAME] ⚠ No detected_lookback_hours in response or response not ok. Current:", analyzerTimeframe);
+      }
+
+      // Extract and preserve fleet window stats from aggregations (source of truth)
+      if (firstResult.response.ok && firstResult.data?.merged?.aggregations) {
+        const agg = firstResult.data.merged.aggregations;
+        console.log("[FLEET-WINDOW] Updating state with aggregations:", {
+          timeframe: currentTimeframe,
+          total_sessions: agg.total_sessions,
+          total_unique_users: agg.total_unique_users,
+        });
+        setFleetWindowStats({
+          timeframe: currentTimeframe,
+          total_sessions: agg.total_sessions || 0,
+          total_unique_users: agg.total_unique_users || 0,
+        });
+      } else {
+        console.log("[FLEET-WINDOW] ⚠ No aggregations in response");
       }
 
       // Create fresh msgContext with CURRENT timeframe (post-sync)
@@ -878,10 +965,28 @@ function App({ signOut, user }) {
         && autoPaginate
         && (Number(firstPageInfo?.total_pages || 1) > 1 || Boolean(firstPageInfo?.has_next_page));
 
+      console.log("[AUTO-PAGINATION DECISION]", {
+        response_ok: firstResult.response.ok,
+        autoPaginateRecommended,
+        autoPaginate,
+        total_pages: Number(firstPageInfo?.total_pages || 1),
+        has_next_page: Boolean(firstPageInfo?.has_next_page),
+        multi_page_condition: Number(firstPageInfo?.total_pages || 1) > 1 || Boolean(firstPageInfo?.has_next_page),
+        shouldAutoLoadRemainingPages,
+        reason: !shouldAutoLoadRemainingPages ? (
+          !firstResult.response.ok ? "response_not_ok" :
+          !autoPaginateRecommended ? "backend_did_not_recommend" :
+          !autoPaginate ? "autoPaginate_param_false" :
+          !(Number(firstPageInfo?.total_pages || 1) > 1 || Boolean(firstPageInfo?.has_next_page)) ? "single_page" :
+          "unknown"
+        ) : "paginating",
+      });
+
       if (shouldAutoLoadRemainingPages) {
         const totalPages = Number(firstPageInfo?.total_pages || 1);
         let hasNextPage = Boolean(firstPageInfo?.has_next_page) || totalPages > 1;
         let loadedPages = Number(firstPageInfo?.page || 1);
+        console.log("[AUTO-PAGINATION START] Loading pages", loadedPages + 1, "to", Math.min(totalPages, loadedPages + 20));
         setAutoPageProgress({ loadedPages, totalPages });
 
         const hardPageCap = Math.max(totalPages, loadedPages + 20);

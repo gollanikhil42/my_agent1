@@ -1,3 +1,6 @@
+import { ResponseMetrics } from "../ResponseMetrics/ResponseMetrics";
+import "./MessageList.css";
+
 export function TypingIndicator() {
   return (
     <div className="typing" aria-live="polite" aria-label="Assistant is typing">
@@ -21,6 +24,11 @@ export function MessageList({
       {messages.map((msg) => (
         <article key={msg.id} className={`message ${msg.role} ${msg.variant || ""}`}>
           <div className="bubble-wrap">
+            {msg.role === "assistant" && msg.metrics && Object.keys(msg.metrics).length > 0 && (
+              <div className="metrics-top">
+                <ResponseMetrics metrics={msg.metrics} />
+              </div>
+            )}
             <div className="bubble-header">
               <span className="who">
                 {msg.role === "assistant"
