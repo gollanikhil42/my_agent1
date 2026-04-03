@@ -2282,15 +2282,18 @@ def _build_trace_lookup_diagnosis(question: str, merged: Dict[str, Any], analyst
     )
 
     user_question = question.strip() if question and question.strip() else "Analyze the requested trace IDs with X-Ray segment delays."
-    # Build compact context inline (replaces deleted _build_llm_analysis_context)
+    # Build full context for trace lookup — include ALL trace details, not truncated
+    # For focused trace lookups, we want comprehensive information including model prompts/responses and X-Ray segments
     llm_context = {
         "analysis_mode": merged.get("analysis_mode", ""),
         "request": merged.get("request", {}),
         "evaluations": merged.get("evaluations", {}),
         "xray": merged.get("xray", {}),
         "trace_lookup": merged.get("trace_lookup", {}),
-        "trace_diagnostics": merged.get("trace_diagnostics", [])[:12],
-        "top_anomalies": merged.get("top_anomalies", [])[:5],
+        "trace_index": merged.get("trace_index", []),  # Full trace index with all metadata
+        "trace_diagnostics": merged.get("trace_diagnostics", []),  # ALL traces, not just first 12
+        "xray_trace_details": merged.get("xray_trace_details", []),  # X-Ray segment details
+        "top_anomalies": merged.get("top_anomalies", []),  # All anomalies for context
         "quality_indicators": merged.get("quality_indicators", {}),
         "fleet_metrics": merged.get("fleet_metrics", {}),
     }
@@ -5003,6 +5006,20 @@ def _handle_session_insights(event: Dict[str, Any]) -> Dict[str, Any]:
     # Detect if user wants to change the timeframe mid-conversation
     # The LLM understands natural language like "switch to 5 days" or "analyze last 3 hours"
     detected_timeframe_hours = _detect_timeframe_change_llm(question, lookback_hours, analyst_memory)
+    
+    # If user explicitly asks for a trace by ID (e.g., "get more info on trace 69c61bfa..."),
+    # auto-expand the window to 30 days to ensure the trace is captured, even if it's old.
+    # This prevents follow-up trace lookups from failing due to small time windows.
+    requested_trace_ids_check = _extract_trace_ids_from_text(question)
+    if requested_trace_ids_check and detected_timeframe_hours < 720:  # 720h = 30 days
+        detected_timeframe_hours = 720.0
+        _emit_analyzer_trace({
+            "phase": "trace_lookup_timeframe_auto_expanded",
+            "question_excerpt": question[:120],
+            "requested_trace_ids": requested_trace_ids_check,
+            "expanded_to_hours": 720.0,
+            "reason": "Explicit trace lookup detected in question",
+        })
     
     # Fleet mode ignores anchors and aggregates all traces in the requested timeframe.
     fleet_hours = detected_timeframe_hours
